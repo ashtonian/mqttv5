@@ -1,0 +1,83 @@
+name: bench-codec
+
+# Codec micro-benchmarks: fast, deterministic, run on every push to
+# main and every PR that touches the codec or its consumers. Results
+# are persisted to the gh-pages branch and rendered as a live chart at
+# https://<owner>.github.io/<repo>/dev/bench/ — see benchmarks/README.md
+# for the dashboard URL and the one-time GH Pages enablement step.
+#
+# The end-to-end benchmarks vs autopaho live in bench.yml and stay
+# manual (workflow_dispatch) because they're slow, need mosquitto, and
+# show too much loop variance for automated regression alerts.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'wire/**'
+      - 'benchmarks/decode_**'
+      - 'benchmarks/encode_**'
+      - 'benchmarks/go.mod'
+      - 'benchmarks/go.sum'
+      - '.github/workflows/bench-codec.yml'
+  pull_request:
+    paths:
+      - 'wire/**'
+      - 'benchmarks/decode_**'
+      - 'benchmarks/encode_**'
+      - 'benchmarks/go.mod'
+      - 'benchmarks/go.sum'
+      - '.github/workflows/bench-codec.yml'
+
+concurrency:
+  group: bench-codec-${{ github.workflow }}-${{ github.ref }}
+  # Cancel duplicate PR runs to save CI minutes. Never cancel a push
+  # to main — every commit's bench result should land in history.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write       # push appended history to gh-pages (push-to-main only)
+  pull-requests: write  # post comparison comments on PRs
+
+jobs:
+  bench-codec:
+    name: codec micro benchmarks (track + alert)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: benchmarks/go.sum
+
+      - name: run codec benchmarks
+        # -count=5 over a 2s benchtime gives benchmark-action stable
+        # medians without taking forever; codec benches are < 1 µs/op
+        # so the whole sweep runs in ~30 s on a GH ubuntu runner.
+        run: |
+          go test -bench='^Benchmark(Decode|Encode)' -run=^$ -benchmem \
+            -benchtime=2s -count=5 ./... | tee bench.out
+        working-directory: benchmarks
+
+      - name: track history + alert on regression
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'go'
+          output-file-path: benchmarks/bench.out
+          # Where the JSON history + Chart.js dashboard live.
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: 'dev/bench'
+          # Compare each metric against the latest committed entry.
+          # 150% = a 1.5× slowdown trips an alert. Tight enough to catch
+          # real regressions, loose enough to ride out the ~20 % noise
+          # we see on GH shared runners.
+          alert-threshold: '150%'
+          fail-on-alert: false
+          # PR runs: always post a comment so reviewers see the diff
+          # inline; persist nothing.
+          # Push to main: append to history, comment only on alert.
+          comment-always: ${{ github.event_name == 'pull_request' }}
+          comment-on-alert: true
+          auto-push: ${{ github.event_name == 'push' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,179 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION_FILE: go.mod
+  GOLANGCI_LINT_VERSION: v2.12.2
+  GOVULNCHECK_VERSION: v1.1.4
+
+jobs:
+  lint:
+    name: lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - codec/json
+          - codec/msgpack
+          - store/file
+          - examples
+          - conformance
+          - benchmarks
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: ${{ matrix.module }}
+
+  tidy:
+    name: tidy (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - codec/json
+          - codec/msgpack
+          - store/file
+          - examples
+          - conformance
+          - benchmarks
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: go mod tidy
+        run: go mod tidy
+        working-directory: ${{ matrix.module }}
+
+      - name: verify go.mod / go.sum unchanged
+        run: |
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go mod tidy produced changes in ${{ matrix.module }}; commit them."
+            exit 1
+          fi
+        working-directory: ${{ matrix.module }}
+
+  vet:
+    name: vet (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - codec/json
+          - codec/msgpack
+          - store/file
+          - examples
+          - conformance
+          - benchmarks
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: go vet (untagged)
+        run: go vet ./...
+        working-directory: ${{ matrix.module }}
+
+      - name: go vet (with build tags)
+        run: go vet -tags 'conformance e2e' ./...
+        working-directory: ${{ matrix.module }}
+
+  test:
+    name: test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - codec/json
+          - codec/msgpack
+          - store/file
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: go test -race
+        run: go test -race -v -timeout 5m -count=1 ./...
+        working-directory: ${{ matrix.module }}
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+
+      - name: build core
+        run: go build ./...
+
+      - name: build examples
+        run: go build ./...
+        working-directory: examples
+
+  vuln:
+    name: vuln (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - codec/json
+          - codec/msgpack
+          - store/file
+          - examples
+          - conformance
+          - benchmarks
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
+
+      - name: govulncheck
+        run: govulncheck ./...
+        working-directory: ${{ matrix.module }}

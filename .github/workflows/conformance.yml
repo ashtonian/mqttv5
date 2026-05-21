@@ -1,0 +1,51 @@
+name: conformance
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: broker-backed conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: conformance/go.sum
+
+      - name: start brokers
+        run: docker compose -f conformance/docker-compose.yml up -d
+
+      - name: wait for brokers
+        timeout-minutes: 2
+        run: |
+          for port in 1883 1884; do
+            echo "waiting for tcp/$port"
+            until bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; do
+              sleep 1
+            done
+            echo "tcp/$port up"
+          done
+
+      - name: run conformance
+        run: go test -tags conformance -race -v -timeout 180s ./...
+        working-directory: conformance
+
+      - name: broker logs (on failure)
+        if: failure()
+        run: docker compose -f conformance/docker-compose.yml logs --no-color
+
+      - name: stop brokers
+        if: always()
+        run: docker compose -f conformance/docker-compose.yml down -v

@@ -1,0 +1,68 @@
+name: bench
+
+# End-to-end benchmarks vs autopaho. Slow (~5-10 min), needs mosquitto
+# in docker, and shows enough loop variance on shared runners that
+# automated regression alerts would be noise. So this workflow is
+# manual: dispatch it before/after a perf-relevant change, download
+# the artifacts, run `benchstat` locally to compare.
+#
+# The fast codec micro-benchmarks (always-on with PR comments + a live
+# dashboard) live in bench-codec.yml.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-bench:
+    name: end-to-end benchmarks (vs autopaho)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: benchmarks/go.sum
+
+      - name: start mosquitto
+        run: docker compose -f conformance/docker-compose.yml up -d mosquitto
+
+      - name: wait for mosquitto
+        timeout-minutes: 2
+        run: until bash -c "</dev/tcp/127.0.0.1/1883" 2>/dev/null; do sleep 1; done
+
+      - name: run e2e benchmarks
+        run: |
+          go test -tags e2e -bench='^BenchmarkE2E_' -run=^$ -benchmem \
+            -benchtime=3s -count=5 -timeout 20m ./... | tee e2e_results.txt
+        working-directory: benchmarks
+
+      - name: post bench summary
+        if: always()
+        run: |
+          {
+            echo "## End-to-end benchmarks vs autopaho"
+            echo ""
+            echo "Compare locally with \`benchstat\` — see benchmarks/README.md."
+            echo ""
+            echo '```'
+            cat benchmarks/e2e_results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-bench-${{ github.run_id }}
+          path: benchmarks/e2e_results.txt
+
+      - name: stop mosquitto
+        if: always()
+        run: docker compose -f conformance/docker-compose.yml down -v

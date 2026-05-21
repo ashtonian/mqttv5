@@ -1,0 +1,14 @@
+*.test
+*.out
+*.prof
+*.bench
+coverage.txt
+.idea/
+.vscode/
+.DS_Store
+dist/
+
+# Stray `go build` binaries that have ended up at the repo root.
+# Add explicit names here as they appear — root should normally only
+# contain source files.
+/ws

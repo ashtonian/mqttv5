@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: go vet (core)
+        run: go vet ./...
+
+      - name: go test -race (core)
+        run: go test -race -timeout 5m -count=1 ./...
+
+  conformance:
+    name: conformance (release gate)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: conformance/go.sum
+
+      - name: start brokers
+        run: docker compose -f conformance/docker-compose.yml up -d
+
+      - name: wait for brokers
+        timeout-minutes: 2
+        run: |
+          for port in 1883 1884; do
+            until bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; do sleep 1; done
+          done
+
+      - name: run conformance
+        run: go test -tags conformance -race -timeout 180s ./...
+        working-directory: conformance
+
+      - name: stop brokers
+        if: always()
+        run: docker compose -f conformance/docker-compose.yml down -v
+
+  publish:
+    name: publish GitHub release
+    needs: [validate, conformance]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: create release with auto-generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

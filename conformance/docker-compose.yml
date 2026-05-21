@@ -1,0 +1,28 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mqttv5-conformance-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # emqx covers the cases mosquitto handles differently (e.g.,
+  # AssignedClientIdentifier policy, shared subscriptions).
+  emqx:
+    image: emqx/emqx:5
+    container_name: mqttv5-conformance-emqx
+    ports:
+      - "1884:1883"
+    environment:
+      - EMQX_ALLOW_ANONYMOUS=true
+    healthcheck:
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 15

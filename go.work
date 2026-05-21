@@ -1,0 +1,13 @@
+go 1.26.3
+
+use (
+	.
+	./benchmarks
+	./codec/json
+	./codec/msgpack
+	./conformance
+	./examples
+	./queue/file
+	./store/file
+	./transport/ws
+)

@@ -1,0 +1,54 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/ashtonian/mqttv5/benchmarks
+cpu: Apple M2 Pro
+BenchmarkDecode_Eclipse_PUBLISH/64B-12          	 2322337	       978.6 ns/op	 108.32 MB/s	    4595 B/op	      22 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/64B-12          	 2604973	       988.7 ns/op	 107.21 MB/s	    4595 B/op	      22 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/64B-12          	 2149642	       954.5 ns/op	 111.05 MB/s	    4595 B/op	      22 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/256B-12         	 2297080	      1124 ns/op	 266.11 MB/s	    5187 B/op	      22 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/256B-12         	 2277648	      1153 ns/op	 259.25 MB/s	    5187 B/op	      22 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/256B-12         	 2243286	      1053 ns/op	 283.88 MB/s	    5187 B/op	      22 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/1KiB-12         	 1598988	      1409 ns/op	 757.41 MB/s	    8067 B/op	      24 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/1KiB-12         	 1660659	      1436 ns/op	 743.09 MB/s	    8067 B/op	      24 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/1KiB-12         	 1732141	      1461 ns/op	 730.47 MB/s	    8067 B/op	      24 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/16KiB-12        	  342729	      6972 ns/op	2356.45 MB/s	   58627 B/op	      32 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/16KiB-12        	  312782	      7163 ns/op	2293.48 MB/s	   58627 B/op	      32 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH/16KiB-12        	  312054	      7008 ns/op	2344.02 MB/s	   58627 B/op	      32 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/64B-12         	  456207	      5461 ns/op	  43.40 MB/s	   23768 B/op	      93 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/64B-12         	  406532	      5543 ns/op	  42.75 MB/s	   23768 B/op	      93 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/64B-12         	  472784	      5525 ns/op	  42.90 MB/s	   23768 B/op	      93 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/256B-12        	  499052	      5967 ns/op	  71.89 MB/s	   25128 B/op	      93 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/256B-12        	  372219	      5861 ns/op	  73.19 MB/s	   25128 B/op	      93 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/256B-12        	  446162	      5664 ns/op	  75.74 MB/s	   25128 B/op	      93 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/1KiB-12        	  386341	      6133 ns/op	 195.18 MB/s	   27624 B/op	      95 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/1KiB-12        	  373497	      6137 ns/op	 195.04 MB/s	   27624 B/op	      95 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/1KiB-12        	  382196	      5949 ns/op	 201.21 MB/s	   27624 B/op	      95 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/16KiB-12       	  189103	     12146 ns/op	1363.26 MB/s	   77672 B/op	     103 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/16KiB-12       	  189700	     12395 ns/op	1335.81 MB/s	   77672 B/op	     103 allocs/op
+BenchmarkDecode_Eclipse_PUBLISH_WithProps/16KiB-12       	  195278	     12156 ns/op	1362.18 MB/s	   77672 B/op	     103 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/64B-12                   	10314362	       235.7 ns/op	 449.74 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/64B-12                   	10194774	       233.8 ns/op	 453.30 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/64B-12                   	 9742256	       233.4 ns/op	 454.18 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/256B-12                  	 9836738	       234.0 ns/op	1277.89 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/256B-12                  	 9978151	       235.0 ns/op	1272.36 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/256B-12                  	 8774846	       233.5 ns/op	1280.44 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/1KiB-12                  	 9836713	       236.4 ns/op	4512.69 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/1KiB-12                  	10013763	       236.3 ns/op	4514.52 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/1KiB-12                  	 9948840	       240.6 ns/op	4433.87 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/16KiB-12                 	 9763692	       236.3 ns/op	69535.15 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/16KiB-12                 	 9601806	       236.2 ns/op	69536.93 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH/16KiB-12                 	 9811198	       236.7 ns/op	69393.33 MB/s	     408 B/op	       9 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/64B-12         	 4931168	       471.3 ns/op	 502.89 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/64B-12         	 4884288	       473.3 ns/op	 500.71 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/64B-12         	 4918591	       473.3 ns/op	 500.69 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/256B-12        	 5264068	       470.6 ns/op	 911.59 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/256B-12        	 5524255	       470.7 ns/op	 911.38 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/256B-12        	 4912665	       466.9 ns/op	 918.78 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/1KiB-12        	 4855398	       469.6 ns/op	2549.16 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/1KiB-12        	 4944739	       471.5 ns/op	2538.48 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/1KiB-12        	 4897508	       469.5 ns/op	2549.45 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/16KiB-12       	 4925167	       477.3 ns/op	34690.14 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/16KiB-12       	 5345828	       483.9 ns/op	34214.80 MB/s	     856 B/op	      12 allocs/op
+BenchmarkEncode_Eclipse_PUBLISH_WithProps/16KiB-12       	 5584669	       476.7 ns/op	34737.91 MB/s	     856 B/op	      12 allocs/op
+PASS
+ok  	github.com/ashtonian/mqttv5/benchmarks	134.845s

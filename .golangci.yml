@@ -1,0 +1,64 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  build-tags:
+    - conformance
+    - e2e
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - revive
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    gosec:
+      excludes:
+        - G104 # Errors not checked: `_ = m.Ack()` is intentional throughout (manual-ack contract)
+        - G115 # Integer overflow conversions: false positives on bounded uint16 packet IDs
+        - G306 # File perms: store/file already uses 0o600 / 0o700; gosec misreads MkdirAll
+    revive:
+      rules:
+        - name: var-naming
+          disabled: false
+        - name: package-comments
+          disabled: false
+        - name: exported
+          disabled: false
+          arguments:
+            - checkPrivateReceivers # methods on unexported receivers
+            - sayRepetitiveInsteadOfStutters
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - govet
+      - path: benchmarks/
+        linters:
+          - errcheck
+          - gosec
+      - path: examples/
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/ashtonian/mqttv5
