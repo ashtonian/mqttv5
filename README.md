@@ -15,24 +15,87 @@ go get github.com/ashtonian/mqttv5
 - Go: 1.26+ (evergreen — tracks the latest stable Go)
 - Benchmarks: [benchmarks/README.md](benchmarks/README.md)
 
+## Simple
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ashtonian/mqttv5"
+    jsoncodec "github.com/ashtonian/mqttv5/codec/json"
+    "github.com/ashtonian/mqttv5/wire"
+)
+
+type Event struct {
+    Device string  `json:"device"`
+    Temp   float64 `json:"temp"`
+}
+
+func main() {
+    ctx := context.Background()
+
+    client, err := mqttv5.New(mqttv5.WithBroker("mqtt://localhost:1883"))
+    if err != nil { panic(err) }
+    if err := client.Connect(ctx); err != nil { panic(err) }
+    defer client.Disconnect(ctx)
+
+    // Generic typed pub/sub via Codec[T] (JSON ships in a sibling
+    // submodule). Supervisor handles reconnect + auto-resubscribe +
+    // QoS 1/2 replay underneath — you just write the consumer loop.
+    events := mqttv5.NewTyped(client, jsoncodec.Codec[Event]{})
+
+    msgs, _, _ := events.Subscribe(ctx,
+        []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}})
+    go func() {
+        for m := range msgs {
+            fmt.Printf("%s: %+v\n", m.Topic, m.Value) // m.Value already decoded
+            _ = m.Ack() // PUBACK held for QoS 1 until you ack
+        }
+    }()
+
+    _ = events.Publish(ctx,
+        wire.PublishOpts{Topic: "events/hello", QoS: 1},
+        Event{Device: "a1", Temp: 22.5})
+
+    select {} // hook into your service's shutdown signal in production
+}
+```
+
+See [`examples/`](examples/) for full demos — TLS, multi-broker failover,
+publisher pool, durable queue, raw-bytes subscribe, WebSocket, OAuth
+rotation, and lifecycle observability.
+
 ## Why this over `eclipse/paho.golang` + `autopaho`
 
-- **One package, one client.** No `paho` vs `autopaho` split. Reconnect,
-  replay-in-flight, and auto-resubscribe are always on.
+- **Go-idiomatic top to bottom.** Channels (`<-chan *Message`) and
+  queues for delivery, not just global `OnPublishReceived` callbacks.
+  `context.Context` on every operation. Sentinel errors with
+  `errors.Is`. Functional options instead of a 40-field
+  `ClientOptions` struct. paho was ported from a Java/C client and
+  shows it.
+- **One client. Supervisor baked in.** No `paho` / `autopaho` split —
+  reconnect, replay-in-flight, and auto-resubscribe are always on.
 - **20–60× faster decode, zero steady-state allocs** on the receive
   path. Topic and payload are zero-copy slices into a pooled frame;
-  properties decode lazily. **2.5× faster** for 8-goroutine fan-in
-  publish.
-- **`<-chan *Message`** and **`Queue[*Message]`** out of the box — not
-  just global `OnPublishReceived` callbacks.
+  properties decode lazily.
+- **Multi-broker, kept distinct and composable.** Failover
+  (`WithBrokers`), fan-out across N independent brokers (`ClientGroup`),
+  publish-only pool against one broker (`WithPublisherPool`) — three
+  real patterns paho conflates into one retry knob. Compose them:
+  `WithBrokers` inside a `GroupMember` for HA-per-region, then
+  `WithPublisherPool` on top for throughput.
+- **Publisher pool that actually scales.** paho serialises every
+  write behind one mutex; mqttv5 funnels into MPSC + one writer
+  goroutine, so N publish-only conns parallelise across cores.
+  **2.5× faster** under 8-goroutine fan-in.
 - **Backpressure as a first-class concept.** Per-subscription
   `DropNewest` / `DropOldest`, with the dropped message auto-ack'd so
   the broker stops retransmitting.
 - **Generic typed payloads.** `Codec[T]` boundary; JSON and msgpack
   codecs ship in separate submodules so the core stays stdlib-only.
-- **Three multi-broker patterns kept distinct:** failover within one
-  client (`WithBrokers(...)`), fan-out across brokers (`ClientGroup`),
-  publisher pool against one broker (`WithPublisherPool(N)`).
 - **Durable outbound queue** (`QueuePublisher` + file-backed
   `queue/file/`) — enqueue while disconnected, drain on reconnect,
   survive process restart.
@@ -44,159 +107,6 @@ go get github.com/ashtonian/mqttv5
 - **WebSocket as a sibling module** — `transport/ws` brings ws/wss via
   `WithDialFunc(ws.DialFunc(opts))` (see [`examples/ws`](examples/ws)).
   Zero impact on the core's stdlib-only promise.
-
-## A complete example
-
-Connect with broker failover + TLS, subscribe both via channel and
-typed JSON, publish through a publisher pool, observe reconnect, and
-use the durable queue for at-least-once publish across process
-restarts.
-
-```go
-package main
-
-import (
-    "context"
-    "crypto/tls"
-    "fmt"
-    "log/slog"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
-
-    "github.com/ashtonian/mqttv5"
-    jsoncodec "github.com/ashtonian/mqttv5/codec/json"
-    qfile "github.com/ashtonian/mqttv5/queue/file"
-    "github.com/ashtonian/mqttv5/wire"
-)
-
-type Reading struct {
-    Device string  `json:"device"`
-    Temp   float64 `json:"temp"`
-}
-
-func main() {
-    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-    defer stop()
-
-    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-
-    var cli *mqttv5.Client
-    var err error
-    cli, err = mqttv5.New(
-        // Multi-URL failover: supervisor rotates on every reconnect.
-        mqttv5.WithBrokers(
-            "mqtts://broker-a.example.com:8883",
-            "mqtts://broker-b.example.com:8883",
-        ),
-        mqttv5.WithClientID("ingest-svc-1"),
-        mqttv5.WithCredentials("user", []byte("pass")),
-        mqttv5.WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13}),
-        mqttv5.WithKeepAlive(30),
-        mqttv5.WithSessionExpiry(3600),
-        mqttv5.WithCleanStart(false),
-
-        // 4 publish-only connections, hash-by-topic preserves ordering.
-        mqttv5.WithPublisherPool(4),
-        mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
-
-        // Lifecycle hooks. OnConnectionUp receives the CONNACK clone
-        // so callers can read broker-negotiated values (assigned
-        // ClientID, ServerKeepAlive, MaximumQoS, ...). OnConnectionDown
-        // returns false to terminate the supervisor; a follow-up
-        // Connect call re-starts it.
-        mqttv5.WithOnConnectionUp(func(ack *wire.Connack) {
-            logger.Info("connected", "session_present", ack.SessionPresent)
-        }),
-        mqttv5.WithOnConnectionDown(func() bool {
-            logger.Warn("disconnected; supervisor will redial")
-            return true
-        }),
-        mqttv5.WithOnConnectError(func(err error) {
-            logger.Warn("connect attempt failed", "error", err)
-        }),
-
-        // React to broker-initiated DISCONNECT (e.g. ServerMoved).
-        // The callback can call cli.SetBrokers(ref) to redirect.
-        mqttv5.WithOnServerDisconnect(func(d *wire.Disconnect) {
-            if ref, ok := d.Properties.String(wire.PropServerReference); ok {
-                logger.Info("redirect", "to", ref)
-                _ = cli.SetBrokers(ref)
-            }
-        }),
-
-        mqttv5.WithLogger(logger),
-    )
-    must(err)
-    must(cli.Connect(ctx))
-    defer func() {
-        shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        defer cancel()
-        _ = cli.Disconnect(shutdown)
-    }()
-
-    // ── Channel subscribe — manual ack, §4.6-ordered PUBACK flush.
-    msgs, _, err := cli.Subscribe(ctx,
-        []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},
-        mqttv5.SubBuffer(256),
-        mqttv5.SubOnDrop(func(m *mqttv5.Message) {
-            logger.Warn("dropped", "topic", m.Topic)
-        }),
-    )
-    must(err)
-    go func() {
-        for m := range msgs {
-            fmt.Printf("recv  %s  %s\n", m.Topic, m.Payload)
-            _ = m.Ack()
-        }
-    }()
-
-    // ── Typed subscribe — JSON decode at the boundary.
-    typed := mqttv5.NewTyped[Reading](cli, jsoncodec.Codec[Reading]{})
-    readings, _, err := typed.Subscribe(ctx,
-        []mqttv5.TopicFilter{{Topic: "sensors/+/temp", QoS: 1}})
-    must(err)
-    go func() {
-        for m := range readings {
-            fmt.Printf("reading  %s  %+v\n", m.Topic, m.Value)
-            _ = m.Ack()
-        }
-    }()
-
-    // ── Durable publisher — Publish returns once durably enqueued.
-    //    Drain goroutine handles broker handshake when connected.
-    //    Survives process restart via queue/file's WAL on disk.
-    q, err := qfile.Open("/var/lib/myapp/outbound")
-    must(err)
-    pub := mqttv5.NewQueuePublisher(cli, q,
-        mqttv5.WithQueueBatchSize(32),
-        mqttv5.WithQueueTTL(24*time.Hour),
-        mqttv5.WithDeadLetter(func(e mqttv5.QueueEntry, err error) {
-            logger.Error("dead letter", "topic", e.Publish.Topic, "error", err)
-        }),
-    )
-    defer pub.Close(context.Background())
-
-    // ── Main publish loop.
-    tick := time.NewTicker(time.Second)
-    defer tick.Stop()
-    for i := 0; ; i++ {
-        select {
-        case <-ctx.Done():
-            return
-        case <-tick.C:
-            _ = pub.Publish(ctx, wire.PublishOpts{
-                Topic:   fmt.Sprintf("events/tick/%d", i%4),
-                Payload: fmt.Appendf(nil, `{"n":%d}`, i),
-                QoS:     1,
-            })
-        }
-    }
-}
-
-func must(err error) { if err != nil { panic(err) } }
-```
 
 ## Runnable examples
 
@@ -249,8 +159,15 @@ to get throughput against an HA pair.
 
 `Client.SetBrokers(urls...)` swaps the failover list at runtime —
 typical use is inside `WithOnServerDisconnect` when the broker sends
-`ReasonServerMoved` with a `ServerReference`. See the complete
-example above.
+`ReasonServerMoved` with a `ServerReference`:
+
+```go
+mqttv5.WithOnServerDisconnect(func(d *wire.Disconnect) {
+    if ref, ok := d.Properties.String(wire.PropServerReference); ok {
+        _ = cli.SetBrokers(ref)
+    }
+})
+```
 
 ### `ClientGroup` policies
 
@@ -686,17 +603,12 @@ go -C conformance test -tags conformance -race -v
 
 ## Stability
 
-- Wire protocol: stable (MQTT v5 OASIS).
-- Public API: semantically stable in v0.x; identifier names may shift
-  before tagging `v1`. Any renames will be in release notes with the
-  old → new mapping. `v1` will freeze the `Client` / `Config` / option
-  / Stats surface; the `wire/` codec internals stay mutable.
-- Sentinel errors above are stable.
+- Wire protocol: MQTT v5 OASIS, stable.
+- Public `Client` / `Config` / option / `Stats` surface is stable;
+  any breaking change is called out in release notes with a mapping.
+- Sentinel errors above are stable; branch on them with `errors.Is`.
 - Submodules version independently — each has its own `go.mod`.
-- Production burn-in: this is a pre-v1 release. The lib runs green
-  under `-race` across the conformance suite (mosquitto + emqx) but
-  has limited hours in real production. Run a soak before relying on
-  it for ledger-style workloads.
+- `wire/` codec internals are mutable — treat as private.
 
 ## Independence
 
