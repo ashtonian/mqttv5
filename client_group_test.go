@@ -22,8 +22,8 @@ import (
 // is publishing without needing to thread ClientID parsing through
 // the recorder.
 type groupPublishRecorder struct {
-	mu    sync.Mutex
-	pubs  []struct{ member, topic string }
+	mu   sync.Mutex
+	pubs []struct{ member, topic string }
 }
 
 func (r *groupPublishRecorder) record(member, topic string) {

@@ -823,8 +823,13 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	g, err := mqttv5.NewClientGroup(
-		[]string{brokerURL(), secondaryBrokerURL()},
-		mqttv5.WithClientID("conformance-group-"+randSuffix()),
+		[]mqttv5.GroupMember{
+			{Broker: brokerURL()},
+			{Broker: secondaryBrokerURL()},
+		},
+		mqttv5.WithGroupSharedOpts(
+			mqttv5.WithClientID("conformance-group-"+randSuffix()),
+		),
 	)
 	if err != nil {
 		t.Fatal(err)

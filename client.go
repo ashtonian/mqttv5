@@ -209,19 +209,71 @@ type clientStats struct {
 // free of cost when stats are off. The repetition is intentional:
 // Go has no method generics and the inline check is cheaper than a
 // generic indirection.
-func (s *clientStats) addConnect()          { if s != nil { s.connects.Add(1) } }
-func (s *clientStats) addConnectFailure()   { if s != nil { s.connectFailures.Add(1) } }
-func (s *clientStats) addDisconnect()       { if s != nil { s.disconnects.Add(1) } }
-func (s *clientStats) addServerDisconnect() { if s != nil { s.serverDisconnects.Add(1) } }
-func (s *clientStats) addPingTimeout()      { if s != nil { s.pingTimeouts.Add(1) } }
-func (s *clientStats) addPublishSent()      { if s != nil { s.publishesSent.Add(1) } }
-func (s *clientStats) addPublishAcked()     { if s != nil { s.publishesAcked.Add(1) } }
-func (s *clientStats) addPublishReplayed()  { if s != nil { s.publishesReplayed.Add(1) } }
-func (s *clientStats) addInboundPublish()   { if s != nil { s.inboundPublishes.Add(1) } }
-func (s *clientStats) addInboundDropped()   { if s != nil { s.inboundDropped.Add(1) } }
-func (s *clientStats) addSubscribeSent()    { if s != nil { s.subscribesSent.Add(1) } }
-func (s *clientStats) addUnsubscribeSent()  { if s != nil { s.unsubscribesSent.Add(1) } }
-func (s *clientStats) addPoolFallback()     { if s != nil { s.poolFallbacks.Add(1) } }
+func (s *clientStats) addConnect() {
+	if s != nil {
+		s.connects.Add(1)
+	}
+}
+func (s *clientStats) addConnectFailure() {
+	if s != nil {
+		s.connectFailures.Add(1)
+	}
+}
+func (s *clientStats) addDisconnect() {
+	if s != nil {
+		s.disconnects.Add(1)
+	}
+}
+func (s *clientStats) addServerDisconnect() {
+	if s != nil {
+		s.serverDisconnects.Add(1)
+	}
+}
+func (s *clientStats) addPingTimeout() {
+	if s != nil {
+		s.pingTimeouts.Add(1)
+	}
+}
+func (s *clientStats) addPublishSent() {
+	if s != nil {
+		s.publishesSent.Add(1)
+	}
+}
+func (s *clientStats) addPublishAcked() {
+	if s != nil {
+		s.publishesAcked.Add(1)
+	}
+}
+func (s *clientStats) addPublishReplayed() {
+	if s != nil {
+		s.publishesReplayed.Add(1)
+	}
+}
+func (s *clientStats) addInboundPublish() {
+	if s != nil {
+		s.inboundPublishes.Add(1)
+	}
+}
+func (s *clientStats) addInboundDropped() {
+	if s != nil {
+		s.inboundDropped.Add(1)
+	}
+}
+func (s *clientStats) addSubscribeSent() {
+	if s != nil {
+		s.subscribesSent.Add(1)
+	}
+}
+func (s *clientStats) addUnsubscribeSent() {
+	if s != nil {
+		s.unsubscribesSent.Add(1)
+	}
+}
+func (s *clientStats) addPoolFallback() {
+	if s != nil {
+		s.poolFallbacks.Add(1)
+	}
+}
 
 // Stats is the snapshot of Client counters returned by Client.Stats.
 //
@@ -338,9 +390,9 @@ type writeReq struct {
 // options. The Client is not connected — call Connect.
 func New(opts ...Option) (*Client, error) {
 	cfg := &Config{
-		CleanStart:                 true,
-		SessionExpiry:              DefaultSessionExpiry,
-		RequestProblemInformation:  true,
+		CleanStart:                true,
+		SessionExpiry:             DefaultSessionExpiry,
+		RequestProblemInformation: true,
 	}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
@@ -1662,14 +1714,14 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, isReconnect bool
 	}
 
 	opts := wire.ConnectOpts{
-		ClientID:                   cfg.ClientID,
-		CleanStart:                 cleanStart,
-		KeepAlive:                  cfg.KeepAlive,
-		Username:                   cfg.Username,
-		Password:                   cfg.Password,
-		Will:                       cfg.WillMessage,
-		TopicAliasMaximum:          cfg.InboundTopicAliasMaximum,
-		UserProperties:             cfg.ConnectUserProperties,
+		ClientID:          cfg.ClientID,
+		CleanStart:        cleanStart,
+		KeepAlive:         cfg.KeepAlive,
+		Username:          cfg.Username,
+		Password:          cfg.Password,
+		Will:              cfg.WillMessage,
+		TopicAliasMaximum: cfg.InboundTopicAliasMaximum,
+		UserProperties:    cfg.ConnectUserProperties,
 	}
 	if cfg.SessionExpiry > 0 {
 		opts.SessionExpiryInterval = &cfg.SessionExpiry

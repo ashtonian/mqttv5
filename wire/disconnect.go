@@ -128,7 +128,7 @@ func decodeDisconnect(frame *[]byte, flags byte) (*Disconnect, error) {
 
 	buf := *frame
 	var (
-		reason ReasonCode = ReasonNormalDisconnection
+		reason = ReasonNormalDisconnection
 		props  Properties
 	)
 	if len(buf) > 0 {

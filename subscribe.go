@@ -49,6 +49,11 @@ func releaseMessage(m *Message) {
 // is held until Ack (flushed in §4.6 arrival order); for QoS 2 the
 // PUBREC is held until Ack, PUBCOMP fires automatically on PUBREL.
 //
+// When SubAutoAck is set on Subscribe / SubscribeQueue the library
+// delivers a detached *Message instead: Topic / Payload / Properties
+// are heap copies safe to retain indefinitely, and Ack is a no-op
+// (the original frame is already released).
+//
 // A PUBLISH matching multiple overlapping filters delivers the same
 // *Message to every matched handler. Ack is refcounted — only the
 // final call releases the frame.
@@ -61,6 +66,11 @@ type Message struct {
 	// refs is initialised by the dispatcher to the matched-handler
 	// count. Each Ack decrements; the final caller releases the frame.
 	refs atomic.Int32
+
+	// detached is set on auto-ack copies returned to SubAutoAck
+	// consumers. The embedded Publish is heap-allocated with cloned
+	// fields, not pooled, so Ack must not Release or pool-return.
+	detached bool
 }
 
 // CloneTopic returns a heap-allocated copy of Topic safe to retain
@@ -86,9 +96,17 @@ func (m *Message) ClonePayload() []byte {
 // matched-handler count are silent no-ops. After the final Ack the
 // embedded Publish fields (Topic, Payload, Properties) are invalid;
 // use [Message.CloneTopic] / [Message.ClonePayload] for retention.
+//
+// On a detached message (delivered when [SubAutoAck] is set) Ack is
+// always a no-op — the broker ack and frame release already happened
+// inside the dispatcher.
 func (m *Message) Ack() error {
 	if m.refs.Add(-1) > 0 {
 		// Other handlers still hold this message; defer cleanup.
+		return nil
+	}
+	if m.detached {
+		// Heap-allocated standalone; nothing pooled, nothing to ack.
 		return nil
 	}
 	pub := m.Publish
@@ -101,6 +119,29 @@ func (m *Message) Ack() error {
 	pub.Release()
 	releaseMessage(m)
 	return nil
+}
+
+// detachMessage returns a heap-allocated standalone copy of m with
+// Topic, Payload, and Properties cloned off the frame so they survive
+// the caller's subsequent m.Ack(). Used by SubAutoAck to deliver
+// already-acked messages to channel / queue consumers.
+//
+// Costs one *Message allocation, one *wire.Publish allocation, plus
+// the three field clones. Reserved for opt-in auto-ack delivery; the
+// default manual-ack path remains zero-alloc on receive.
+func detachMessage(m *Message) *Message {
+	return &Message{
+		Publish: &wire.Publish{
+			Topic:      strings.Clone(m.Topic),
+			Payload:    bytes.Clone(m.Payload),
+			Properties: wire.PropertiesFromBytes(bytes.Clone(m.Properties.Raw())),
+			QoS:        m.QoS,
+			Retain:     m.Retain,
+			Dup:        m.Dup,
+			PacketID:   m.PacketID,
+		},
+		detached: true,
+	}
 }
 
 // ---------------- Subscribe API ----------------
@@ -142,11 +183,12 @@ var ErrNilHandler = errors.New("mqttv5: subscribe handler must not be nil")
 // subscribeConfig is the internal accumulator the SubscribeOptions
 // apply to. Defaults are set by newSubscribeConfig before applying.
 type subscribeConfig struct {
-	bufferSize       int            // chan flavour only
-	maxQueueSize     int            // queue flavour only (0 = unbounded)
-	dropPolicy       DropPolicy     // queue flavour honors both; chan rejects explicit DropOldest
-	dropPolicyExplicit bool         // SubDropPolicy was called for this Subscribe
-	onDrop           func(*Message) // optional: fires after a chan/queue drop+ack
+	bufferSize         int            // chan flavour only
+	maxQueueSize       int            // queue flavour only (0 = unbounded)
+	dropPolicy         DropPolicy     // queue flavour honors both; chan rejects explicit DropOldest
+	dropPolicyExplicit bool           // SubDropPolicy was called for this Subscribe
+	onDrop             func(*Message) // optional: fires after a chan/queue drop+ack
+	autoAck            bool           // SubAutoAck: ack on delivery, deliver detached copy
 }
 
 func newSubscribeConfig(c *Client) subscribeConfig {
@@ -203,6 +245,26 @@ func SubOnDrop(fn func(*Message)) SubscribeOption {
 	return func(cfg *subscribeConfig) { cfg.onDrop = fn }
 }
 
+// SubAutoAck makes [Client.Subscribe] / [Client.SubscribeQueue] ack
+// each delivery on the dispatcher goroutine, before handing the
+// message to the consumer. The consumer receives a detached
+// *Message whose Topic / Payload / Properties are heap copies safe
+// to retain indefinitely; [Message.Ack] becomes a no-op.
+//
+// Trade-off: convenience for two allocations per delivery (Topic
+// clone + Payload clone) on top of the *Message + *wire.Publish
+// header allocations — the default manual-ack path is zero-alloc on
+// the receive hot path. More importantly, auto-ack breaks
+// at-least-once semantics: a consumer that crashes between delivery
+// and processing has nothing to replay, since the broker considers
+// the message delivered. Reach for this on QoS 0 / observational
+// consumers; keep manual ack for ledger-style workloads.
+//
+// Ignored by [Client.SubscribeCallback] (already auto-acks).
+func SubAutoAck() SubscribeOption {
+	return func(cfg *subscribeConfig) { cfg.autoAck = true }
+}
+
 // Subscribe sends one SUBSCRIBE for filters and returns a buffered
 // channel of matching inbound messages. Callers MUST call
 // [Message.Ack] on each. Returns once SUBACK arrives; the channel
@@ -227,14 +289,22 @@ func (c *Client) Subscribe(ctx context.Context, filters []TopicFilter, opts ...S
 
 	ch := make(chan *Message, cfg.bufferSize)
 	onDrop := cfg.onDrop
+	autoAck := cfg.autoAck
 	handler := func(m *Message) {
+		if autoAck {
+			// Detach + ack the original frame BEFORE handing to the
+			// consumer so Topic / Payload survive past delivery.
+			detached := detachMessage(m)
+			_ = m.Ack()
+			m = detached
+		}
 		select {
 		case ch <- m:
 		default:
 			// Channel full: drop + ack. DropOldest is rejected at
 			// entry so only DropNewest semantics reach here.
 			c.stats.addInboundDropped()
-			_ = m.Ack()
+			_ = m.Ack() // no-op for detached; releases frame otherwise
 			if onDrop != nil {
 				onDrop(m)
 			}
@@ -264,20 +334,26 @@ func (c *Client) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts
 	maxQueue := cfg.maxQueueSize
 	policy := cfg.dropPolicy
 	onDrop := cfg.onDrop
+	autoAck := cfg.autoAck
 	handler := func(m *Message) {
+		if autoAck {
+			detached := detachMessage(m)
+			_ = m.Ack()
+			m = detached
+		}
 		if maxQueue > 0 && q.Len() >= maxQueue {
 			c.stats.addInboundDropped()
 			switch policy {
 			case DropOldest:
 				if old, ok := q.TryDequeue(); ok {
-					_ = old.Ack()
+					_ = old.Ack() // no-op for detached
 					if onDrop != nil {
 						onDrop(old)
 					}
 				}
 				q.Enqueue(m)
 			default: // DropNewest
-				_ = m.Ack()
+				_ = m.Ack() // no-op for detached
 				if onDrop != nil {
 					onDrop(m)
 				}
@@ -286,7 +362,7 @@ func (c *Client) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts
 		}
 		if !q.Enqueue(m) {
 			c.stats.addInboundDropped()
-			_ = m.Ack()
+			_ = m.Ack() // no-op for detached
 			if onDrop != nil {
 				onDrop(m)
 			}
@@ -440,14 +516,14 @@ func (c *Client) Unsubscribe(ctx context.Context, token SubscriptionToken) error
 	wait := c.installCtrlWaiter(id)
 
 	c.stats.addUnsubscribeSent()
-	if err := c.enqueueAwait(ctx, func(w io.Writer) (int64, error) {
+	if werr := c.enqueueAwait(ctx, func(w io.Writer) (int64, error) {
 		return wire.WriteUnsubscribe(w, wire.UnsubscribeOpts{
 			PacketID: id,
 			Topics:   topics,
 		})
-	}); err != nil {
+	}); werr != nil {
 		c.removeCtrlWaiter(id)
-		return fmt.Errorf("mqttv5: write UNSUBSCRIBE: %w", err)
+		return fmt.Errorf("mqttv5: write UNSUBSCRIBE: %w", werr)
 	}
 
 	unsuback, err := c.awaitControlAck(ctx, id, wait)

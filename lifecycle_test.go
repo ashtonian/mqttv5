@@ -417,4 +417,3 @@ func TestSetBrokersAfterServerMoved(t *testing.T) {
 	}
 	t.Fatal("client never reconnected to ServerReference target")
 }
-

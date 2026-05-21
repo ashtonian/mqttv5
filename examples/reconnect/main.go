@@ -64,7 +64,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	if err := cli.Connect(ctx); err != nil {
+	if err = cli.Connect(ctx); err != nil {
 		panic(err)
 	}
 	defer func() {

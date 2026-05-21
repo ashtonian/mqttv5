@@ -26,6 +26,7 @@ linters:
       excludes:
         - G104 # Errors not checked: `_ = m.Ack()` is intentional throughout (manual-ack contract)
         - G115 # Integer overflow conversions: false positives on bounded uint16 packet IDs
+        - G304 # File inclusion via variable: store/file paths are joined onto a root dir owned by the caller's Config
         - G306 # File perms: store/file already uses 0o600 / 0o700; gosec misreads MkdirAll
     revive:
       rules:
@@ -45,6 +46,13 @@ linters:
           - errcheck
           - gosec
           - govet
+        # revive's var-naming complains about test helpers like
+        # pubQoS0_autopaho / pubQoS0_mqttv5 that deliberately use a
+        # `_lib` suffix as a paired-naming convention.
+      - path: _test\.go
+        linters:
+          - revive
+        text: "var-naming:.*underscores"
       - path: benchmarks/
         linters:
           - errcheck

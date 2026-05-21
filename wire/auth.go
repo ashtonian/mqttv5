@@ -40,11 +40,11 @@ var authPool = sync.Pool{
 
 // AuthOpts is the input for WriteAuth.
 type AuthOpts struct {
-	ReasonCode         ReasonCode
+	ReasonCode           ReasonCode
 	AuthenticationMethod string
-	AuthenticationData []byte
-	ReasonString       string
-	UserProperties     []UserProperty
+	AuthenticationData   []byte
+	ReasonString         string
+	UserProperties       []UserProperty
 }
 
 // WriteAuth emits an AUTH packet.
@@ -111,7 +111,7 @@ func decodeAuth(frame *[]byte, flags byte) (*Auth, error) {
 
 	buf := *frame
 	var (
-		reason ReasonCode = ReasonSuccess
+		reason = ReasonSuccess
 		props  Properties
 	)
 	if len(buf) > 0 {

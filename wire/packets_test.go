@@ -320,15 +320,15 @@ func TestConnectRoundTrip(t *testing.T) {
 		Retain:  true,
 	}
 	opts := ConnectOpts{
-		ClientID:               "client-001",
-		CleanStart:             true,
-		KeepAlive:              30,
-		Username:               "alice",
-		Password:               []byte("secret"),
-		Will:                   &will,
-		SessionExpiryInterval:  &sei,
-		ReceiveMaximum:         &rcvMax,
-		UserProperties:         []UserProperty{{Key: "client", Value: "go"}},
+		ClientID:              "client-001",
+		CleanStart:            true,
+		KeepAlive:             30,
+		Username:              "alice",
+		Password:              []byte("secret"),
+		Will:                  &will,
+		SessionExpiryInterval: &sei,
+		ReceiveMaximum:        &rcvMax,
+		UserProperties:        []UserProperty{{Key: "client", Value: "go"}},
 	}
 	pkt := roundTrip(t,
 		func(b *bytes.Buffer) (int64, error) { return WriteConnect(b, opts) },
@@ -378,7 +378,7 @@ func encodeBadCONNECTBody() []byte {
 	b.WriteByte(0x05)
 	b.WriteByte(0x00)
 	b.Write([]byte{0x00, 0x00})
-	b.WriteByte(0x00) // empty properties
+	b.WriteByte(0x00)           // empty properties
 	b.Write([]byte{0x00, 0x00}) // empty client id
 	return b.Bytes()
 }
@@ -387,12 +387,12 @@ func TestConnackRoundTrip(t *testing.T) {
 	sei := uint32(60)
 	maxQoS := byte(2)
 	opts := ConnackOpts{
-		SessionPresent:        true,
-		ReasonCode:            ReasonSuccess,
-		SessionExpiryInterval: &sei,
-		MaximumQoS:            &maxQoS,
+		SessionPresent:           true,
+		ReasonCode:               ReasonSuccess,
+		SessionExpiryInterval:    &sei,
+		MaximumQoS:               &maxQoS,
 		AssignedClientIdentifier: "broker-assigned-id",
-		ReasonString:          "ok",
+		ReasonString:             "ok",
 	}
 	pkt := roundTrip(t,
 		func(b *bytes.Buffer) (int64, error) { return WriteConnack(b, opts) },

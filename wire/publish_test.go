@@ -16,11 +16,11 @@ type publishCase struct {
 }
 
 var (
-	pfi1               byte   = 1
-	mei100      uint32        = 100
-	contentTypeJSON           = "application/json"
-	responseTopicRPC          = "rpc/responses/01HXZ7QY"
-	correlationData           = []byte("\x01\x02\x03\x04")
+	pfi1             byte   = 1
+	mei100           uint32 = 100
+	contentTypeJSON         = "application/json"
+	responseTopicRPC        = "rpc/responses/01HXZ7QY"
+	correlationData         = []byte("\x01\x02\x03\x04")
 )
 
 func publishCases() []publishCase {

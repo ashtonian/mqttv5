@@ -25,10 +25,10 @@ type Config struct {
 // Methods are thread-safe; the embedded trackers each carry their own
 // mutex.
 type Session struct {
-	IDs       *IDPool
-	Outbound  *OutboundTracker
-	Inbound   *InboundTracker
-	Store     Store
+	IDs      *IDPool
+	Outbound *OutboundTracker
+	Inbound  *InboundTracker
+	Store    Store
 }
 
 // New constructs a Session. Pass a zero Config for sensible defaults

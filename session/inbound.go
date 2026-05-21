@@ -49,10 +49,10 @@ type inboundEntry struct {
 // then drains every consecutive acked entry and returns them to the
 // caller for serialisation.
 type InboundTracker struct {
-	mu     sync.Mutex
-	fifo   []*inboundEntry
-	byID   map[uint16]*inboundEntry
-	store  Store // PUBREL-pending IDs persisted here; nil disables
+	mu    sync.Mutex
+	fifo  []*inboundEntry
+	byID  map[uint16]*inboundEntry
+	store Store // PUBREL-pending IDs persisted here; nil disables
 }
 
 // NewInboundTracker returns a tracker. If store is non-nil, inbound

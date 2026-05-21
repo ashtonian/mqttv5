@@ -275,16 +275,16 @@ func TestPoolMemberInheritsConnectProperties(t *testing.T) {
 	// is still alive — Properties is a view over the frame buffer
 	// and becomes invalid after Release.
 	type connectSnapshot struct {
-		clientID                string
-		maxPacketSize           uint32
-		hasMaxPacketSize        bool
-		topicAliasMax           uint16
-		hasTopicAliasMax        bool
-		rri                     byte
-		hasRRI                  bool
-		rpi                     byte
-		hasRPI                  bool
-		userProperty            map[string]string
+		clientID         string
+		maxPacketSize    uint32
+		hasMaxPacketSize bool
+		topicAliasMax    uint16
+		hasTopicAliasMax bool
+		rri              byte
+		hasRRI           bool
+		rpi              byte
+		hasRPI           bool
+		userProperty     map[string]string
 	}
 	var snapsMu sync.Mutex
 	snaps := []connectSnapshot{}

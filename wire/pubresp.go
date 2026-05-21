@@ -100,7 +100,7 @@ func decodePubResp(frame *[]byte, pktType PacketType, flags byte) (*PubResp, err
 	buf = buf[2:]
 
 	var (
-		reason ReasonCode = ReasonSuccess
+		reason = ReasonSuccess
 		props  Properties
 	)
 

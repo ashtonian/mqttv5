@@ -13,33 +13,33 @@ import (
 // above 0x2A, so a fast byte path is correct for every conforming
 // implementation.
 const (
-	PropPayloadFormat              byte = 0x01
-	PropMessageExpiryInterval      byte = 0x02
-	PropContentType                byte = 0x03
-	PropResponseTopic              byte = 0x08
-	PropCorrelationData            byte = 0x09
-	PropSubscriptionIdentifier     byte = 0x0B
-	PropSessionExpiryInterval      byte = 0x11
-	PropAssignedClientID           byte = 0x12
-	PropServerKeepAlive            byte = 0x13
-	PropAuthMethod                 byte = 0x15
-	PropAuthData                   byte = 0x16
-	PropRequestProblemInfo         byte = 0x17
-	PropWillDelayInterval          byte = 0x18
-	PropRequestResponseInfo        byte = 0x19
-	PropResponseInformation        byte = 0x1A
-	PropServerReference            byte = 0x1C
-	PropReasonString               byte = 0x1F
-	PropReceiveMaximum             byte = 0x21
-	PropTopicAliasMaximum          byte = 0x22
-	PropTopicAlias                 byte = 0x23
-	PropMaximumQoS                 byte = 0x24
-	PropRetainAvailable            byte = 0x25
-	PropUserProperty               byte = 0x26
-	PropMaximumPacketSize          byte = 0x27
-	PropWildcardSubAvailable       byte = 0x28
-	PropSubscriptionIDAvailable    byte = 0x29
-	PropSharedSubAvailable         byte = 0x2A
+	PropPayloadFormat           byte = 0x01
+	PropMessageExpiryInterval   byte = 0x02
+	PropContentType             byte = 0x03
+	PropResponseTopic           byte = 0x08
+	PropCorrelationData         byte = 0x09
+	PropSubscriptionIdentifier  byte = 0x0B
+	PropSessionExpiryInterval   byte = 0x11
+	PropAssignedClientID        byte = 0x12
+	PropServerKeepAlive         byte = 0x13
+	PropAuthMethod              byte = 0x15
+	PropAuthData                byte = 0x16
+	PropRequestProblemInfo      byte = 0x17
+	PropWillDelayInterval       byte = 0x18
+	PropRequestResponseInfo     byte = 0x19
+	PropResponseInformation     byte = 0x1A
+	PropServerReference         byte = 0x1C
+	PropReasonString            byte = 0x1F
+	PropReceiveMaximum          byte = 0x21
+	PropTopicAliasMaximum       byte = 0x22
+	PropTopicAlias              byte = 0x23
+	PropMaximumQoS              byte = 0x24
+	PropRetainAvailable         byte = 0x25
+	PropUserProperty            byte = 0x26
+	PropMaximumPacketSize       byte = 0x27
+	PropWildcardSubAvailable    byte = 0x28
+	PropSubscriptionIDAvailable byte = 0x29
+	PropSharedSubAvailable      byte = 0x2A
 )
 
 // ErrInvalidProperties is returned when the property bytes are

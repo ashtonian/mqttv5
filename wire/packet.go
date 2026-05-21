@@ -17,10 +17,10 @@
 //
 // Lifetime contract:
 //
-//   A Packet returned from a Decoder borrows its underlying frame buffer.
-//   The caller MUST call Packet.Release once they are done. After Release,
-//   every []byte and string field is invalid — copy what you need to keep
-//   (use strings.Clone, bytes.Clone, or assignment into a heap struct).
+//	A Packet returned from a Decoder borrows its underlying frame buffer.
+//	The caller MUST call Packet.Release once they are done. After Release,
+//	every []byte and string field is invalid — copy what you need to keep
+//	(use strings.Clone, bytes.Clone, or assignment into a heap struct).
 package wire
 
 import "errors"

@@ -1,5 +1,10 @@
 # mqttv5
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/ashtonian/mqttv5.svg)](https://pkg.go.dev/github.com/ashtonian/mqttv5)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ashtonian/mqttv5)](https://goreportcard.com/report/github.com/ashtonian/mqttv5)
+[![CI](https://github.com/ashtonian/mqttv5/actions/workflows/ci.yml/badge.svg)](https://github.com/ashtonian/mqttv5/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A fast, ergonomic MQTT v5 client for Go. Single package, stdlib-only
 core, zero allocations on the receive path, Go-native subscribe
 surface (`<-chan *Message` / `Queue[*Message]` / callback), and the
@@ -102,8 +107,8 @@ rotation, and lifecycle observability.
 - **Conformance.** Full MQTT v5: shared subscriptions, topic aliases
   (in + out), session expiry, retained messages, will + will
   properties, enhanced authentication (CONNECT + mid-session §4.12),
-  CONNACK capability flags honoured (we error before sending a
-  feature the broker disabled).
+  CONNACK capability flags honoured — `Subscribe*` errors before the
+  wire when the broker has disabled the feature.
 - **WebSocket as a sibling module** — `transport/ws` brings ws/wss via
   `WithDialFunc(ws.DialFunc(opts))` (see [`examples/ws`](examples/ws)).
   Zero impact on the core's stdlib-only promise.
@@ -410,6 +415,7 @@ No silent downgrade.
 | `SubMaxQueueSize(n)` | Queue cap (SubscribeQueue only). 0 = unbounded. |
 | `SubDropPolicy(p)` | `DropNewest` / `DropOldest`. SubscribeQueue honours both; chan-based `Subscribe` returns `ErrChanDropOldestUnsupported` when DropOldest is set explicitly. |
 | `SubOnDrop(fn)` | Metrics hook fired when a message is dropped + acked. |
+| `SubAutoAck()` | Opt-in: dispatcher acks each delivery before handing it to the consumer; the received `*Message` is a detached copy (Topic/Payload/Properties cloned, safe to retain) and `m.Ack()` is a no-op. Trade: 2 allocs/msg + breaks at-least-once semantics (consumer crash between delivery and processing has nothing to replay). Reach for it on QoS 0 / observational consumers. Ignored by `SubscribeCallback`. |
 
 ### Per-`QueuePublisher`
 
@@ -463,7 +469,7 @@ _ = cli.DisconnectWith(ctx, wire.DisconnectOpts{
 ```
 
 The `OnConnectionDown` callback is *not* invoked on a user-initiated
-disconnect — use the call site itself as the "we're going down" signal.
+disconnect — the call site itself is the "going down" signal.
 See [`examples/disconnect`](examples/disconnect).
 
 ## Per-attempt credential rotation
@@ -499,7 +505,7 @@ Branch with `errors.Is(err, ...)`; stable across versions.
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
 | `ErrClosed` | any after `Disconnect` | Client torn down. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason. |
-| `ErrUnexpectedPacket` | various | Broker sent something we didn't expect. Treat as protocol bug. |
+| `ErrUnexpectedPacket` | various | Broker sent an unexpected packet for the current state. Treat as protocol bug. |
 | `ErrMissingBroker` | `New` | No URLs supplied. |
 | `ErrInvalidBrokerURL` | `New`, `SetBrokers` | URL failed to parse or has unsupported scheme. `WithDialFunc` relaxes scheme validation. |
 | `ErrChanDropOldestUnsupported` | `Subscribe` (chan) | Explicit `SubDropPolicy(DropOldest)` on the channel-based Subscribe. Use `SubscribeQueue` for DropOldest. |
@@ -549,9 +555,9 @@ Decode allocation is **constant in payload size** — `Topic` and
 | RoundTrip (pub → broker → sub) | 267 µs | **256 µs** | 4× fewer allocs |
 
 The single-goroutine QoS-0 case where autopaho's mutex-around-`Write`
-edges us by ~2 µs is the only loss. That mutex is exactly what blocks
-autopaho from scaling — we trade 2 µs per call for the 2.5× win under
-fan-in.
+edges mqttv5 by ~2 µs is the only loss. That mutex is exactly what
+blocks autopaho from scaling — the trade-off is 2 µs per call against
+the 2.5× win under fan-in.
 
 ## Reliability semantics
 

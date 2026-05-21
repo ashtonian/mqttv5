@@ -191,4 +191,3 @@ func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) 
 		return ErrClosed
 	}
 }
-

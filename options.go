@@ -38,10 +38,11 @@ const (
 	// DefaultPingTimeout is the budget for PINGRESP after a PINGREQ
 	// before the connection is declared dead. Chosen flat (not a
 	// multiple of KeepAlive) because PINGRESP is a tiny packet whose
-	// RTT does not scale with how often we ping. With DefaultKeepAlive
-	// (30 s) the total dead-detect time is 40 s — comfortably inside
-	// every common broker's 1.5×KeepAlive (~45 s) disconnect window,
-	// so the client drives the reconnect rather than getting cut.
+	// RTT does not scale with how often PINGREQ is sent. With
+	// DefaultKeepAlive (30 s) the total dead-detect time is 40 s —
+	// comfortably inside every common broker's 1.5×KeepAlive (~45 s)
+	// disconnect window, so the client drives the reconnect rather
+	// than getting cut.
 	DefaultPingTimeout = 10 * time.Second
 
 	// DefaultSessionExpiry is the Session Expiry Interval (§3.1.2.11.2)
@@ -95,7 +96,7 @@ type Config struct {
 	ReceiveMaximum uint16
 
 	// MaximumPacketSize caps the largest packet the broker may send
-	// to us (§3.1.2.11.4). Zero advertises no limit.
+	// to this client (§3.1.2.11.4). Zero advertises no limit.
 	MaximumPacketSize uint32
 
 	// InboundTopicAliasMaximum is the inbound TopicAliasMaximum
@@ -637,9 +638,9 @@ const (
 	// are not surfaced.
 	PublishFireAndForget PublishMode = iota
 
-	// PublishWaitForFlush: Publish blocks until conn.Write returns
-	// and surfaces transport errors. Useful as a connection-health
-	// probe.
+	// PublishWaitForFlush makes Publish block until conn.Write
+	// returns and surfaces transport errors. Useful as a
+	// connection-health probe.
 	PublishWaitForFlush
 )
 

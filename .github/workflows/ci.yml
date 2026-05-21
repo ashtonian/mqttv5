@@ -102,6 +102,7 @@ jobs:
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: go vet (untagged)
+        if: matrix.module != 'conformance'
         run: go vet ./...
         working-directory: ${{ matrix.module }}
 

@@ -5,8 +5,8 @@
 //
 // Wildcards (per §4.7):
 //
-//   +  matches exactly one level
-//   #  matches zero or more trailing levels (only valid as the final level)
+//   - matches exactly one level
+//     #  matches zero or more trailing levels (only valid as the final level)
 //
 // The Tree value is read-only after construction. Use Register/Unregister
 // on the parent Router (see router.go in the package consumer) for
@@ -169,7 +169,7 @@ func matchLevels(n *Node, topic string, start int, yield func(Handler)) {
 func (t *Tree) ensure(filter string) *Node {
 	levels := splitLevels(filter)
 	node := t.root
-	for i, level := range levels {
+	for _, level := range levels {
 		switch level {
 		case "+":
 			if node.plusChild == nil {
@@ -177,15 +177,13 @@ func (t *Tree) ensure(filter string) *Node {
 			}
 			node = node.plusChild
 		case "#":
+			// # is terminal — per spec it's only allowed at the end.
+			// Caller validates; we defensively return the hash child
+			// so handler registration doesn't silently disappear even
+			// if the caller passed a malformed filter like "a/#/b".
+			// Any levels after # are ignored.
 			if node.hashChild == nil {
 				node.hashChild = &Node{}
-			}
-			// # is terminal — caller can register only at this node.
-			if i != len(levels)-1 {
-				// Per spec, # is only allowed at the end. The caller
-				// should validate, but we defensively return the hash
-				// child so handler registration doesn't silently
-				// disappear.
 			}
 			return node.hashChild
 		default:

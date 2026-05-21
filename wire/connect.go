@@ -91,8 +91,8 @@ type ConnectOpts struct {
 	CleanStart bool
 	KeepAlive  uint16
 
-	Username string   // empty = no Username Flag
-	Password []byte   // nil   = no Password Flag
+	Username string    // empty = no Username Flag
+	Password []byte    // nil   = no Password Flag
 	Will     *WillOpts // nil  = no Will Flag
 
 	SessionExpiryInterval      *uint32

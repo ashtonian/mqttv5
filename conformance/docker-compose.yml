@@ -14,12 +14,8 @@ services:
 
   # emqx covers the cases mosquitto handles differently (e.g.,
   # AssignedClientIdentifier policy, shared subscriptions).
-  #
-  # Pinned to a specific patch — EMQX removed the floating "5" tag,
-  # so unpinned references to it 404 in CI. 5.10.3 is the latest
-  # stable in the 5.x line as of 2026-01.
   emqx:
-    image: emqx/emqx:5.10.3
+    image: emqx/emqx:6.2.0
     container_name: mqttv5-conformance-emqx
     ports:
       - "1884:1883"
