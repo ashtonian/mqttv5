@@ -27,9 +27,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ashtonian/mqttv5"
 	"github.com/eclipse/paho.golang/autopaho"
 	"github.com/eclipse/paho.golang/paho"
+
+	"github.com/ashtonian/mqttv5"
 )
 
 // quietLogger discards every log call so benchmark output isn't

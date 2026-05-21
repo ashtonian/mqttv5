@@ -24,10 +24,14 @@ linters:
         - fieldalignment
     gosec:
       excludes:
-        - G104 # Errors not checked: `_ = m.Ack()` is intentional throughout (manual-ack contract)
-        - G115 # Integer overflow conversions: false positives on bounded uint16 packet IDs
-        - G304 # File inclusion via variable: store/file paths are joined onto a root dir owned by the caller's Config
-        - G306 # File perms: store/file already uses 0o600 / 0o700; gosec misreads MkdirAll
+        - G103 # unsafe.String for zero-alloc topic/payload aliasing; isolated to wire/unsafe.go and contract-documented
+        - G104 # `_ = m.Ack()` is intentional throughout (manual-ack contract)
+        - G115 # bounded uint16 packet IDs trip integer-overflow false positives
+        - G118 # supervisor + decode goroutines are client-lifetime, not request-scoped — context.Background is correct
+        - G304 # file-backed store paths are root-rebased by the caller's Config
+        - G306 # store/file already uses 0o600 / 0o700; gosec misreads MkdirAll
+        - G404 # reconnect-backoff jitter is not cryptographically sensitive; math/rand/v2 is the right choice
+        - G602 # VBI decoder bounds-checks before indexing; gosec doesn't track the guard
     revive:
       rules:
         - name: var-naming

@@ -147,9 +147,9 @@ func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) 
 	opts.PacketID = id
 
 	var buf bytes.Buffer
-	if _, err := wire.WritePublish(&buf, opts); err != nil {
+	if _, werr := wire.WritePublish(&buf, opts); werr != nil {
 		c.session.ReleaseID(id)
-		return fmt.Errorf("mqttv5: encode PUBLISH: %w", err)
+		return fmt.Errorf("mqttv5: encode PUBLISH: %w", werr)
 	}
 	packet := buf.Bytes()
 

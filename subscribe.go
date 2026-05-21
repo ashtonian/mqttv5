@@ -438,12 +438,12 @@ func (c *Client) subscribeImpl(ctx context.Context, filters []TopicFilter, handl
 
 	opts := wire.SubscribeOpts{PacketID: id, Filters: filters}
 	c.stats.addSubscribeSent()
-	if err := c.enqueueAwait(ctx, func(w io.Writer) (int64, error) {
+	if werr := c.enqueueAwait(ctx, func(w io.Writer) (int64, error) {
 		return wire.WriteSubscribe(w, opts)
-	}); err != nil {
+	}); werr != nil {
 		c.removeCtrlWaiter(id)
 		c.unregisterTrieEntries(sub.trieIDs)
-		return SubscriptionToken{}, fmt.Errorf("mqttv5: write SUBSCRIBE: %w", err)
+		return SubscriptionToken{}, fmt.Errorf("mqttv5: write SUBSCRIBE: %w", werr)
 	}
 
 	suback, err := c.awaitControlAck(ctx, id, wait)
