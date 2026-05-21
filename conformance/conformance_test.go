@@ -7,6 +7,7 @@ package conformance
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -797,6 +798,105 @@ func TestSubscribe_MultipleHandlersDispatch(t *testing.T) {
 	wg.Wait()
 	if !gotA.Load() || !gotB.Load() {
 		t.Errorf("fan-out: A=%v B=%v, want both true", gotA.Load(), gotB.Load())
+	}
+}
+
+// ---------------- Shared subscriptions ----------------
+
+func TestSubscribe_SharedSub_RoundRobinAcrossGroup(t *testing.T) {
+	// MQTT v5 §4.8.2: every PUBLISH matching $share/{group}/{filter}
+	// goes to exactly one subscriber in the group. The distribution
+	// algorithm is broker-specific — mosquitto's default is
+	// round-robin, which we assert here. Two invariants matter:
+	//
+	//   1. every published payload is delivered exactly once across
+	//      the group (no drops, no duplicates — the spec guarantee).
+	//   2. mosquitto's round-robin spreads evenly: every subscriber
+	//      receives msgs/subs ± 1 messages.
+	//
+	// The second assertion is mosquitto-specific. EMQX's default is
+	// random and may leave one sub starved over short test runs —
+	// skip there.
+	if !strings.Contains(brokerURL(), "1883") {
+		t.Skip("round-robin assertion is mosquitto-specific")
+	}
+
+	const (
+		subs = 3
+		msgs = 30
+	)
+	topic := "conformance/sharedsub/" + randSuffix()
+	filter := "$share/g-" + randSuffix() + "/" + topic
+
+	var (
+		mu       sync.Mutex
+		perSub   = make([]int, subs)
+		payloads = make(map[string]int) // payload → recipient count
+	)
+	var wg sync.WaitGroup
+	wg.Add(msgs)
+
+	for i := range subs {
+		sub := connect(t)
+		idx := i
+		if _, err := sub.SubscribeCallback(context.Background(),
+			[]mqttv5.TopicFilter{{Topic: filter, QoS: 1}},
+			func(m *mqttv5.Message) {
+				mu.Lock()
+				perSub[idx]++
+				payloads[string(m.Payload)]++
+				mu.Unlock()
+				wg.Done()
+			}); err != nil {
+			t.Fatalf("sub %d: %v", i, err)
+		}
+	}
+	// Let SUBACKs settle so the broker has every member registered
+	// before the first PUBLISH lands.
+	time.Sleep(100 * time.Millisecond)
+
+	pub := connect(t)
+	for i := range msgs {
+		if err := pub.Publish(context.Background(), wire.PublishOpts{
+			Topic:   topic,
+			Payload: fmt.Appendf(nil, "msg-%d", i),
+			QoS:     1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	drained := make(chan struct{})
+	go func() { wg.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		t.Fatalf("only %d of %d messages delivered after 5s (per-sub %v)",
+			len(payloads), msgs, perSub)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// (1) spec invariant — exactly-once delivery per payload.
+	if got := len(payloads); got != msgs {
+		t.Errorf("delivered %d distinct payloads, want %d (drops?)", got, msgs)
+	}
+	for payload, count := range payloads {
+		if count != 1 {
+			t.Errorf("payload %q delivered %d times, want exactly 1 (group dedup broken)",
+				payload, count)
+		}
+	}
+
+	// (2) mosquitto round-robin — every sub within ±1 of msgs/subs.
+	target := msgs / subs
+	for i, n := range perSub {
+		if n < target-1 || n > target+1 {
+			t.Errorf("sub %d got %d messages, want %d±1 (mosquitto round-robin skew)",
+				i, n, target)
+		}
 	}
 }
 
