@@ -91,7 +91,7 @@ benchmarks/scripts/compare.sh /tmp/base/e2e_results.txt /tmp/cur/e2e_results.txt
 `compare.sh` installs `benchstat` on first use and prints the
 geomean / delta / significance table per metric.
 
-## Last verified e2e results
+## E2E results
 
 Against eclipse-mosquitto:2.0 on loopback, Apple M2 Pro (12-core),
 median of 5 runs at 3 s benchtime each. Full raw output in
@@ -209,79 +209,29 @@ capped by PUBACK round-trips.
 | 256 B |  9,875 | 42 / 5,763 |    9,907 | **5 / 286** |
 | 1 KiB | 24,560 | 44 / 8,867 | **23,898** | **5 / 286** |
 
-mqttv5 wins or ties at every size. The 256 B firehose previously
-showed a **bimodal pattern** (some runs ~9 µs, some ~19 µs) caused
-by `strings.Split` allocations in the topic-filter trie that drove
-GC pressure under load — that's been fixed by rewriting the trie
-match path to walk topic levels in place via `IndexByte('/')` with
-no allocations. Variance at 256 B is now contained inside a single
-cluster (10-run distribution: 9.05k, 9.07k, 9.12k, 9.18k, 9.41k,
-10.41k, 11.50k, 11.58k, 11.82k, 16.48k).
-
-Allocation win is consistent: **~8× fewer objects, ~16-31× fewer
-bytes** at every size — at a sustained 100k msg/sec that's the
-difference between ~880 MB/s of garbage (autopaho) and ~29 MB/s
+mqttv5 wins or ties at every size. **~8× fewer objects, ~16-31×
+fewer bytes** at every size — at a sustained 100k msg/sec that's
+the difference between ~880 MB/s of garbage (autopaho) and ~29 MB/s
 (mqttv5).
-
-## What CPU profiling found
-
-Profiling either firehose or single-publisher QoS 0 shows the same
-shape: roughly **85% of CPU is in `syscall.rawsyscalln`,
-`runtime.kevent`, `runtime.pthread_cond_wait`, and the
-`runtime.findRunnable` scheduler hot path** — pure kernel I/O and
-goroutine park/unpark. mqttv5's in-process code accounts for less
-than 5% of the cycles. Going hunting for more single-publisher
-single-thread ns/op wins past this point means going after syscalls
-themselves (writer batching, larger bufio buffers), not Go code.
-
-## Wins shipped from the last profiling pass
-
-- **Trie `Match` is zero-alloc.** Walks the topic via `IndexByte('/')`
-  instead of `strings.Split` ([internal/trie/trie.go]). Cut one alloc
-  / 48 bytes per inbound dispatch. Erased the 256 B firehose's
-  bimodal slow cluster (median 19 µs → 9.9 µs, a **49 % drop**).
-- **Publish path is zero-alloc** (`PublishMode == FireAndForget` and
-  `WaitForFlush`). `wire.EncodePublish` returns a pooled `*[]byte`;
-  the writer goroutine does one `conn.Write` and releases the buffer.
-  Eliminated the closure-capturing-`PublishOpts` allocation and the
-  `net.Buffers{...}` 3-element slice escape from the hot path. Cut
-  publish allocations from **4/285 B → 0/0** and shaved ~10-15 % off
-  single-publisher QoS 0 ns/op at every payload.
-- **Opt-in writev coalescing via `WithWriteBatch(n)`.** Off by
-  default. When enabled the writer goroutine drains up to N
-  pre-encoded packets per cycle and ships them in a single writev
-  via `net.Buffers.WriteTo`. Loopback benchmarks showed concurrent
-  QoS 1 at 256 B drops from ~17 µs → ~9.4 µs (**~45 % faster**)
-  with `WithWriteBatch(16)`. Small-payload single-publisher and
-  large-payload concurrent workloads regress under batching, so the
-  default leaves it off — turn it on only after measuring on your
-  workload.
 
 ## Takeaways
 
-1. **Allocations are flat at zero on the hot paths now.** Publish is
-   0 / 0; inbound dispatch is 5 / 286 B. Compared to autopaho's
-   15-95 allocs / 600-14 600 B per call, that's GC pressure that
-   simply doesn't exist.
+1. **Hot paths are zero-alloc.** Publish is 0 / 0; inbound dispatch
+   is 5 / 286 B. Compared to autopaho's 15-95 allocs / 600-14 600 B
+   per call, the GC pressure simply isn't there.
 2. **Single-publisher QoS 0 is tied to slightly faster.** mqttv5 is
    within ±3 % of autopaho at 64 B and 256 B and ~15 % faster at 1 KiB.
-   `PublishMode` is still meaningful for callers who need
-   transport-level error visibility (`PublishWaitForFlush`), at the
-   cost of one channel round-trip with the writer.
-3. **Concurrency is mqttv5's decisive win.** With 8 publisher
-   goroutines on one client, mqttv5 is **1.3-3.2× faster** because
-   the writer queue eliminates the mutex contention autopaho
-   serialises through.
+   `PublishMode` is meaningful for callers who need transport-level
+   error visibility (`PublishWaitForFlush`), at the cost of one
+   channel round-trip with the writer.
+3. **Concurrency is the decisive win.** With 8 publisher goroutines
+   on one client, mqttv5 is **1.3-3.2× faster** because the writer
+   queue eliminates the mutex contention autopaho serialises through.
 4. **QoS 1 single-publisher: mqttv5 wins.** Faster *and* fewer allocs
    at every payload size.
 5. **Round-trip-dominated workloads (QoS 2, RoundTrip, Subscribe)
    are roughly tied on ns/op** — both libraries spend most of their
    time waiting on the broker. The allocation gap remains.
-6. **Next available win: writer batching.** A single writev syscall
-   per Publish accounts for ~33 % of CPU in the writer. Coalescing
-   multiple queued pre-encoded packets into one writev would cut
-   syscall count under sustained concurrent publish (and is unlocked
-   by the new bytes-based `writeReq` shape).
 
 ## Codec micro benchmarks (no broker)
 

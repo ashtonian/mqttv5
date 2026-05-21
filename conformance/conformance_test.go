@@ -585,67 +585,77 @@ func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 // ---------------- Session resume (publish-while-offline) ----------------
 
 func TestSession_QueuedPublishesDeliveredOnResume(t *testing.T) {
-	// Subscriber A connects with CleanStart=false + SessionExpiry>0,
-	// subscribes, disconnects. Publisher P publishes QoS 1 while A
-	// is offline. When A reconnects, the broker must deliver the
-	// queued message.
+	// A single Subscriber A dials the broker via a controllable TCP
+	// proxy. Sequence:
+	//
+	//  1. A connects (CleanStart=false, SessionExpiry>0), subscribes.
+	//  2. Proxy.Pause closes A's TCP — broker sees A go offline.
+	//  3. Publisher P publishes QoS 1 — broker queues it for A's
+	//     persisted session.
+	//  4. Proxy.Resume re-enables forwarding — A's supervisor
+	//     reconnects with the same ClientID; activeSubs (and the
+	//     local trie handlers) survived the network drop, so the
+	//     broker-pipelined replay lands on the right handler.
+	//
+	// Using a fresh second Client here would race: a fresh Client's
+	// activeSubs is empty, so the queued PUBLISH that mosquitto
+	// pipelines right after CONNACK would land on an empty trie and
+	// get dropped before SubscribeImpl could re-register the
+	// handler. The single-Client + proxy-drop shape matches what
+	// happens in production when a real network blip triggers the
+	// supervisor's reconnect path.
+	requireBroker(t, brokerURL())
+
 	id := "conformance-resume-" + randSuffix()
 	topic := "conformance/resume/" + randSuffix()
+	proxy := newTCPProxy(t, stripScheme(brokerURL()))
 
-	subA1, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
+	subA, err := mqttv5.New(
+		mqttv5.WithBroker(proxy.URL()),
 		mqttv5.WithClientID(id),
 		mqttv5.WithCleanStart(false),
 		mqttv5.WithSessionExpiry(60),
+		mqttv5.WithReconnectBackoff(mqttv5.ConstantBackoff(100*time.Millisecond)),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := subA1.Connect(context.Background()); err != nil {
+	if err := subA.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := subA1.Subscribe(context.Background(),
-		[]mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(8)); err != nil {
-		_ = subA1.Disconnect(context.Background())
-		t.Fatal(err)
-	}
-	_ = subA1.Disconnect(context.Background())
+	t.Cleanup(func() { _ = subA.Disconnect(context.Background()) })
 
-	// Publish while A is offline.
-	pub := connect(t)
-	want := []byte("queued-while-offline")
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
-		Topic: topic, Payload: want, QoS: 1,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(100 * time.Millisecond)
-
-	// A reconnects with the SAME ClientID + CleanStart=false. Re-Subscribe
-	// so we have a local channel; the broker still routes the queued
-	// message because the server-side subscription persisted with the
-	// session.
-	subA2, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
-		mqttv5.WithClientID(id),
-		mqttv5.WithCleanStart(false),
-		mqttv5.WithSessionExpiry(60),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := subA2.Connect(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = subA2.Disconnect(context.Background()) })
-
-	ch, _, err := subA2.Subscribe(context.Background(),
+	ch, _, err := subA.Subscribe(context.Background(),
 		[]mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(8))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	m := expectMessage(t, ch, 3*time.Second)
+	// Drop A's connection. Supervisor enters its 100ms backoff
+	// loop and keeps trying to reconnect through the still-paused
+	// proxy, so A stays offline from the broker's view.
+	proxy.Pause()
+
+	// Brief settle: let the supervisor notice the closed conn and
+	// hit at least one failed reconnect attempt before publishing.
+	time.Sleep(150 * time.Millisecond)
+
+	want := []byte("queued-while-offline")
+	pub := connect(t)
+	if err := pub.Publish(context.Background(), wire.PublishOpts{
+		Topic: topic, Payload: want, QoS: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Give the broker a moment to actually queue the message into
+	// A's persisted session before we let A back in.
+	time.Sleep(100 * time.Millisecond)
+
+	// Re-enable forwarding. Supervisor's next backoff tick reconnects,
+	// mosquitto pipelines the queued PUBLISH, the live trie dispatches.
+	proxy.Resume()
+
+	m := expectMessage(t, ch, 5*time.Second)
 	if !bytes.Equal(m.Payload, want) {
 		t.Errorf("queued publish payload = %q, want %q", m.Payload, want)
 	}

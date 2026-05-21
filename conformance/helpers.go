@@ -18,8 +18,10 @@ package conformance
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +99,87 @@ func connect(t *testing.T, opts ...mqttv5.Option) *mqttv5.Client {
 		_ = cli.Disconnect(shutdown)
 	})
 	return cli
+}
+
+// tcpProxy is a controllable TCP forwarder sitting between a test
+// client and the real broker. Tests use it to simulate a network
+// drop on a single client (Pause closes every live conn and refuses
+// new ones; Resume re-enables forwarding) without killing the broker
+// or reaching into client internals — the supervisor sees a real
+// transport-level disconnect, enters its reconnect loop, and resumes
+// once the proxy comes back up.
+type tcpProxy struct {
+	ln     net.Listener
+	target string
+
+	mu      sync.Mutex
+	paused  bool
+	conns   []net.Conn
+}
+
+// newTCPProxy listens on 127.0.0.1:0 and forwards every accepted
+// connection to target (host:port). Cleanup is registered with t.
+func newTCPProxy(t *testing.T, target string) *tcpProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("tcpProxy listen: %v", err)
+	}
+	p := &tcpProxy{ln: ln, target: target}
+	go p.serve()
+	t.Cleanup(func() {
+		_ = p.ln.Close()
+		p.Pause()
+	})
+	return p
+}
+
+// URL returns the mqtt:// URL clients should dial to reach the proxy.
+func (p *tcpProxy) URL() string { return "mqtt://" + p.ln.Addr().String() }
+
+// Pause closes every live forwarded connection and refuses new ones
+// until Resume is called.
+func (p *tcpProxy) Pause() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.paused = true
+	for _, c := range p.conns {
+		_ = c.Close()
+	}
+	p.conns = nil
+}
+
+// Resume re-enables forwarding so the next accept opens a new
+// upstream connection.
+func (p *tcpProxy) Resume() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.paused = false
+}
+
+func (p *tcpProxy) serve() {
+	for {
+		c, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		p.mu.Lock()
+		if p.paused {
+			p.mu.Unlock()
+			_ = c.Close()
+			continue
+		}
+		upstream, err := net.Dial("tcp", p.target)
+		if err != nil {
+			p.mu.Unlock()
+			_ = c.Close()
+			continue
+		}
+		p.conns = append(p.conns, c, upstream)
+		p.mu.Unlock()
+		go func() { _, _ = io.Copy(upstream, c); _ = upstream.Close() }()
+		go func() { _, _ = io.Copy(c, upstream); _ = c.Close() }()
+	}
 }
 
 // randSuffix returns a short random string so tests don't collide on

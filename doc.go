@@ -8,7 +8,7 @@
 //
 // One package, one [Client]. No paho / autopaho split — reconnect,
 // replay, and resubscribe are always on. Channel-native subscribe:
-// <-chan *Message ([Client.Subscribe]), [Queue][*Message]
+// <-chan *[Message] ([Client.Subscribe]), [Queue] of *[Message]
 // ([Client.SubscribeQueue]), or a sync callback ([Client.SubscribeCallback]).
 // Backpressure is a first-class concept — per-subscription
 // [DropNewest] / [DropOldest] auto-ack the dropped message so the
@@ -25,8 +25,8 @@
 //     [GroupPublishHashByTopic]).
 //   - Publisher pool against one broker: [WithPublisherPool].
 //
-// Typed publish / subscribe goes through a generic [Codec][T]; JSON
-// and msgpack ship in separate submodules so the core stays
+// Typed publish / subscribe goes through the generic [Codec] interface;
+// JSON and msgpack ship in separate submodules so the core stays
 // stdlib-only. The durable outbound [QueuePublisher] lets you enqueue
 // publishes while disconnected, drain on reconnect, and survive
 // process restart (when combined with the queue/file submodule).
@@ -81,7 +81,7 @@
 //	    QoS:     1,
 //	})
 //
-// See the [Example] functions below for end-to-end snippets covering
+// See the Example functions below for end-to-end snippets covering
 // each subscribe shape, typed payloads, multi-broker fan-out, and the
 // durable queue publisher.
 //
@@ -98,8 +98,8 @@
 // Each opt-in submodule has its own go.mod so importing it does not
 // add a runtime dependency to the core:
 //
-//   - codec/json     — JSON [Codec][T] for [Typed][T].
-//   - codec/msgpack  — MessagePack [Codec][T] via vmihailenco/msgpack/v5.
+//   - codec/json     — JSON [Codec] implementation, wired into [Typed].
+//   - codec/msgpack  — MessagePack [Codec] via vmihailenco/msgpack/v5.
 //   - queue/file     — Durable outbound publish queue (filesystem WAL).
 //   - store/file     — Crash-safe session store for in-flight QoS 1/2.
 //   - transport/ws   — WebSocket transport via gobwas/ws; wire it in
