@@ -5,6 +5,7 @@ package mqttv5
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/ashtonian/mqttv5/wire"
 )
@@ -16,11 +17,15 @@ type Codec[T any] interface {
 	Decode(b []byte) (T, error)
 }
 
-// TypedMessage wraps Message with an already-decoded Value. Value
-// lives on the heap and is safe to retain past Ack; the embedded
-// *Message still aliases the frame for Topic / Properties access.
+// TypedMessage wraps Message with an already-decoded Value and a
+// detached Topic. Both Value and Topic are safe to retain past Ack —
+// Value via the codec's allocation, Topic via an explicit
+// strings.Clone at construction. The embedded *Message still aliases
+// the frame for Payload / Properties access; use Message.ClonePayload
+// or read those fields before calling Ack if you need them.
 type TypedMessage[T any] struct {
 	*Message
+	Topic string
 	Value T
 }
 
@@ -66,7 +71,11 @@ func (t *Typed[T]) Subscribe(ctx context.Context, filters []TopicFilter, opts ..
 				_ = m.Ack()
 				continue
 			}
-			out <- &TypedMessage[T]{Message: m, Value: v}
+			out <- &TypedMessage[T]{
+				Message: m,
+				Topic:   strings.Clone(m.Topic),
+				Value:   v,
+			}
 		}
 	}()
 
@@ -95,7 +104,11 @@ func (t *Typed[T]) SubscribeQueue(ctx context.Context, filters []TopicFilter, op
 				_ = m.Ack()
 				continue
 			}
-			out.Enqueue(&TypedMessage[T]{Message: m, Value: v})
+			out.Enqueue(&TypedMessage[T]{
+				Message: m,
+				Topic:   strings.Clone(m.Topic),
+				Value:   v,
+			})
 		}
 	}()
 

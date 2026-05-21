@@ -337,7 +337,11 @@ type writeReq struct {
 // New constructs a Client. Apply WithBroker (required) plus any other
 // options. The Client is not connected — call Connect.
 func New(opts ...Option) (*Client, error) {
-	cfg := &Config{CleanStart: true}
+	cfg := &Config{
+		CleanStart:                 true,
+		SessionExpiry:              DefaultSessionExpiry,
+		RequestProblemInformation:  true,
+	}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
 			return nil, err

@@ -35,10 +35,21 @@ const (
 	// CONNECT/CONNACK) when WithConnectTimeout is not called.
 	DefaultConnectTimeout = 10 * time.Second
 
-	// DefaultPingTimeoutFloor is the minimum PingTimeout the defaults
-	// will produce — KeepAlive*2 is used unless it is below this
-	// floor, in which case the floor wins.
-	DefaultPingTimeoutFloor = 10 * time.Second
+	// DefaultPingTimeout is the budget for PINGRESP after a PINGREQ
+	// before the connection is declared dead. Chosen flat (not a
+	// multiple of KeepAlive) because PINGRESP is a tiny packet whose
+	// RTT does not scale with how often we ping. With DefaultKeepAlive
+	// (30 s) the total dead-detect time is 40 s — comfortably inside
+	// every common broker's 1.5×KeepAlive (~45 s) disconnect window,
+	// so the client drives the reconnect rather than getting cut.
+	DefaultPingTimeout = 10 * time.Second
+
+	// DefaultSessionExpiry is the Session Expiry Interval (§3.1.2.11.2)
+	// advertised on every CONNECT. 5 minutes is long enough to ride out
+	// the typical reconnect blip / container redeploy window so QoS 1/2
+	// resume actually works out of the box; short enough that the
+	// broker isn't asked to hold idle sessions indefinitely.
+	DefaultSessionExpiry uint32 = 300
 
 	// DefaultWriteQueueSize sizes the internal MPSC write channel.
 	DefaultWriteQueueSize = 256
@@ -297,8 +308,10 @@ func WithCleanStartOnReconnect(b bool) Option {
 	}
 }
 
-// WithSessionExpiry sets the Session Expiry Interval (seconds). Zero
-// means the session ends with the network connection.
+// WithSessionExpiry sets the Session Expiry Interval (§3.1.2.11.2) in
+// seconds. Default [DefaultSessionExpiry] (300 s / 5 min) — enough
+// for QoS 1/2 resume across a typical reconnect blip. Zero ends the
+// session with the network connection (no broker-side retention).
 func WithSessionExpiry(s uint32) Option {
 	return func(c *Config) error {
 		c.SessionExpiry = s
@@ -345,7 +358,10 @@ func WithRequestResponseInformation(b bool) Option {
 }
 
 // WithRequestProblemInformation asks the broker for ReasonString /
-// UserProperties on error responses (§3.1.2.11.7).
+// UserProperties on error responses (§3.1.2.11.7). Default true —
+// debugging a CONNECT or PUBLISH refusal without these is "why was
+// this rejected?" with no answer; the wire cost is a handful of
+// bytes on the error path only. Pass false to opt out.
 func WithRequestProblemInformation(b bool) Option {
 	return func(c *Config) error {
 		c.RequestProblemInformation = b
@@ -382,8 +398,9 @@ func WithConnectTimeout(d time.Duration) Option {
 }
 
 // WithPingTimeout sets the budget for a PINGRESP after a PINGREQ.
-// Exceeding it forces a reconnect. Defaults clamp to at least
-// [DefaultPingTimeoutFloor].
+// Exceeding it forces a reconnect. Default [DefaultPingTimeout]
+// (10 s). Override only on links where PINGRESP round-trip exceeds a
+// few seconds (LEO satellite, severely congested cellular).
 func WithPingTimeout(d time.Duration) Option {
 	return func(c *Config) error {
 		c.PingTimeout = d
@@ -755,10 +772,7 @@ func (c *Config) defaults() {
 		c.ConnectTimeout = DefaultConnectTimeout
 	}
 	if c.PingTimeout == 0 {
-		c.PingTimeout = time.Duration(c.KeepAlive) * time.Second * 2
-		if c.PingTimeout < DefaultPingTimeoutFloor {
-			c.PingTimeout = DefaultPingTimeoutFloor
-		}
+		c.PingTimeout = DefaultPingTimeout
 	}
 	if c.DisconnectFlushTimeout == 0 {
 		c.DisconnectFlushTimeout = DefaultDisconnectFlushTimeout

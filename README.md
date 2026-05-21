@@ -45,10 +45,6 @@ go get github.com/ashtonian/mqttv5
   `WithDialFunc(ws.DialFunc(opts))` (see [`examples/ws`](examples/ws)).
   Zero impact on the core's stdlib-only promise.
 
-Pick eclipse paho if you specifically need MQTT 3.1.x (we're v5 only)
-or Eclipse Foundation governance. Otherwise mqttv5 has all the same
-surface and then some.
-
 ## A complete example
 
 Connect with broker failover + TLS, subscribe both via channel and
@@ -453,15 +449,15 @@ No silent downgrade.
 | `WithoutKeepAlive()` | — | Disable PINGREQ entirely. Rarely correct in production. |
 | `WithCleanStart(b)` | true | `CleanStart` on the initial CONNECT. |
 | `WithCleanStartOnReconnect(b)` | false | `CleanStart` on every reconnect. False preserves QoS 1/2 session for resume. |
-| `WithSessionExpiry(seconds)` | 0 | Session Expiry Interval. |
+| `WithSessionExpiry(seconds)` | 300 (5 min) | Session Expiry Interval (§3.1.2.11.2). Default holds the broker session long enough for QoS 1/2 resume across a typical reconnect blip. Pass 0 to end the session with the connection. |
 | `WithReceiveMaximum(n)` | unset (broker default 65535) | Cap on concurrent inbound QoS 1/2. |
-| `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property §3.1.2.11.4 — caps the largest packet the broker may send. |
+| `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property §3.1.2.11.4 — caps the largest packet the broker may send. **Note:** with the default, a buggy / hostile broker can send arbitrarily large PUBLISHes; set explicitly when broker trust is limited. |
 | `WithInboundTopicAliasMaximum(n)` | 0 (no inbound aliases) | CONNECT property §3.1.2.11.5 — opt into wire compression on inbound PUBLISHes. |
 | `WithRequestResponseInformation(b)` | false | CONNECT property §3.1.2.11.6 — broker returns `ResponseInformation` in CONNACK. |
-| `WithRequestProblemInformation(b)` | false | CONNECT property §3.1.2.11.7 — broker returns `ReasonString` / `UserProperties` on errors. |
+| `WithRequestProblemInformation(b)` | true | CONNECT property §3.1.2.11.7 — broker returns `ReasonString` / `UserProperties` on errors. On by default; pass `false` to opt out. |
 | `WithConnectUserProperty(k, v)` / `WithConnectUserProperties(p)` | — | CONNECT user properties; append-style or bulk replace. |
 | `WithConnectTimeout(d)` | 10 s | Dial + CONNECT/CONNACK budget. |
-| `WithPingTimeout(d)` | 2 × keepalive (≥10 s) | PINGRESP budget. |
+| `WithPingTimeout(d)` | 10 s | PINGRESP budget. Total dead-connection detect = `KeepAlive + PingTimeout` (40 s with defaults), inside the broker's 1.5×KeepAlive cutoff so the client drives reconnect. |
 | `WithDisconnectFlushTimeout(d)` | 500 ms | Flush budget for the DISCONNECT write on graceful shutdown. |
 | `WithWriteQueueSize(n)` | 256 | Internal MPSC write buffer. |
 | `WithWriteBatch(n)` | 0 (off) | Coalesce up to n pre-encoded packets per writev syscall. Wins under sustained concurrent publishers; measure before enabling. |
