@@ -17,7 +17,7 @@ go get github.com/ashtonian/mqttv5
 
 - Module: `github.com/ashtonian/mqttv5`
 - License: [Apache 2.0](LICENSE) (with [NOTICE](NOTICE))
-- Go: 1.26+ (evergreen — tracks the latest stable Go)
+- Go: 1.26+
 - Benchmarks: [benchmarks/README.md](benchmarks/README.md)
 
 ## Simple
@@ -383,6 +383,7 @@ No silent downgrade.
 | `WithDisconnectFlushTimeout(d)` | 500 ms | Flush budget for the DISCONNECT write on graceful shutdown. |
 | `WithWriteQueueSize(n)` | 256 | Internal MPSC write buffer. |
 | `WithWriteBatch(n)` | 0 (off) | Coalesce up to n pre-encoded packets per writev syscall. Wins under sustained concurrent publishers; measure before enabling. |
+| `WithWriteOverflowPolicy(p)` | `WriteBlock` | QoS 0 only. `WriteBlock` waits for queue room / ctx; `WriteDropNewest` returns `ErrWriteQueueFull` immediately when the writer queue is full. Use for telemetry where head-of-line latency on the producer is worse than occasional loss. QoS 1/2 always block on the broker ack regardless. |
 | `WithWill(opts)` | — | Will message + properties. |
 | `WithReconnectBackoff(b)` | `ExponentialBackoff(1s, 30s, 200ms)` | `ConstantBackoff(d)` also shipped. |
 | `WithTLSConfig(*tls.Config)` | — | TLS for `mqtts://`. |
@@ -509,6 +510,7 @@ Branch with `errors.Is(err, ...)`; stable across versions.
 | `ErrMissingBroker` | `New` | No URLs supplied. |
 | `ErrInvalidBrokerURL` | `New`, `SetBrokers` | URL failed to parse or has unsupported scheme. `WithDialFunc` relaxes scheme validation. |
 | `ErrChanDropOldestUnsupported` | `Subscribe` (chan) | Explicit `SubDropPolicy(DropOldest)` on the channel-based Subscribe. Use `SubscribeQueue` for DropOldest. |
+| `ErrWriteQueueFull` | `Publish` (QoS 0) | Writer queue at capacity AND client configured with `WithWriteOverflowPolicy(WriteDropNewest)`. The publish never reached the wire. |
 | `ErrNilHandler` | `SubscribeCallback` | Handler argument was nil. |
 | `ErrSharedSubsUnsupported` | `Subscribe*` | Broker disabled `$share/...` in CONNACK. |
 | `ErrWildcardSubsUnsupported` | `Subscribe*` | Broker disabled `+` / `#` in CONNACK. |
