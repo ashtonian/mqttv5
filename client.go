@@ -30,6 +30,11 @@ var (
 	ErrConnectRefused   = errors.New("mqttv5: broker refused CONNECT")
 	ErrUnexpectedPacket = errors.New("mqttv5: unexpected packet from broker")
 
+	// ErrWriteQueueFull is returned by QoS 0 Publish when the client
+	// is configured with WriteDropNewest and the writer queue has no
+	// room. The publish never reaches the wire.
+	ErrWriteQueueFull = errors.New("mqttv5: write queue full")
+
 	// Subscribe-time errors raised when the broker advertised the
 	// feature as unsupported in CONNACK (MQTT v5 §3.2.2.3.{11,12,13}).
 	// Returned before any SUBSCRIBE traffic goes on the wire.

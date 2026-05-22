@@ -127,6 +127,12 @@ type Config struct {
 
 	WriteQueueSize int
 
+	// WriteOverflowPolicy controls what QoS 0 Publish does when the
+	// writer queue is full. WriteBlock (default) waits for room or
+	// ctx; WriteDropNewest returns ErrWriteQueueFull immediately.
+	// QoS 1/2 unaffected.
+	WriteOverflowPolicy WriteOverflowPolicy
+
 	// WriteBatchMax caps how many pre-encoded packets the writer
 	// goroutine coalesces into one writev. 0 disables batching.
 	// Worth enabling only for sustained concurrent publishers; see
@@ -666,6 +672,51 @@ func WithPublishMode(m PublishMode) Option {
 			return fmt.Errorf("mqttv5: invalid PublishMode %d", m)
 		}
 		c.PublishMode = m
+		return nil
+	}
+}
+
+// WriteOverflowPolicy controls what QoS 0 [Client.Publish] does when
+// the internal writer queue (sized by [WithWriteQueueSize]) is full.
+// QoS 1/2 are unaffected — they always block on the broker ack.
+type WriteOverflowPolicy uint8
+
+const (
+	// WriteBlock (default) blocks Publish until the writer queue has
+	// room, the call's ctx fires, or the connection goes down. The
+	// caller surfaces overload as latency.
+	WriteBlock WriteOverflowPolicy = iota
+
+	// WriteDropNewest returns [ErrWriteQueueFull] immediately when
+	// the queue has no room. Use for high-rate fire-and-forget
+	// telemetry where the producer goroutine must not block.
+	WriteDropNewest
+)
+
+func (p WriteOverflowPolicy) valid() bool {
+	return p == WriteBlock || p == WriteDropNewest
+}
+
+// String returns a stable name for the policy.
+func (p WriteOverflowPolicy) String() string {
+	switch p {
+	case WriteDropNewest:
+		return "drop_newest"
+	default:
+		return "block"
+	}
+}
+
+// WithWriteOverflowPolicy selects the QoS 0 writer-queue overflow
+// policy. Only meaningful for [PublishFireAndForget] — QoS 1/2 and
+// [PublishWaitForFlush] always wait for either the broker or the
+// writer to be ready.
+func WithWriteOverflowPolicy(p WriteOverflowPolicy) Option {
+	return func(c *Config) error {
+		if !p.valid() {
+			return fmt.Errorf("mqttv5: invalid WriteOverflowPolicy %d", p)
+		}
+		c.WriteOverflowPolicy = p
 		return nil
 	}
 }

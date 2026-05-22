@@ -89,6 +89,27 @@ func (c *Client) publishQoS0(ctx context.Context, opts wire.PublishOpts) error {
 		wire.ReleaseBuf(bp)
 		return ErrNotConnected
 	}
+
+	// WriteDropNewest: don't wait for queue room. The default branch
+	// fires only if none of the others are ready immediately, so
+	// shutdown/dying still take precedence.
+	if c.cfg.WriteOverflowPolicy == WriteDropNewest {
+		select {
+		case cs.writeQueue <- writeReq{pkt: bp}:
+			return nil
+		case <-cs.dying:
+			wire.ReleaseBuf(bp)
+			return ErrNotConnected
+		case <-c.shutdown:
+			wire.ReleaseBuf(bp)
+			return ErrClosed
+		default:
+			wire.ReleaseBuf(bp)
+			return ErrWriteQueueFull
+		}
+	}
+
+	// WriteBlock: wait for room, ctx, or teardown.
 	select {
 	case cs.writeQueue <- writeReq{pkt: bp}:
 		return nil
