@@ -264,9 +264,9 @@ type benchLib struct {
 
 	// Queue / multi-consumer adapters. subQueue and subMultiQueue and
 	// fhMultiQueue are nil on autopaho (no Queue API).
-	subQueue       func(b *testing.B, payload []byte)
-	subMultiChan   func(b *testing.B, payload []byte, consumers int)
-	subMultiQueue  func(b *testing.B, payload []byte, consumers int)
+	subQueue      func(b *testing.B, payload []byte)
+	subMultiChan  func(b *testing.B, payload []byte, consumers int)
+	subMultiQueue func(b *testing.B, payload []byte, consumers int)
 
 	// Firehose (QoS 0 publish, no PUBACK gating) — pure dispatch
 	// throughput on the chan / queue primitive. Compare against the
