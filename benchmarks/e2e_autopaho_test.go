@@ -227,3 +227,121 @@ func sub_autopaho(b *testing.B, payload []byte) {
 	}
 	wg.Wait()
 }
+
+// subMulti_autopaho_chan: one publisher fires b.N QoS 1 messages async;
+// N consumer goroutines race for them on autopaho's delivery channel.
+// Direct counterpart of subMulti_mqttv5_chan — exposes channel
+// receive-side contention under fan-out for the paho stack.
+func subMulti_autopaho_chan(b *testing.B, payload []byte, consumers int) {
+	topic := "bench/multichan/" + uniqueID("")
+	pub := connectAutopaho(b, uniqueID("autopaho-mc-pub"))
+	_, ch := subscribeAutopaho(b, uniqueID("autopaho-mc-sub"), topic)
+	ctx := context.Background()
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	received := atomic.Int64{}
+	target := int64(b.N)
+	done := make(chan struct{})
+
+	var consWG sync.WaitGroup
+	for range consumers {
+		consWG.Add(1)
+		go func() {
+			defer consWG.Done()
+			for {
+				select {
+				case <-ch:
+					received.Add(1)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		for range b.N {
+			_, _ = pub.Publish(ctx, &paho.Publish{
+				Topic: topic, Payload: payload, QoS: 1,
+			})
+		}
+	}()
+	pubWG.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < target && time.Now().Before(deadline) {
+		time.Sleep(time.Microsecond)
+	}
+	b.StopTimer()
+	close(done)
+	consWG.Wait()
+
+	if received.Load() < target {
+		b.Fatalf("multi-chan: received %d/%d after publisher done", received.Load(), target)
+	}
+}
+
+// fhMulti_autopaho_chan: QoS 0 fire-hose into autopaho's delivery
+// channel; N consumer goroutines drain. Counterpart of
+// fhMulti_mqttv5_chan — exposes channel dispatch throughput under
+// fan-out for the paho stack.
+func fhMulti_autopaho_chan(b *testing.B, payload []byte, consumers int) {
+	topic := "bench/fhchan/" + uniqueID("")
+	pub := connectAutopaho(b, uniqueID("autopaho-fhc-pub"))
+	_, ch := subscribeAutopaho(b, uniqueID("autopaho-fhc-sub"), topic)
+	ctx := context.Background()
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	received := atomic.Int64{}
+	target := int64(b.N)
+	done := make(chan struct{})
+
+	var consWG sync.WaitGroup
+	for range consumers {
+		consWG.Add(1)
+		go func() {
+			defer consWG.Done()
+			for {
+				select {
+				case <-ch:
+					received.Add(1)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		for range b.N {
+			_, _ = pub.Publish(ctx, &paho.Publish{
+				Topic: topic, Payload: payload, QoS: 0,
+			})
+		}
+	}()
+	pubWG.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < target && time.Now().Before(deadline) {
+		time.Sleep(time.Microsecond)
+	}
+	b.StopTimer()
+	close(done)
+	consWG.Wait()
+
+	if received.Load() < target {
+		b.Fatalf("fh-chan: received %d/%d after publisher done", received.Load(), target)
+	}
+}

@@ -73,25 +73,26 @@ See [`examples/`](examples/) for full demos — TLS, multi-broker failover,
 publisher pool, durable queue, raw-bytes subscribe, WebSocket, OAuth
 rotation, and lifecycle observability.
 
-## Why this over `eclipse/paho.golang` + `autopaho`
+## Why this over [eclipse/paho.golang](https://github.com/eclipse/paho.golang) + [autopaho](https://github.com/eclipse/paho.golang/tree/master/autopaho)
 
 - **Go-idiomatic top to bottom.** Channels (`<-chan *Message`) and
   queues for delivery, not just global `OnPublishReceived` callbacks.
   `context.Context` on every operation. Sentinel errors with
   `errors.Is`. Functional options instead of a 40-field
-  `ClientOptions` struct. paho was ported from a Java/C client and
-  shows it.
+  `ClientOptions` struct.
 - **One client. Supervisor baked in.** No `paho` / `autopaho` split —
   reconnect, replay-in-flight, and auto-resubscribe are always on.
 - **20–60× faster decode, zero steady-state allocs** on the receive
   path. Topic and payload are zero-copy slices into a pooled frame;
-  properties decode lazily.
+  properties decode lazily. **~30× less GC pressure** at sustained
+  load (~29 MB/s of garbage vs ~880 MB/s for autopaho at 100k msg/s)
+  — smaller pauses, less p99 jitter.
 - **Multi-broker, kept distinct and composable.** Failover
   (`WithBrokers`), fan-out across N independent brokers (`ClientGroup`),
   publish-only pool against one broker (`WithPublisherPool`) — three
-  real patterns paho conflates into one retry knob. Compose them:
-  `WithBrokers` inside a `GroupMember` for HA-per-region, then
-  `WithPublisherPool` on top for throughput.
+  real patterns, each its own API. Compose them: `WithBrokers` inside
+  a `GroupMember` for HA-per-region, then `WithPublisherPool` on top
+  for throughput.
 - **Publisher pool that actually scales.** paho serialises every
   write behind one mutex; mqttv5 funnels into MPSC + one writer
   goroutine, so N publish-only conns parallelise across cores.
@@ -150,7 +151,7 @@ The core is stdlib-only. Opt-in submodules each have their own
 
 ## Three multi-broker patterns
 
-mqttv5 separates patterns autopaho conflates:
+Three distinct shapes, each its own API:
 
 | Goal | API | Connections |
 |---|---|---|
@@ -579,7 +580,7 @@ the 2.5× win under fan-in.
 | Topic alias outbound | Auto-allocated on QoS 0 publishes when broker advertises `TopicAliasMaximum > 0`. Skipped for QoS 1/2 so replay carries the full topic. |
 | Disconnect | Best-effort graceful DISCONNECT (bounded by ctx + `cs.dying`), tears down per-conn goroutines, closes consumer channels/queues. Idempotent. |
 
-## Architecture (one paragraph)
+## Architecture
 
 One goroutine per connection drives `read → decode → trie match →
 handlers (sync)`. A dedicated writer goroutine drains an MPSC channel

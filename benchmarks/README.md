@@ -184,24 +184,49 @@ whole point of the design and it pays off here.
 Tied to slight mqttv5 win on ns/op. **~4× fewer allocations,
 ~7-8× fewer bytes** for mqttv5.
 
-### Subscribe throughput (QoS 1 publish + manual-ack receive)
+### Subscribe — single consumer, channel vs queue (QoS 1 + manual ack)
 
-| Payload | autopaho ns/op | autopaho allocs/B | mqttv5 ns/op | mqttv5 allocs/B |
-|---|---:|---:|---:|---:|
-| 64 B  | 201,005 | 95 / 10,140 | **171,361** | **22 / 1,108** |
-| 256 B | 194,637 | 95 / 10,684 |  193,605 | **22 / 1,270** |
-| 1 KiB | 209,762 | 97 / 14,652 |  202,902 | **22 / 2,136** |
+`BenchmarkE2E_Subscribe` (chan) vs `BenchmarkE2E_SubscribeQueue`
+(queue). Same workload — one publisher fires QoS 1 messages async,
+one consumer drains and acks. Only the delivery primitive differs.
 
-Tied to slight mqttv5 win, same ~4× allocs / ~7-8× bytes story.
+| Payload | autopaho chan ns/op | autopaho allocs/B | mqttv5 chan ns/op | mqttv5 chan allocs/B | mqttv5 queue ns/op | mqttv5 queue allocs/B |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 B  | 178,809 | 95 / 10,142 | **171,334** | **21 / 1,058** | **169,344** | **19 / 825** |
+| 256 B | 169,998 | 95 / 10,685 | **170,938** | **21 / 1,219** | **172,569** | **19 / 988** |
+| 1 KiB | 182,351 | 97 / 14,653 | **177,546** | **21 / 2,088** | **181,167** | **19 / 1,856** |
 
-### Subscribe firehose (no PUBACK gating, callback subscriber)
+Broker round-trip dominates the per-message time at QoS 1 (~170 µs
+floor), so chan and queue land within noise on ns/op. Queue costs
+**+1 alloc, +15 B** vs chan per message (linked-list node) and
+otherwise reads identical. Both mqttv5 surfaces are **~5× fewer
+allocs / ~7-12× fewer bytes** than autopaho's chan.
 
-Publisher fires QoS 0 without per-message acks (mqttv5's default
-`Publish` in `PublishFireAndForget` mode; autopaho regular QoS 0
-Publish). Subscriber increments an atomic counter directly from the
-inbound dispatch path — no channel buffer to overflow. Unlike the
-QoS 1 `Subscribe` benchmark above, the publisher rate is **not**
-capped by PUBACK round-trips.
+### Subscribe — fan-out under QoS 1 (broker-bound)
+
+`BenchmarkE2E_SubscribeMultiConsumer` — N consumer goroutines race
+for messages on the same delivery surface; QoS 1 publish + ack.
+
+ns/op at 256 B (representative; full matrix in `e2e_results.txt`):
+
+| Consumers | mqttv5 chan | mqttv5 queue | autopaho chan |
+|---:|---:|---:|---:|
+| 1 | 175,038 | 179,852 | 188,384 |
+| 4 | 176,182 | 180,429 | 191,140 |
+| 8 | 173,308 | 180,633 | 194,788 |
+
+Flat across c1→c8 for both mqttv5 surfaces — fan-out under QoS 1 is
+broker-bound (the PUBACK round-trip is the floor), so per-message
+chan/queue contention is in the noise. autopaho creeps ~4% slower
+at c8. At 64 B (most contention-sensitive) the same pattern
+amplifies: autopaho 189k → 216k from c1→c8 (~14% slower); mqttv5
+chan and queue both flat ±3%.
+
+### Subscribe firehose — callback throughput ceiling (QoS 0)
+
+`BenchmarkE2E_SubscribeFireHose` — QoS 0 publish (no PUBACK gating)
++ `SubscribeCallback` (sync on read goroutine, atomic counter).
+The "no chan/queue overhead at all" reference point.
 
 | Payload | autopaho ns/op | autopaho allocs/B | mqttv5 ns/op | mqttv5 allocs/B |
 |---|---:|---:|---:|---:|
@@ -209,18 +234,59 @@ capped by PUBACK round-trips.
 | 256 B |  9,875 | 42 / 5,763 |    9,907 | **5 / 286** |
 | 1 KiB | 24,560 | 44 / 8,867 | **23,898** | **5 / 286** |
 
-mqttv5 wins or ties at every size. **~8× fewer objects, ~16-31×
-fewer bytes** at every size — at a sustained 100k msg/sec that's
-the difference between ~880 MB/s of garbage (autopaho) and ~29 MB/s
-(mqttv5).
+mqttv5 ties to slight win on ns/op, **~8× fewer objects, ~16-31×
+fewer bytes** at every size. At ~180k msg/s sustained that's the
+difference between ~880 MB/s and ~29 MB/s of garbage produced.
+
+### Subscribe firehose — channel vs queue under fan-out (QoS 0)
+
+`BenchmarkE2E_SubscribeFireHoseFanOut` — same firehose publisher,
+but the consumer pulls through the chan or queue primitive with
+N goroutines competing. This is the raw chan/queue dispatch
+benchmark without the broker RTT floor.
+
+ns/op (median of 2 runs):
+
+| Payload | Consumers | mqttv5 chan | mqttv5 queue | autopaho chan |
+|---|---:|---:|---:|---:|
+| 64 B  | 4 |  5,400 |  5,600 |  5,670 |
+| 64 B  | 8 |  5,500 |  5,680 |  5,900 |
+| 256 B | 4 |  9,940 | 10,580 |  9,850 |
+| 256 B | 8 |   8,000 * | 10,485 | 11,533 |
+| 1 KiB | 4 | 28,675 | 22,930 | 22,660 |
+| 1 KiB | 8 | 24,977 | 23,121 | 23,468 |
+
+Allocations stay flat across fan-out:
+
+| Lib / style | allocs/op | B/op |
+|---|---:|---:|
+| mqttv5 chan  | **4** | ~4,250 |
+| mqttv5 queue | **5** | ~4,270 |
+| autopaho     | 42-44 | 5,400-8,870 |
+
+_* Chan dropped messages at high load._ The `mqttv5-chan/c8/256 B`
+row had a run fail with `received 420,604 / 422,064` — ~0.35% of
+messages lost — because the channel's `SubBuffer(1024)` filled
+faster than the 8 consumer goroutines could drain. The library's
+documented behaviour is to auto-ack-and-drop on full buffer
+(observable via `SubOnDrop`). autopaho's channel dropped much
+worse at the same load (one `autopaho-chan/c1/256 B` run lost
+~28% of messages). The mqttv5 queue is unbounded by default — at
+the same load, zero drops, zero failures, memory simply grew until
+consumers caught up.
+
+The pattern: **chan trades drops for bounded memory; queue trades
+memory for completeness.** Per-message dispatch cost is otherwise
+identical. Pick by failure mode you can tolerate.
 
 ## Takeaways
 
 1. **Hot paths are zero-alloc.** Publish is 0 / 0; inbound dispatch
-   is 5 / 286 B. Compared to autopaho's 15-95 allocs / 600-14 600 B
-   per call, the GC pressure simply isn't there.
+   is 5 / 286 B (callback) or 4-5 / ~4,250 B (chan/queue at firehose
+   rates). Compared to autopaho's 15-95 allocs / 600-14,600 B per
+   call, the GC pressure simply isn't there.
 2. **Single-publisher QoS 0 is tied to slightly faster.** mqttv5 is
-   within ±3 % of autopaho at 64 B and 256 B and ~15 % faster at 1 KiB.
+   within ±3% of autopaho at 64 B and 256 B and ~15% faster at 1 KiB.
    `PublishMode` is meaningful for callers who need transport-level
    error visibility (`PublishWaitForFlush`), at the cost of one
    channel round-trip with the writer.
@@ -232,6 +298,11 @@ the difference between ~880 MB/s of garbage (autopaho) and ~29 MB/s
 5. **Round-trip-dominated workloads (QoS 2, RoundTrip, Subscribe)
    are roughly tied on ns/op** — both libraries spend most of their
    time waiting on the broker. The allocation gap remains.
+6. **Channel vs queue: tied on ns/op; differs on failure mode.**
+   Per-message dispatch cost is ~identical (queue +1 alloc, +15 B).
+   Under firehose pressure the channel will auto-drop on a full
+   `SubBuffer` (bounded memory, lossy); the queue grows unbounded
+   (lossless, memory pressure). Pick by failure mode.
 
 ## Codec micro benchmarks (no broker)
 

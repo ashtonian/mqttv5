@@ -193,6 +193,273 @@ func subFireHose_mqttv5(b *testing.B, payload []byte) {
 	}
 }
 
+// sub_mqttv5_queue is the SubscribeQueue counterpart of sub_mqttv5.
+// Same publish workload (QoS 1, ack on receive); only the consumer
+// plumbing differs (q.Dequeue vs <-chan). Drop-in comparison with
+// sub_mqttv5 isolates the per-message channel-vs-queue overhead.
+func sub_mqttv5_queue(b *testing.B, payload []byte) {
+	topic := "bench/subq/" + uniqueID("")
+	pub := connectMqttv5(b, uniqueID("mqttv5-subq-pub"))
+	_, q := subscribeMqttv5Queue(b, uniqueID("mqttv5-subq-sub"), topic)
+	ctx := context.Background()
+	opts := wire.PublishOpts{Topic: topic, Payload: payload, QoS: 1}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range b.N {
+			_ = pub.Publish(ctx, opts)
+		}
+	}()
+	dequeueCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for range b.N {
+		m, ok := q.Dequeue(dequeueCtx)
+		if !ok {
+			b.Fatal("subq: stalled waiting for delivery")
+		}
+		_ = m.Ack()
+	}
+	wg.Wait()
+}
+
+// subMulti_mqttv5_chan: one publisher fires b.N QoS 1 messages async;
+// N consumer goroutines race for them on the same delivery channel.
+// Tests how channel receive-side lock contention scales with consumer
+// count — what bites under high-throughput fan-out.
+func subMulti_mqttv5_chan(b *testing.B, payload []byte, consumers int) {
+	topic := "bench/multichan/" + uniqueID("")
+	pub := connectMqttv5(b, uniqueID("mqttv5-mc-pub"))
+	_, ch := subscribeMqttv5(b, uniqueID("mqttv5-mc-sub"), topic)
+	ctx := context.Background()
+	opts := wire.PublishOpts{Topic: topic, Payload: payload, QoS: 1}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	received := atomic.Int64{}
+	target := int64(b.N)
+	done := make(chan struct{})
+
+	var consWG sync.WaitGroup
+	for range consumers {
+		consWG.Add(1)
+		go func() {
+			defer consWG.Done()
+			for {
+				select {
+				case m := <-ch:
+					_ = m.Ack()
+					received.Add(1)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		for range b.N {
+			_ = pub.Publish(ctx, opts)
+		}
+	}()
+	pubWG.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < target && time.Now().Before(deadline) {
+		time.Sleep(time.Microsecond)
+	}
+	b.StopTimer()
+	close(done)
+	consWG.Wait()
+
+	if received.Load() < target {
+		b.Fatalf("multi-chan: received %d/%d after publisher done", received.Load(), target)
+	}
+}
+
+// subMulti_mqttv5_queue is the SubscribeQueue counterpart of
+// subMulti_mqttv5_chan. Each consumer pulls via q.Dequeue(ctx); cancel
+// on the dequeue context drains them when the publisher is done.
+func subMulti_mqttv5_queue(b *testing.B, payload []byte, consumers int) {
+	topic := "bench/multiq/" + uniqueID("")
+	pub := connectMqttv5(b, uniqueID("mqttv5-mq-pub"))
+	_, q := subscribeMqttv5Queue(b, uniqueID("mqttv5-mq-sub"), topic)
+	pubCtx := context.Background()
+	opts := wire.PublishOpts{Topic: topic, Payload: payload, QoS: 1}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	received := atomic.Int64{}
+	target := int64(b.N)
+	consCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var consWG sync.WaitGroup
+	for range consumers {
+		consWG.Add(1)
+		go func() {
+			defer consWG.Done()
+			for {
+				m, ok := q.Dequeue(consCtx)
+				if !ok {
+					return
+				}
+				_ = m.Ack()
+				received.Add(1)
+			}
+		}()
+	}
+
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		for range b.N {
+			_ = pub.Publish(pubCtx, opts)
+		}
+	}()
+	pubWG.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < target && time.Now().Before(deadline) {
+		time.Sleep(time.Microsecond)
+	}
+	b.StopTimer()
+	cancel()
+	consWG.Wait()
+
+	if received.Load() < target {
+		b.Fatalf("multi-queue: received %d/%d after publisher done", received.Load(), target)
+	}
+}
+
+// fhMulti_mqttv5_chan: QoS 0 fire-hose into a channel-based Subscribe;
+// N consumer goroutines drain. No PUBACK gating, so the publisher
+// runs at line speed and the chan dispatch primitive is the
+// bottleneck. Compares directly against fhMulti_mqttv5_queue.
+func fhMulti_mqttv5_chan(b *testing.B, payload []byte, consumers int) {
+	topic := "bench/fhchan/" + uniqueID("")
+	pub := connectMqttv5(b, uniqueID("mqttv5-fhc-pub"))
+	_, ch := subscribeMqttv5(b, uniqueID("mqttv5-fhc-sub"), topic)
+	ctx := context.Background()
+	opts := wire.PublishOpts{Topic: topic, Payload: payload, QoS: 0}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	received := atomic.Int64{}
+	target := int64(b.N)
+	done := make(chan struct{})
+
+	var consWG sync.WaitGroup
+	for range consumers {
+		consWG.Add(1)
+		go func() {
+			defer consWG.Done()
+			for {
+				select {
+				case <-ch:
+					received.Add(1)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		for range b.N {
+			_ = pub.Publish(ctx, opts)
+		}
+	}()
+	pubWG.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < target && time.Now().Before(deadline) {
+		time.Sleep(time.Microsecond)
+	}
+	b.StopTimer()
+	close(done)
+	consWG.Wait()
+
+	if received.Load() < target {
+		b.Fatalf("fh-chan: received %d/%d after publisher done", received.Load(), target)
+	}
+}
+
+// fhMulti_mqttv5_queue: QoS 0 fire-hose into a SubscribeQueue;
+// N consumer goroutines drain via q.Dequeue. Same workload shape
+// as fhMulti_mqttv5_chan — only the delivery primitive differs.
+func fhMulti_mqttv5_queue(b *testing.B, payload []byte, consumers int) {
+	topic := "bench/fhqueue/" + uniqueID("")
+	pub := connectMqttv5(b, uniqueID("mqttv5-fhq-pub"))
+	_, q := subscribeMqttv5Queue(b, uniqueID("mqttv5-fhq-sub"), topic)
+	pubCtx := context.Background()
+	opts := wire.PublishOpts{Topic: topic, Payload: payload, QoS: 0}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	received := atomic.Int64{}
+	target := int64(b.N)
+	consCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var consWG sync.WaitGroup
+	for range consumers {
+		consWG.Add(1)
+		go func() {
+			defer consWG.Done()
+			for {
+				_, ok := q.Dequeue(consCtx)
+				if !ok {
+					return
+				}
+				received.Add(1)
+			}
+		}()
+	}
+
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		for range b.N {
+			_ = pub.Publish(pubCtx, opts)
+		}
+	}()
+	pubWG.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < target && time.Now().Before(deadline) {
+		time.Sleep(time.Microsecond)
+	}
+	b.StopTimer()
+	cancel()
+	consWG.Wait()
+
+	if received.Load() < target {
+		b.Fatalf("fh-queue: received %d/%d after publisher done", received.Load(), target)
+	}
+}
+
 // sub_mqttv5: one publisher fires QoS 1 messages async; one subscriber
 // counts deliveries. Timer covers "publish N + receive N". Throughput
 // = msg/sec.

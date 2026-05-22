@@ -4,7 +4,10 @@
 
 package benchmarks
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // Each Benchmark iterates libs × payload-size so a single
 // `go test -tags e2e -bench BenchmarkE2E_PublishQoS1` produces the
@@ -116,6 +119,77 @@ func BenchmarkE2E_Subscribe(b *testing.B) {
 			b.Run(lib.name+"/"+sz.Name, func(b *testing.B) {
 				lib.sub(b, Payload(sz.Size))
 			})
+		}
+	}
+}
+
+// BenchmarkE2E_SubscribeQueue mirrors BenchmarkE2E_Subscribe but with
+// the SubscribeQueue API (q.Dequeue) instead of the channel-based
+// Subscribe. Pair-compare with the same Subscribe row at the same
+// payload size to isolate per-message channel-vs-queue overhead.
+// mqttv5-only — autopaho has no Queue equivalent.
+func BenchmarkE2E_SubscribeQueue(b *testing.B) {
+	requireBroker(b)
+	for _, lib := range libs {
+		if lib.subQueue == nil {
+			continue
+		}
+		for _, sz := range e2eSizes {
+			b.Run(lib.name+"/"+sz.Name, func(b *testing.B) {
+				lib.subQueue(b, Payload(sz.Size))
+			})
+		}
+	}
+}
+
+// BenchmarkE2E_SubscribeFireHoseFanOut measures raw chan/queue
+// dispatch throughput. QoS 0 fire-hose publisher (no PUBACK gating)
+// pushes at line speed; N consumer goroutines drain the delivery
+// surface. This is the test for "channels are locky under fan-out" —
+// the QoS 1 MultiConsumer benchmark is broker-bound (~170 µs RTT
+// floor) and hides per-message dispatch cost; this one isn't.
+func BenchmarkE2E_SubscribeFireHoseFanOut(b *testing.B) {
+	requireBroker(b)
+	for _, lib := range libs {
+		for _, n := range multiConsumerCounts {
+			for _, sz := range e2eSizes {
+				if lib.fhMultiChan != nil {
+					b.Run(fmt.Sprintf("%s-chan/c%d/%s", lib.name, n, sz.Name), func(b *testing.B) {
+						lib.fhMultiChan(b, Payload(sz.Size), n)
+					})
+				}
+				if lib.fhMultiQueue != nil {
+					b.Run(fmt.Sprintf("%s-queue/c%d/%s", lib.name, n, sz.Name), func(b *testing.B) {
+						lib.fhMultiQueue(b, Payload(sz.Size), n)
+					})
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkE2E_SubscribeMultiConsumer measures throughput under
+// consumer fan-out: N goroutines race for messages on the same
+// delivery surface. Iterates (library, consumer style, consumer
+// count, payload size). Aggregate ns/op + MB/s show how each
+// delivery primitive scales as fan-out grows. mqttv5 reports both
+// chan and queue rows; autopaho is chan-only.
+func BenchmarkE2E_SubscribeMultiConsumer(b *testing.B) {
+	requireBroker(b)
+	for _, lib := range libs {
+		for _, n := range multiConsumerCounts {
+			for _, sz := range e2eSizes {
+				if lib.subMultiChan != nil {
+					b.Run(fmt.Sprintf("%s-chan/c%d/%s", lib.name, n, sz.Name), func(b *testing.B) {
+						lib.subMultiChan(b, Payload(sz.Size), n)
+					})
+				}
+				if lib.subMultiQueue != nil {
+					b.Run(fmt.Sprintf("%s-queue/c%d/%s", lib.name, n, sz.Name), func(b *testing.B) {
+						lib.subMultiQueue(b, Payload(sz.Size), n)
+					})
+				}
+			}
 		}
 	}
 }

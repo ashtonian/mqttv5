@@ -126,6 +126,21 @@ func subscribeMqttv5(b *testing.B, clientID, filter string) (*mqttv5.Client, <-c
 	return cli, ch
 }
 
+// subscribeMqttv5Queue returns a connected client + Queue of received
+// messages for the topic filter — the SubscribeQueue counterpart of
+// subscribeMqttv5, used by queue-vs-channel benchmarks.
+func subscribeMqttv5Queue(b *testing.B, clientID, filter string) (*mqttv5.Client, *mqttv5.Queue[*mqttv5.Message]) {
+	b.Helper()
+	cli := connectMqttv5(b, clientID)
+	q, _, err := cli.SubscribeQueue(context.Background(),
+		[]mqttv5.TopicFilter{{Topic: filter, QoS: 1}})
+	if err != nil {
+		b.Fatalf("mqttv5 SubscribeQueue: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	return cli, q
+}
+
 // ---------------- eclipse autopaho client setup ----------------
 
 func connectAutopaho(b *testing.B, clientID string) *autopaho.ConnectionManager {
@@ -231,6 +246,10 @@ func subscribeAutopaho(b *testing.B, clientID, filter string) (*autopaho.Connect
 
 // benchLib is one library under test. Each function runs a self-contained
 // benchmark loop against the configured broker.
+//
+// Adapter slots marked optional may be nil — autopaho has no Queue
+// equivalent so its subQueue / subMultiQueue stay nil and the
+// dispatching benchmark skips that combo.
 type benchLib struct {
 	name string
 
@@ -242,6 +261,19 @@ type benchLib struct {
 	rtt                 func(b *testing.B, payload []byte)
 	sub                 func(b *testing.B, payload []byte)
 	subFireHose         func(b *testing.B, payload []byte)
+
+	// Queue / multi-consumer adapters. subQueue and subMultiQueue and
+	// fhMultiQueue are nil on autopaho (no Queue API).
+	subQueue       func(b *testing.B, payload []byte)
+	subMultiChan   func(b *testing.B, payload []byte, consumers int)
+	subMultiQueue  func(b *testing.B, payload []byte, consumers int)
+
+	// Firehose (QoS 0 publish, no PUBACK gating) — pure dispatch
+	// throughput on the chan / queue primitive. Compare against the
+	// existing callback-flavour subFireHose to see the chan/queue
+	// dispatch overhead vs the bare callback.
+	fhMultiChan  func(b *testing.B, payload []byte, consumers int)
+	fhMultiQueue func(b *testing.B, payload []byte, consumers int)
 }
 
 // libs is the side-by-side list iterated by every benchmark.
@@ -256,6 +288,11 @@ var libs = []benchLib{
 		rtt:                 rtt_mqttv5,
 		sub:                 sub_mqttv5,
 		subFireHose:         subFireHose_mqttv5,
+		subQueue:            sub_mqttv5_queue,
+		subMultiChan:        subMulti_mqttv5_chan,
+		subMultiQueue:       subMulti_mqttv5_queue,
+		fhMultiChan:         fhMulti_mqttv5_chan,
+		fhMultiQueue:        fhMulti_mqttv5_queue,
 	},
 	{
 		name:                "autopaho",
@@ -267,8 +304,17 @@ var libs = []benchLib{
 		rtt:                 rtt_autopaho,
 		sub:                 sub_autopaho,
 		subFireHose:         subFireHose_autopaho,
+		subQueue:            nil, // autopaho has no Queue API
+		subMultiChan:        subMulti_autopaho_chan,
+		subMultiQueue:       nil, // autopaho has no Queue API
+		fhMultiChan:         fhMulti_autopaho_chan,
+		fhMultiQueue:        nil, // autopaho has no Queue API
 	},
 }
+
+// multiConsumerCounts is the consumer-fan-out sweep — 1 baseline,
+// 4 and 8 to stress channel/queue lock contention.
+var multiConsumerCounts = []int{1, 4, 8}
 
 // e2eSizes is the payload-size sweep. Smaller than the codec micro
 // benches because the broker round-trip dominates the per-publish
