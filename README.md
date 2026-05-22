@@ -20,7 +20,7 @@ go get github.com/ashtonian/mqttv5
 - Go: 1.26+
 - Benchmarks: [benchmarks/README.md](benchmarks/README.md)
 
-## Simple
+## Example
 
 ```go
 package main
@@ -42,9 +42,8 @@ type Event struct {
 func main() {
     ctx := context.Background()
 
-    client, err := mqttv5.New(mqttv5.WithBroker("mqtt://localhost:1883"))
-    if err != nil { panic(err) }
-    if err := client.Connect(ctx); err != nil { panic(err) }
+    client, _ := mqttv5.New(mqttv5.WithBroker("mqtt://localhost:1883"))
+    _ = client.Connect(ctx)
     defer client.Disconnect(ctx)
 
     // Generic typed pub/sub via Codec[T] (JSON ships in a sibling
@@ -52,8 +51,7 @@ func main() {
     // QoS 1/2 replay underneath — you just write the consumer loop.
     events := mqttv5.NewTyped(client, jsoncodec.Codec[Event]{})
 
-    msgs, _, _ := events.Subscribe(ctx,
-        []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}})
+    msgs, _, _ := events.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}})
     go func() {
         for m := range msgs {
             fmt.Printf("%s: %+v\n", m.Topic, m.Value) // m.Value already decoded
@@ -61,11 +59,7 @@ func main() {
         }
     }()
 
-    _ = events.Publish(ctx,
-        wire.PublishOpts{Topic: "events/hello", QoS: 1},
-        Event{Device: "a1", Temp: 22.5})
-
-    select {} // hook into your service's shutdown signal in production
+    _ = events.Publish(ctx, wire.PublishOpts{Topic: "events/hello", QoS: 1}, Event{Device: "a1", Temp: 22.5})
 }
 ```
 
@@ -311,7 +305,7 @@ for m := range ch {
 Implement `mqttv5.Codec[T]` for protobuf, Cap'n Proto, FlatBuffers,
 custom binary — the core has no codec dependency.
 
-## Durable PublishViaQueue
+## Durable `QueuePublisher`
 
 `QueuePublisher` decouples the caller from broker availability:
 `Publish` returns as soon as the entry is durably stored. A drain
@@ -380,7 +374,7 @@ No silent downgrade.
 | `WithRequestProblemInformation(b)` | true | CONNECT property §3.1.2.11.7 — broker returns `ReasonString` / `UserProperties` on errors. On by default; pass `false` to opt out. |
 | `WithConnectUserProperty(k, v)` / `WithConnectUserProperties(p)` | — | CONNECT user properties; append-style or bulk replace. |
 | `WithConnectTimeout(d)` | 10 s | Dial + CONNECT/CONNACK budget. |
-| `WithPingTimeout(d)` | 10 s | PINGRESP budget. Total dead-connection detect = `KeepAlive + PingTimeout` (40 s with defaults), inside the broker's 1.5×KeepAlive cutoff so the client drives reconnect. |
+| `WithPingTimeout(d)` | 10 s | PINGRESP budget. Total dead-connection detection = `KeepAlive + PingTimeout` (40 s with defaults), inside the broker's 1.5×KeepAlive cutoff so the client drives reconnect. |
 | `WithDisconnectFlushTimeout(d)` | 500 ms | Flush budget for the DISCONNECT write on graceful shutdown. |
 | `WithWriteQueueSize(n)` | 256 | Internal MPSC write buffer. |
 | `WithWriteBatch(n)` | 0 (off) | Coalesce up to n pre-encoded packets per writev syscall. Wins under sustained concurrent publishers; measure before enabling. |
@@ -566,7 +560,7 @@ the 2.5× win under fan-in.
 
 | Behaviour | Detail |
 |---|---|
-| `Connect` | Blocks until CONNACK (or ctx). Supervisor handles all subsequent reconnects in background. |
+| `Connect` | Blocks until CONNACK (or ctx). Supervisor handles all subsequent reconnects in the background. |
 | Reconnect | `ExponentialBackoff(1s, 30s, 200ms)` default. With `WithBrokers`, URLs rotate per attempt; successful connect sticks. |
 | Publish QoS 1/2 across drop | Serialised once at register time; replayed on every reconnect with `DUP=1` (§3.3.1.1). Caller stays blocked on session's `Done` and resumes on the eventual ack. |
 | Subscribe across drop | Every active subscription re-issued on every reconnect. Subs the broker refused (SUBACK reason ≥ 0x80) drop from the resubscribe set. |
@@ -576,7 +570,7 @@ the 2.5× win under fan-in.
 | PINGRESP liveness | No PINGRESP within `PingTimeout` → connection treated as dead → supervisor redials. |
 | Manual ack ordering | QoS 1 PUBACK held until `m.Ack()`, flushed in §4.6 arrival order. QoS 2 PUBREC held until `m.Ack()`; PUBCOMP fires automatically when PUBREL arrives. |
 | Multi-handler dispatch | A PUBLISH matching multiple overlapping filters delivers the **same** `*Message` to every handler. `m.Ack()` is refcounted — only the final call releases the frame. |
-| Topic / payload lifetime | Zero-copy slices into a pooled frame; valid until `Ack()` returns. Use `m.CloneTopic()` / `m.ClonePayload()` to retain past. |
+| Topic / payload lifetime | Zero-copy slices into a pooled frame; valid until `Ack()` returns. Use `m.CloneTopic()` / `m.ClonePayload()` to retain past `Ack()`. |
 | Topic alias outbound | Auto-allocated on QoS 0 publishes when broker advertises `TopicAliasMaximum > 0`. Skipped for QoS 1/2 so replay carries the full topic. |
 | Disconnect | Best-effort graceful DISCONNECT (bounded by ctx + `cs.dying`), tears down per-conn goroutines, closes consumer channels/queues. Idempotent. |
 
