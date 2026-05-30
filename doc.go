@@ -110,8 +110,11 @@
 // One goroutine per connection drives the read path
 // (read -> decode -> trie match -> handler) with handlers running
 // synchronously on the reader. A second goroutine drains a
-// many-producer-single-consumer write channel — no mutex around
-// [net.Conn.Write], so concurrent publishers scale across cores.
+// many-producer-single-consumer write channel: concurrent publishers
+// hand off their packets without contending on a write lock, instead
+// of serialising behind a mutex around [net.Conn.Write]. Cross-core
+// write scaling comes from [WithPublisherPool], which runs N such
+// connections, each with its own writer goroutine.
 //
 // Packets and frame buffers come from per-type sync.Pools. Inbound
 // [Message] aliases the pooled frame for zero-copy Topic and

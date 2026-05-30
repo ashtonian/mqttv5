@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 A fast, ergonomic MQTT v5 client for Go. Single package, stdlib-only
-core, zero allocations on the receive path, Go-native subscribe
+core, zero-allocation packet decode, Go-native subscribe
 surface (`<-chan *Message` / `Queue[*Message]` / callback), and the
 supervisor (reconnect + replay + resubscribe) baked into every
 `Client`.
@@ -76,9 +76,9 @@ rotation, and lifecycle observability.
   `ClientOptions` struct.
 - **One client. Supervisor baked in.** No `paho` / `autopaho` split —
   reconnect, replay-in-flight, and auto-resubscribe are always on.
-- **20–60× faster decode, zero steady-state allocs** on the receive
-  path. Topic and payload are zero-copy slices into a pooled frame;
-  properties decode lazily. **~30× less GC pressure** at sustained
+- **27–106× faster decode, zero allocations.** Topic and payload are
+  zero-copy slices into a pooled frame; properties decode lazily.
+  **~30× less GC pressure** at sustained
   load (~29 MB/s of garbage vs ~880 MB/s for autopaho at 100k msg/s)
   — smaller pauses, less p99 jitter.
 - **Multi-broker, kept distinct and composable.** Failover
@@ -87,10 +87,14 @@ rotation, and lifecycle observability.
   real patterns, each its own API. Compose them: `WithBrokers` inside
   a `GroupMember` for HA-per-region, then `WithPublisherPool` on top
   for throughput.
-- **Publisher pool that actually scales.** paho serialises every
-  write behind one mutex; mqttv5 funnels into MPSC + one writer
-  goroutine, so N publish-only conns parallelise across cores.
-  **2.5× faster** under 8-goroutine fan-in.
+- **Publisher writes don't serialise on a mutex.** paho holds one
+  mutex across every connection `Write`, so concurrent publishers
+  contend on each other's syscalls. mqttv5 has each producer hand its
+  packet to a per-connection MPSC channel that a single writer
+  goroutine drains to the socket — no write-lock contention on the hot
+  path. **~1.6× faster** under 8-goroutine QoS 1 fan-in onto one
+  connection. `WithPublisherPool(N)` then runs N such connections, each
+  with its own writer goroutine, to spread write load across cores.
 - **Backpressure as a first-class concept.** Per-subscription
   `DropNewest` / `DropOldest`, with the dropped message auto-ack'd so
   the broker stops retransmitting.
@@ -544,17 +548,22 @@ Decode allocation is **constant in payload size** — `Topic` and
 
 ### End-to-end vs real broker
 
-| Workload, 256 B payload | autopaho | mqttv5 | mqttv5 wins |
+| Workload, 256 B payload | autopaho | mqttv5 | Result |
 |---|---:|---:|---|
-| Publish QoS 0 single goroutine | 5,500 ns | **4,900 ns** | 10 % faster, 3.75× fewer allocs |
-| Publish QoS 1 (waits for PUBACK) | 200 µs | **184 µs** | 10 % faster, 5× fewer allocs |
-| Publish QoS 1 × 8 goroutines, 1 KiB | 32.1 µs | **13.0 µs** | **2.5× faster** under fan-in |
-| RoundTrip (pub → broker → sub) | 267 µs | **256 µs** | 4× fewer allocs |
+| Publish QoS 0 single goroutine | **~5.0 µs** | ~5.6 µs | autopaho ~12 % faster; mqttv5 3.75× fewer allocs (4 vs 15) |
+| Publish QoS 1 (waits for PUBACK) | ~200 µs | **~146 µs** | mqttv5 ~27 % faster, 4.8× fewer allocs (11 vs 53) |
+| Publish QoS 1 × 8 goroutines, 1 KiB | ~27.7 µs | **~16.8 µs** | mqttv5 **~1.6× faster** under fan-in, 5× fewer allocs (11 vs 56) |
+| RoundTrip (pub → broker → sub) | ~200 µs | **~185 µs** | mqttv5 ~7 % faster, 4.3× fewer allocs (22 vs 95) |
 
-The single-goroutine QoS-0 case where autopaho's mutex-around-`Write`
-edges mqttv5 by ~2 µs is the only loss. That mutex is exactly what
-blocks autopaho from scaling — the trade-off is 2 µs per call against
-the 2.5× win under fan-in.
+Numbers are rounded from the per-run figures in
+[`e2e_results.txt`](benchmarks/e2e_results.txt) (`-count=2`); the fan-in
+row is noisy run to run, so treat ~1.6× as the working figure and
+re-run the suite for numbers under your own load. The single-goroutine
+QoS-0 case — where autopaho's mutex-around-`Write` is cheap with no
+contention and edges mqttv5 by ~0.6 µs — is the only loss. That same
+mutex is what limits autopaho under concurrency: the trade-off is
+sub-microsecond per call against the ~1.6× fan-in win (and 4–5× fewer
+allocations across the board).
 
 ## Reliability semantics
 
