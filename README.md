@@ -401,8 +401,9 @@ No silent downgrade.
 | `WithOnConnectError(fn)` | — | Fires per failed CONNECT attempt (dial err, CONNACK refusal, AUTH-loop err). Observability only. |
 | `WithOnReconnectAttempt(fn)` | — | Fires immediately before each reconnect dial. Receives `(attempt, brokerURL)`. |
 | `WithOnServerDisconnect(fn)` | — | Fires on broker-initiated DISCONNECT with detached `*wire.Disconnect`. May call `Client.SetBrokers(...)` to redirect. |
+| `WithOnReauthenticated(fn)` | — | Fires when a re-auth (§4.12) concludes successfully (broker AUTH `0x00`), client- or broker-driven. Observability only; must not block. |
 | `WithConnectPacketBuilder(fn)` | — | `func(ctx, *wire.ConnectOpts) error`. Mutate CONNECT immediately before serialisation; canonical OAuth-token-rotation hook. |
-| `WithAuthenticator(a)` | — | MQTT v5 enhanced auth (CONNECT + mid-session §4.12). |
+| `WithAuthenticator(a)` | — | MQTT v5 enhanced auth (CONNECT + re-auth §4.12). `Begin(ctx)` resolves the credential; client-initiated refresh via `Client.Reauthenticate`. |
 
 ### Per-subscribe
 
@@ -495,6 +496,37 @@ Pair with `WithOnConnectError` for observability — every refusal /
 network failure fires the callback with the per-attempt error.
 See [`examples/oauth`](examples/oauth).
 
+**Refresh without reconnecting.** `Client.Reauthenticate(ctx)` drives MQTT
+v5 re-authentication (§4.12) on the *live* connection: it sends an AUTH
+`0x19` carrying a fresh `Authenticator.Begin(ctx)` payload, services any
+broker challenges via `Continue`, and returns when the broker concludes
+with `0x00` Success — no reconnect, no QoS-state churn. Ideal for a
+long-lived connection whose bearer (OAuth/JWT) outlives the session: start
+a timer from the token lifetime and call `Reauthenticate` ahead of expiry.
+`ctx` bounds the whole operation, including the token fetch in `Begin`.
+Calls are single-flighted per connection; a broker rejection returns
+`ErrReauthRejected` and tears the connection down so the supervisor
+reconnects through the normal CONNECT path. Pair with
+`WithOnReauthenticated` to observe successful refreshes centrally — it
+also fires for a broker-driven re-auth, which has no return value to
+inspect.
+
+For mechanisms with mutual authentication (e.g. SCRAM), an `Authenticator`
+may also implement the optional `ServerFinalVerifier` interface
+(`VerifyServerFinal([]byte) error`): the client hands it the server's
+concluding `AuthenticationData` — the CONNACK on connect, the AUTH `0x00`
+on re-auth — so it can verify the server proved knowledge of the
+credential. A verification failure aborts the connect, or fails
+`Reauthenticate` and tears the connection down.
+
+```go
+// e.g. 30s before the JWT `exp`:
+if err := cli.Reauthenticate(ctx); err != nil {
+    // ErrReauthRejected → broker refused the new credential;
+    // the supervisor is already reconnecting with a fresh CONNECT.
+}
+```
+
 ## Sentinel errors
 
 Branch with `errors.Is(err, ...)`; stable across versions.
@@ -505,6 +537,9 @@ Branch with `errors.Is(err, ...)`; stable across versions.
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
 | `ErrClosed` | any after `Disconnect` | Client torn down. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason. |
+| `ErrNoAuthenticator` | `Reauthenticate` | Called without `WithAuthenticator`. |
+| `ErrReauthInProgress` | `Reauthenticate` | A re-auth is already in flight on this connection (calls are single-flighted). |
+| `ErrReauthRejected` | `Reauthenticate` | Broker rejected re-auth via DISCONNECT; wrapped with the reason code. Connection torn down; supervisor reconnects. |
 | `ErrUnexpectedPacket` | various | Broker sent an unexpected packet for the current state. Treat as protocol bug. |
 | `ErrMissingBroker` | `New` | No URLs supplied. |
 | `ErrInvalidBrokerURL` | `New`, `SetBrokers` | URL failed to parse or has unsupported scheme. `WithDialFunc` relaxes scheme validation. |
@@ -578,7 +613,7 @@ framing.
 | Reconnect | `ExponentialBackoff(1s, 30s, 200ms)` default. With `WithBrokers`, URLs rotate per attempt; successful connect sticks. |
 | Publish QoS 1/2 across drop | Serialised once at register time; replayed on every reconnect with `DUP=1` (§3.3.1.1). Caller stays blocked on session's `Done` and resumes on the eventual ack. |
 | Subscribe across drop | Every active subscription re-issued on every reconnect. Subs the broker refused (SUBACK reason ≥ 0x80) drop from the resubscribe set. |
-| Mid-session re-auth (§4.12) | Broker AUTH post-CONNACK routes to `Authenticator.Continue`. No Authenticator configured = client emits DISCONNECT 0x87 and reconnects via fresh CONNECT. |
+| Re-authentication (§4.12) | Client-initiated via `Reauthenticate(ctx)` (AUTH `0x19` → `Begin`/`Continue` → broker `0x00` Success). Broker AUTH post-CONNACK also routes to `Authenticator.Continue`. The client always replies `0x18` Continue — only the server concludes (`0x00`), and an inbound `0x00` is terminal. Rejection → `ErrReauthRejected` + reconnect via fresh CONNECT; no Authenticator configured = DISCONNECT `0x87`. |
 | CONNACK capability flags | `Shared` / `Wildcard` / `SubscriptionIdentifier` availability honoured — `Subscribe*` errors before the wire if the broker disabled the feature. |
 | Server-initiated DISCONNECT | `WithOnServerDisconnect(fn)` fires with detached `*wire.Disconnect` before the generic `OnConnectionDown`. Callback may call `Client.SetBrokers(...)` to redirect; new list takes effect on next reconnect. |
 | PINGRESP liveness | No PINGRESP within `PingTimeout` → connection treated as dead → supervisor redials. |

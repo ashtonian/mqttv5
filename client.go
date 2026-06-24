@@ -30,6 +30,13 @@ var (
 	ErrConnectRefused   = errors.New("mqttv5: broker refused CONNECT")
 	ErrUnexpectedPacket = errors.New("mqttv5: unexpected packet from broker")
 
+	// Enhanced-authentication errors (§4.12), returned by Reauthenticate.
+	// ErrReauthRejected is wrapped with the broker's DISCONNECT reason
+	// code (mirroring ErrConnectRefused) — match with errors.Is.
+	ErrNoAuthenticator  = errors.New("mqttv5: no Authenticator configured")
+	ErrReauthInProgress = errors.New("mqttv5: re-authentication already in progress")
+	ErrReauthRejected   = errors.New("mqttv5: broker rejected re-authentication")
+
 	// ErrWriteQueueFull is returned by QoS 0 Publish when the client
 	// is configured with WriteDropNewest and the writer queue has no
 	// room. The publish never reaches the wire.
@@ -105,8 +112,19 @@ type connState struct {
 	// safe to retain past the originating frame) when the connection
 	// goes down due to a broker-initiated disconnect. Read by the
 	// supervisor to invoke OnServerDisconnect before the generic
-	// OnConnectionDown.
+	// OnConnectionDown, and by Reauthenticate to distinguish a broker
+	// rejection (ErrReauthRejected) from a plain drop (ErrNotConnected).
 	serverDisconnect atomic.Pointer[wire.Disconnect]
+
+	// reauth is non-nil while a client-initiated re-authentication
+	// (Reauthenticate) is in flight on this connection. The read loop
+	// routes inbound AUTH to the in-flight call and clears the slot when
+	// the exchange resolves on the wire (0x00 Success, or a DISCONNECT /
+	// drop that disposes of this connState). It is deliberately NOT
+	// cleared when the caller's ctx elapses, so a late terminal AUTH
+	// cannot be misattributed to a subsequent Reauthenticate on the same
+	// connection.
+	reauth atomic.Pointer[reauthCall]
 
 	// Broker capability flags from CONNACK. MQTT v5 default is
 	// "supported" when the property is absent. subscribeImpl uses
@@ -670,6 +688,18 @@ func (c *Client) connectOnce(ctx context.Context, isReconnect bool) (*connectRes
 				p.Release()
 				_ = conn.Close()
 				return nil, fmt.Errorf("%w: reason 0x%02X", ErrConnectRefused, byte(reason))
+			}
+			// Enhanced-auth mutual verification (§4.12): an Authenticator
+			// that implements ServerFinalVerifier checks the server's
+			// concluding AuthenticationData (e.g. the SCRAM server
+			// signature) carried on the CONNACK. Failure aborts the connect.
+			if v, ok := c.cfg.Authenticator.(ServerFinalVerifier); ok {
+				serverFinal, _ := p.Properties.Binary(wire.PropAuthData)
+				if err := v.VerifyServerFinal(append([]byte(nil), serverFinal...)); err != nil {
+					p.Release()
+					_ = conn.Close()
+					return nil, fmt.Errorf("mqttv5: server authentication verification failed: %w", err)
+				}
 			}
 			aliasMax, _ := p.Properties.Uint16(wire.PropTopicAliasMaximum)
 			// CONNACK capability flags. Absent property means feature
@@ -1258,9 +1288,11 @@ func (c *Client) dispatch(cs *connState, pkt wire.Packet) {
 	case *wire.Auth:
 		c.handleServerAuth(cs, p)
 	case *wire.Disconnect:
-		if c.cfg.OnServerDisconnect != nil {
-			cs.serverDisconnect.Store(p.Clone())
-		}
+		// Always retain the reason: the supervisor uses it for the
+		// ServerDisconnects stat and OnServerDisconnect, and
+		// Reauthenticate uses it to surface ErrReauthRejected with the
+		// broker's code. Cheap clone on a rare event.
+		cs.serverDisconnect.Store(p.Clone())
 		c.cfg.Logger.Warn("mqttv5: broker DISCONNECT", slog.Int("reason", int(p.ReasonCode)))
 		pkt.Release()
 		cs.signalDown()
@@ -1299,9 +1331,21 @@ func (c *Client) writeDisconnectAndClose(cs *connState, opts wire.DisconnectOpts
 }
 
 // handleServerAuth processes an AUTH packet that arrived outside the
-// CONNECT handshake (MQTT v5 §4.12 — mid-session re-authentication).
-// The broker drives this when it wants the client to re-prove identity
-// without dropping the connection — typically for credential refresh.
+// CONNECT handshake (MQTT v5 §4.12 enhanced authentication).
+//
+// Per §3.15.2.1 the AUTH reason codes have fixed senders: 0x00 Success
+// is server-only, 0x19 Re-authentication is client-only, 0x18 Continue
+// is either. A conformant broker therefore never spontaneously starts a
+// mid-session exchange — it only replies within one the client started
+// (0x18 / 0x00) or sends DISCONNECT. This handler services that reply
+// and, defensively, any unsolicited mid-session AUTH a broker sends.
+//
+// Behaviour:
+//   - inbound 0x00 Success: terminal — the client does not reply and
+//     does not call Continue (only the server concludes the exchange).
+//   - otherwise (0x18 Continue): feed brokerData to Authenticator.Continue
+//     and reply 0x18. The Continue done flag is informational; the client
+//     never emits 0x00. This mirrors the in-CONNECT loop in connectOnce.
 //
 // Failure modes (all log + close the connection so the supervisor
 // reconnects through the normal CONNECT path with fresh credentials):
@@ -1317,6 +1361,14 @@ func (c *Client) handleServerAuth(cs *connState, p *wire.Auth) {
 	pktReason := p.ReasonCode
 	p.Release()
 
+	// A client-initiated re-authentication (Reauthenticate) takes
+	// precedence: route the broker's reply to the in-flight waiter
+	// rather than the defensive broker-driven path below.
+	if call := cs.reauth.Load(); call != nil {
+		c.handleReauthInbound(cs, call, pktReason, brokerData)
+		return
+	}
+
 	if c.cfg.Authenticator == nil {
 		c.cfg.Logger.Warn("mqttv5: broker sent AUTH mid-session but no Authenticator configured",
 			slog.Int("reason", int(pktReason)),
@@ -1328,7 +1380,29 @@ func (c *Client) handleServerAuth(cs *connState, p *wire.Auth) {
 		return
 	}
 
-	response, done, err := c.cfg.Authenticator.Continue(brokerData)
+	// 0x00 Success concludes the exchange. The client must not respond
+	// and must not re-enter the Authenticator — replying here would emit
+	// an unsolicited extra AUTH (and a client-sent 0x00 is itself a spec
+	// violation, §3.15.2.1).
+	if pktReason == wire.ReasonSuccess {
+		if v, ok := c.cfg.Authenticator.(ServerFinalVerifier); ok {
+			if err := v.VerifyServerFinal(brokerData); err != nil {
+				c.cfg.Logger.Warn("mqttv5: server re-authentication verification failed",
+					slog.Any("error", err),
+				)
+				c.writeDisconnectAndClose(cs, wire.DisconnectOpts{ReasonCode: wire.ReasonNotAuthorized})
+				return
+			}
+		}
+		c.cfg.Logger.Debug("mqttv5: broker concluded mid-session re-auth (AUTH 0x00 Success)")
+		c.fireReauthenticated()
+		return
+	}
+
+	// The broker is continuing the exchange (0x18). Run the Authenticator
+	// and always reply 0x18 Continue — only the server concludes (0x00),
+	// so done is discarded here just as in connectOnce.
+	response, _, err := c.cfg.Authenticator.Continue(brokerData)
 	if err != nil {
 		c.cfg.Logger.Warn("mqttv5: Authenticator.Continue failed during mid-session re-auth",
 			slog.Any("error", err),
@@ -1339,15 +1413,188 @@ func (c *Client) handleServerAuth(cs *connState, p *wire.Auth) {
 		return
 	}
 
-	method := c.cfg.Authenticator.Method()
-	reason := wire.ReasonContinueAuthentication
-	if done {
-		reason = wire.ReasonSuccess
-	}
 	c.enqueueFireAndForget(cs, func(w io.Writer) (int64, error) {
 		return wire.WriteAuth(w, wire.AuthOpts{
-			ReasonCode:           reason,
+			ReasonCode:           wire.ReasonContinueAuthentication,
+			AuthenticationMethod: c.cfg.Authenticator.Method(),
+			AuthenticationData:   response,
+		})
+	})
+}
+
+// reauthCall tracks one in-flight client-initiated re-authentication
+// (§4.12). result delivers the terminal outcome to the Reauthenticate
+// caller: nil on AUTH 0x00 Success, or a non-nil error if the
+// Authenticator fails mid-exchange. It is buffered (cap 1) so the read
+// loop never blocks delivering the outcome even when the caller has
+// stopped waiting (ctx elapsed). Broker rejection (DISCONNECT) and plain
+// drops are reported via cs.dying, not result.
+type reauthCall struct {
+	result chan error
+}
+
+// Reauthenticate initiates MQTT v5 re-authentication (§4.12) on the live
+// connection: it sends an AUTH 0x19 carrying the configured
+// Authenticator's Method() and a fresh Begin(ctx) payload, services any
+// broker 0x18 Continue challenges via Authenticator.Continue, and returns
+// when the broker concludes the exchange — without dropping the
+// connection or disturbing in-flight QoS state.
+//
+// It returns nil when the broker accepts re-authentication (AUTH 0x00
+// Success), or:
+//   - ErrNoAuthenticator if the client was not built WithAuthenticator;
+//   - ErrNotConnected if there is no live connection (before the first
+//     CONNACK, or after a drop);
+//   - ErrReauthInProgress if another re-auth is already in flight on this
+//     connection (calls are single-flighted per connection);
+//   - ErrReauthRejected (wrapped with the DISCONNECT reason code) if the
+//     broker rejects re-auth and tears the connection down;
+//   - ctx.Err() if ctx is cancelled or its deadline elapses first.
+//
+// The AuthenticationMethod established at CONNECT is reused; Method() MUST
+// be stable for the client's lifetime (§4.12 requires it to match across
+// the exchange). Reauthenticate is safe for concurrent use.
+//
+// ctx bounds the whole operation including credential resolution via
+// Begin(ctx). On ctx cancellation after the AUTH 0x19 has been sent the
+// connection is left intact and the exchange resolves on the wire — re-auth
+// stays single-flighted until the broker concludes, so a subsequent call
+// may observe ErrReauthInProgress until then. On a broker rejection the
+// connection is torn down and the supervisor reconnects through the normal
+// CONNECT path (which re-presents credentials).
+func (c *Client) Reauthenticate(ctx context.Context) error {
+	if c.cfg.Authenticator == nil {
+		return ErrNoAuthenticator
+	}
+	cs := c.cur.Load()
+	if cs == nil {
+		return ErrNotConnected
+	}
+
+	call := &reauthCall{result: make(chan error, 1)}
+	if !cs.reauth.CompareAndSwap(nil, call) {
+		return ErrReauthInProgress
+	}
+
+	// Resolve a fresh credential. ctx bounds any I/O Begin performs.
+	// Nothing is on the wire yet, so a failure here releases the slot.
+	data, err := c.cfg.Authenticator.Begin(ctx)
+	if err != nil {
+		cs.reauth.CompareAndSwap(call, nil)
+		return fmt.Errorf("mqttv5: Authenticator.Begin: %w", err)
+	}
+	method := c.cfg.Authenticator.Method()
+
+	// Send AUTH 0x19 to initiate. Until it is enqueued nothing is on the
+	// wire, so the ctx/dying/shutdown exits may still release the slot.
+	authFn := func(w io.Writer) (int64, error) {
+		return wire.WriteAuth(w, wire.AuthOpts{
+			ReasonCode:           wire.ReasonReAuthenticate,
 			AuthenticationMethod: method,
+			AuthenticationData:   data,
+		})
+	}
+	select {
+	case cs.writeQueue <- writeReq{fn: authFn}:
+	case <-ctx.Done():
+		cs.reauth.CompareAndSwap(call, nil)
+		return ctx.Err()
+	case <-cs.dying:
+		cs.reauth.CompareAndSwap(call, nil)
+		return ErrNotConnected
+	case <-c.shutdown:
+		cs.reauth.CompareAndSwap(call, nil)
+		return ErrClosed
+	}
+
+	// The 0x19 is queued and will flush. The read loop now owns the
+	// exchange: it answers 0x18 challenges and delivers the terminal
+	// outcome on call.result. From here the slot is released only by the
+	// read loop (on 0x00) or by this connState being disposed on teardown
+	// — never on ctx cancel — so a late terminal AUTH cannot land on a
+	// subsequent Reauthenticate.
+	select {
+	case err := <-call.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-cs.dying:
+		// A delivered result (e.g. a server-verification failure that
+		// also tore the connection down) takes precedence over the
+		// generic down error when both are ready.
+		select {
+		case err := <-call.result:
+			return err
+		default:
+			return c.reauthDownError(cs)
+		}
+	case <-c.shutdown:
+		return ErrClosed
+	}
+}
+
+// reauthDownError maps a connection teardown observed mid-re-auth to the
+// right error: a broker DISCONNECT (rejection) surfaces as
+// ErrReauthRejected with its reason code; a plain socket drop surfaces as
+// ErrNotConnected.
+func (c *Client) reauthDownError(cs *connState) error {
+	if sd := cs.serverDisconnect.Load(); sd != nil {
+		return fmt.Errorf("%w: reason 0x%02X", ErrReauthRejected, byte(sd.ReasonCode))
+	}
+	return ErrNotConnected
+}
+
+// fireReauthenticated invokes the OnReauthenticated observability hook (if
+// configured) on the read-loop goroutine. The callback must not block.
+func (c *Client) fireReauthenticated() {
+	if c.cfg.OnReauthenticated != nil {
+		c.cfg.OnReauthenticated()
+	}
+}
+
+// handleReauthInbound services a broker AUTH that arrived while a
+// client-initiated re-auth is in flight (slot held by call). Runs on the
+// read-loop goroutine.
+//
+//   - 0x00 Success: terminal — release the slot and signal the waiter.
+//   - otherwise (0x18 Continue): feed the Authenticator and reply 0x18,
+//     keeping the slot so the exchange continues. A Continue error tears
+//     the connection down; the waiter then observes the drop via cs.dying.
+func (c *Client) handleReauthInbound(cs *connState, call *reauthCall, pktReason wire.ReasonCode, brokerData []byte) {
+	if pktReason == wire.ReasonSuccess {
+		cs.reauth.CompareAndSwap(call, nil)
+		// Mutual verification (§4.12): if the Authenticator verifies the
+		// server's final data, a failure means the broker is not trusted
+		// — report it to the caller and tear the connection down.
+		if v, ok := c.cfg.Authenticator.(ServerFinalVerifier); ok {
+			if err := v.VerifyServerFinal(brokerData); err != nil {
+				call.result <- fmt.Errorf("mqttv5: server re-authentication verification failed: %w", err)
+				c.writeDisconnectAndClose(cs, wire.DisconnectOpts{ReasonCode: wire.ReasonNotAuthorized})
+				return
+			}
+		}
+		c.fireReauthenticated()
+		call.result <- nil
+		return
+	}
+
+	response, _, err := c.cfg.Authenticator.Continue(brokerData)
+	if err != nil {
+		c.cfg.Logger.Warn("mqttv5: Authenticator.Continue failed during re-authentication",
+			slog.Any("error", err),
+		)
+		// Tear down — the waiter wakes on cs.dying and reports the drop.
+		// The slot rides down with this disposed connState.
+		c.writeDisconnectAndClose(cs, wire.DisconnectOpts{
+			ReasonCode: wire.ReasonNotAuthorized,
+		})
+		return
+	}
+
+	c.enqueueFireAndForget(cs, func(w io.Writer) (int64, error) {
+		return wire.WriteAuth(w, wire.AuthOpts{
+			ReasonCode:           wire.ReasonContinueAuthentication,
+			AuthenticationMethod: c.cfg.Authenticator.Method(),
 			AuthenticationData:   response,
 		})
 	})
@@ -1705,7 +1952,7 @@ func (c *Client) resubscribeAll(cs *connState) {
 //
 // If cfg.Authenticator is set, the CONNECT carries
 // AuthenticationMethod + the initial AuthenticationData from
-// Authenticator.Begin(). connectOnce then drives the AUTH loop.
+// Authenticator.Begin(ctx). connectOnce then drives the AUTH loop.
 //
 // If cfg.ConnectPacketBuilder is set, it runs after this method has
 // populated opts and may mutate any field — useful for per-attempt
@@ -1747,7 +1994,7 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, isReconnect bool
 	}
 	if cfg.Authenticator != nil {
 		opts.AuthenticationMethod = cfg.Authenticator.Method()
-		data, err := cfg.Authenticator.Begin()
+		data, err := cfg.Authenticator.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("mqttv5: Authenticator.Begin: %w", err)
 		}

@@ -202,6 +202,14 @@ type Config struct {
 	// Authenticator drives MQTT v5 enhanced authentication when set.
 	Authenticator Authenticator
 
+	// OnReauthenticated fires when an MQTT v5 re-authentication (§4.12)
+	// concludes successfully (broker AUTH 0x00 Success) — for either a
+	// client-initiated Reauthenticate or a broker-driven exchange. Runs
+	// on the read loop; must not block. Observability only: a
+	// client-initiated success is also reported by Reauthenticate's
+	// return value.
+	OnReauthenticated func()
+
 	// ConnectPacketBuilder is invoked immediately before each CONNECT
 	// is serialised. The callback may mutate any field of opts —
 	// typical use is rotating Username/Password per attempt for
@@ -510,6 +518,18 @@ func WithOnReconnectAttempt(fn func(attempt int, brokerURL string)) Option {
 func WithOnServerDisconnect(fn func(*wire.Disconnect)) Option {
 	return func(c *Config) error {
 		c.OnServerDisconnect = fn
+		return nil
+	}
+}
+
+// WithOnReauthenticated registers a callback fired when an MQTT v5
+// re-authentication (§4.12) concludes successfully (broker AUTH 0x00
+// Success), whether the exchange was client-initiated (Reauthenticate)
+// or broker-driven. Observability only — runs on the read loop and must
+// not block.
+func WithOnReauthenticated(fn func()) Option {
+	return func(c *Config) error {
+		c.OnReauthenticated = fn
 		return nil
 	}
 }

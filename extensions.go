@@ -3,6 +3,7 @@
 package mqttv5
 
 import (
+	"context"
 	"math/rand/v2"
 	"time"
 )
@@ -11,20 +12,47 @@ import (
 
 // Authenticator drives the client side of MQTT v5 enhanced
 // authentication — the challenge-response handshake that runs during
-// CONNECT (SCRAM, Kerberos, OAuth challenge, etc.).
+// CONNECT and during re-authentication (SCRAM, Kerberos, OAuth/JWT,
+// etc.).
 //
-// Method() supplies the AuthenticationMethod property; Begin() the
-// initial AuthenticationData. For each AUTH packet from the broker
-// before CONNACK, Continue(brokerData) returns the next response.
-// done=true is informational — the broker decides when to send
-// CONNACK. A non-nil error from Continue aborts the connection.
+// Method() supplies the AuthenticationMethod property. Begin(ctx)
+// resolves the initial AuthenticationData — for a bearer method this is
+// where a fresh token is fetched, so ctx carries the deadline of the
+// triggering operation (the connect timeout, or the ctx passed to
+// Reauthenticate); honor it for any I/O. For each broker AUTH challenge
+// — during CONNECT (before CONNACK) and during mid-session
+// re-authentication (§4.12) — Continue(brokerData) returns the next
+// response, which the client always sends as AUTH 0x18 Continue.
+//
+// done is informational only. The client never concludes the exchange:
+// per §3.15.2.1 only the server sends AUTH 0x00 Success (or CONNACK for
+// the initial handshake). Returning done=true does NOT make the client
+// emit 0x00 — treat it as a hint that the Authenticator has no further
+// data to send. A non-nil error from Continue aborts the connection.
 //
 // Implementations need only be safe for concurrent use when shared
 // across multiple Clients (e.g. with WithPublisherPool).
 type Authenticator interface {
 	Method() string
-	Begin() (data []byte, err error)
+	Begin(ctx context.Context) (data []byte, err error)
 	Continue(brokerData []byte) (response []byte, done bool, err error)
+}
+
+// ServerFinalVerifier is an optional interface an Authenticator may also
+// implement to verify the server's concluding AuthenticationData — the
+// CONNACK on the initial handshake, or the AUTH 0x00 Success that ends a
+// re-authentication (§4.12). For mechanisms with mutual authentication
+// (e.g. SCRAM, where the server proves knowledge of the credential via a
+// server signature) this closes the loop; a non-nil error aborts the
+// connect, or fails Reauthenticate and tears the connection down.
+//
+// The serverData is whatever AuthenticationData the broker attached to the
+// terminal packet (possibly empty). Authenticators whose mechanism has no
+// server proof (e.g. a bearer token) simply do not implement this
+// interface, and the terminal data is ignored. VerifyServerFinal is
+// called on the same goroutine as the corresponding Continue.
+type ServerFinalVerifier interface {
+	VerifyServerFinal(serverData []byte) error
 }
 
 // WithAuthenticator enables MQTT v5 enhanced authentication. When
