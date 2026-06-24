@@ -550,20 +550,25 @@ Decode allocation is **constant in payload size** — `Topic` and
 
 | Workload, 256 B payload | autopaho | mqttv5 | Result |
 |---|---:|---:|---|
-| Publish QoS 0 single goroutine | **~5.0 µs** | ~5.6 µs | autopaho ~12 % faster; mqttv5 3.75× fewer allocs (4 vs 15) |
-| Publish QoS 1 (waits for PUBACK) | ~200 µs | **~146 µs** | mqttv5 ~27 % faster, 4.8× fewer allocs (11 vs 53) |
-| Publish QoS 1 × 8 goroutines, 1 KiB | ~27.7 µs | **~16.8 µs** | mqttv5 **~1.6× faster** under fan-in, 5× fewer allocs (11 vs 56) |
-| RoundTrip (pub → broker → sub) | ~200 µs | **~185 µs** | mqttv5 ~7 % faster, 4.3× fewer allocs (22 vs 95) |
+| Publish QoS 0 single goroutine | ~5–6 µs | ~5–6 µs | Within run-to-run noise (winner flips per run); mqttv5 is **zero-alloc** (0 vs 15) |
+| Publish QoS 1 (waits for PUBACK) | ~154 µs | **~142 µs** | mqttv5 ~8 % faster, 4.8× fewer allocs (11 vs 53) |
+| Publish QoS 1 × 8 goroutines, 1 KiB | ~33 µs | **~20 µs** | mqttv5 **~1.6× faster** under fan-in, 5× fewer allocs (11 vs 56) |
+| RoundTrip (pub → broker → sub) | ~223 µs | **~184 µs** | mqttv5 ~17 % faster, 4.5× fewer allocs (21 vs 95) |
 
-Numbers are rounded from the per-run figures in
-[`e2e_results.txt`](benchmarks/e2e_results.txt) (`-count=2`); the fan-in
-row is noisy run to run, so treat ~1.6× as the working figure and
-re-run the suite for numbers under your own load. The single-goroutine
-QoS-0 case — where autopaho's mutex-around-`Write` is cheap with no
-contention and edges mqttv5 by ~0.6 µs — is the only loss. That same
-mutex is what limits autopaho under concurrency: the trade-off is
-sub-microsecond per call against the ~1.6× fan-in win (and 4–5× fewer
-allocations across the board).
+Numbers are means of the per-run figures in
+[`e2e_results.txt`](benchmarks/e2e_results.txt) (`-count=2`) — loopback
+to mosquitto, so they are dominated by the broker round-trip and are
+**noisy run to run** (±20–30 %). Treat the ratios and alloc counts as
+the stable signal, not the absolute µs. Single-producer QoS 0 is a
+**wash within that noise** — the winner flips between runs, because
+autopaho writes inline under an uncontended mutex while mqttv5 hands the
+packet to its writer goroutine; that handoff is a draw at one producer
+and turns into the win once producers contend (fan-in). mqttv5 stays
+zero-alloc on that path either way. Got a *single* hot publisher and
+want more single-connection throughput? `WithWriteBatch(32)` coalesces
+queued packets into one `writev` (~25 % faster than autopaho in this
+loopback test); it's off by default to keep one-packet-per-segment
+framing.
 
 ## Reliability semantics
 
