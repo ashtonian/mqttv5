@@ -1,6 +1,6 @@
 module github.com/ashtonian/mqttv5/codec/msgpack
 
-go 1.26.3
+go 1.26.4
 
 require github.com/vmihailenco/msgpack/v5 v5.4.1
 
