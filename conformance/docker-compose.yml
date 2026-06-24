@@ -26,3 +26,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 15
+
+  # emqx-scram is a dedicated EMQX with MQTT 5 enhanced authentication
+  # (SCRAM-SHA-256) for the re-authentication conformance test, kept
+  # separate from the anonymous `emqx` above so the other emqx-backed
+  # tests stay unaffected. The SCRAM authenticator and its user are
+  # provisioned at test time via the REST API (see reauth_test.go), using
+  # the API key bootstrapped from ./emqx/api_key.bootstrap.
+  emqx-scram:
+    image: emqx/emqx:6.2.0
+    container_name: mqttv5-conformance-emqx-scram
+    ports:
+      - "1885:1883"   # MQTT listener (SCRAM-authenticated)
+      - "18084:18083" # REST API, for provisioning the SCRAM user
+    environment:
+      - EMQX_API_KEY__BOOTSTRAP_FILE=/opt/emqx/etc/api_key.bootstrap
+    volumes:
+      - ./emqx/api_key.bootstrap:/opt/emqx/etc/api_key.bootstrap:ro
+    healthcheck:
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 15

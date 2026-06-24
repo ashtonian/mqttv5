@@ -30,13 +30,24 @@ jobs:
       - name: wait for brokers
         timeout-minutes: 2
         run: |
-          for port in 1883 1884; do
+          for port in 1883 1884 1885 18084; do
             echo "waiting for tcp/$port"
             until bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; do
               sleep 1
             done
             echo "tcp/$port up"
           done
+
+      - name: wait for emqx-scram REST API
+        timeout-minutes: 2
+        run: |
+          until curl -fsS -o /dev/null \
+            -u conformancekey:conformanceSecret0123456789 \
+            http://127.0.0.1:18084/api/v5/authentication; do
+            echo "waiting for emqx-scram API"
+            sleep 2
+          done
+          echo "emqx-scram API ready"
 
       - name: run conformance
         run: go test -tags conformance -race -v -timeout 180s ./...

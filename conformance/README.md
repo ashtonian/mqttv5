@@ -19,6 +19,7 @@ default `go test ./...` does not require a broker.
 | Large payload | 32 KiB through the broker |
 | Session | resume with CleanStart=false + SessionExpiry |
 | ClientGroup | publish fan-out to two brokers |
+| Re-auth (§4.12) | client-initiated re-authentication over SCRAM-SHA-256 against EMQX |
 
 The reconnect+replay paths are covered by the in-process fakeBroker
 tests in the main module (no real broker bounce required).
@@ -49,15 +50,26 @@ Cleanup:
 docker compose -f conformance/docker-compose.yml down
 ```
 
-## Two brokers
+## Brokers
 
-`docker-compose.yml` brings up `mosquitto` (port 1883) and `emqx`
-(port 1884). The ClientGroup test requires both; other tests use just
-mosquitto. To override:
+`docker-compose.yml` brings up three brokers:
+
+- `mosquitto` (port 1883) — the default for most tests.
+- `emqx` (port 1884, anonymous) — the second broker for the ClientGroup
+  fan-out test.
+- `emqx-scram` (port 1885) — a dedicated EMQX with MQTT 5 enhanced
+  authentication (SCRAM-SHA-256) for `TestReauthenticate_SCRAM_EMQX`. Its
+  SCRAM authenticator and test user are provisioned at test time via the
+  REST API (port 18084) using the API key in `emqx/api_key.bootstrap`.
+
+The ClientGroup test needs mosquitto + emqx; the re-auth test needs
+emqx-scram; everything else uses just mosquitto. Override broker URLs via
+env:
 
 ```bash
 MQTT_BROKER=mqtt://broker-a:1883 \
 MQTT_BROKER_2=mqtt://broker-b:1883 \
+MQTT_BROKER_SCRAM=mqtt://broker-c:1885 \
   go -C conformance test -tags conformance -v
 ```
 
