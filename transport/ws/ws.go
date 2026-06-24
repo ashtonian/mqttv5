@@ -31,9 +31,10 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/ashtonian/mqttv5/transport"
 	gws "github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
+
+	"github.com/ashtonian/mqttv5/transport"
 )
 
 // DefaultHandshakeTimeout is the WebSocket upgrade-handshake budget

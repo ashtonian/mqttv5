@@ -29,6 +29,8 @@ jobs:
           - codec/json
           - codec/msgpack
           - store/file
+          - queue/file
+          - transport/ws
           - examples
           - conformance
           - benchmarks
@@ -56,6 +58,8 @@ jobs:
           - codec/json
           - codec/msgpack
           - store/file
+          - queue/file
+          - transport/ws
           - examples
           - conformance
           - benchmarks
@@ -90,6 +94,8 @@ jobs:
           - codec/json
           - codec/msgpack
           - store/file
+          - queue/file
+          - transport/ws
           - examples
           - conformance
           - benchmarks
@@ -121,6 +127,8 @@ jobs:
           - codec/json
           - codec/msgpack
           - store/file
+          - queue/file
+          - transport/ws
     steps:
       - uses: actions/checkout@v6
 
@@ -161,6 +169,8 @@ jobs:
           - codec/json
           - codec/msgpack
           - store/file
+          - queue/file
+          - transport/ws
           - examples
           - conformance
           - benchmarks
