@@ -1217,7 +1217,23 @@ func (c *Client) pingLoop(cs *connState) {
 
 		select {
 		case <-time.After(c.cfg.PingTimeout):
-			if cs.pingResp.Load() < cs.pingSent.Load() {
+			// Liveness = "did the broker send us ANYTHING since we
+			// PINGREQ'd?", not "did the PINGRESP specifically land?".
+			// The PINGRESP shares the single ordered stream with inbound
+			// PUBLISHes, and the readLoop dispatches serially, so under a
+			// sustained inbound flood a PINGRESP sits behind a deep read
+			// backlog and pingResp lags past PingTimeout — even though
+			// bytes are actively arriving. A fresh inbound read window
+			// (lastRead advanced past pingSent) is DEFINITIVE proof the
+			// broker is alive, so treat it as a successful liveness check
+			// and skip the reconnect. Without this a busy subscriber
+			// tears down its own healthy connection under load and drops
+			// its subscription window (estavelle RFC 0009 forward-ceiling
+			// forensics: this presented as ~20% cross-node QoS 0 "loss").
+			// A genuinely half-open broker sends no bytes at all, so
+			// lastRead stays stale and the timeout still fires.
+			pingSent := cs.pingSent.Load()
+			if cs.pingResp.Load() < pingSent && cs.lastReadUnixNano.Load() < pingSent {
 				c.cfg.Logger.Warn("mqttv5: PINGRESP timeout",
 					slog.Duration("after", c.cfg.PingTimeout),
 				)

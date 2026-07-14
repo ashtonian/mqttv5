@@ -215,6 +215,130 @@ func TestIdlePING_IdleConnectionStillSendsPINGREQ(t *testing.T) {
 	}
 }
 
+// streamingDropPingBroker accepts a subscription, then streams QoS 0
+// PUBLISHes at a steady cadence — keeping the client's inbound read
+// window perpetually fresh — while DROPPING every PINGRESP. It models
+// the real-world failure the estavelle RFC 0009 forward-ceiling
+// forensics surfaced: under a sustained inbound flood the client's
+// readLoop dispatches serially, so a PINGRESP sits behind a deep
+// backlog and pingResp does not advance within PingTimeout — even
+// though bytes are visibly arriving the whole time. A liveness check
+// that keys on PINGRESP alone falsely tears the connection down; one
+// that also honours inbound data (lastRead) does not.
+type streamingDropPingBroker struct {
+	pubInterval time.Duration
+}
+
+func (b *streamingDropPingBroker) serve(t *testing.T, fb *fakeBroker, c net.Conn) {
+	t.Helper()
+	defer c.Close()
+	dec := wire.NewDecoder(c)
+	acceptConnect(t, c, dec)
+
+	// A dedicated writer streams PUBLISHes until the conn dies, so the
+	// client's inbound window stays fresh independent of PINGREQ timing.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tk := time.NewTicker(b.pubInterval)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-fb.Done():
+				return
+			case <-tk.C:
+				if _, err := wire.WritePublish(c, wire.PublishOpts{
+					Topic:   "flood/topic",
+					Payload: []byte("x"),
+					QoS:     0,
+				}); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		pkt, err := dec.ReadPacket()
+		if err != nil {
+			return
+		}
+		// A SUBSCRIBE gets a SUBACK; a PINGREQ gets NOTHING (the
+		// PINGRESP is dropped, modelling one buried behind the inbound
+		// backlog); everything else is released.
+		if sub, ok := pkt.(*wire.Subscribe); ok {
+			id := sub.PacketID
+			pkt.Release()
+			_, _ = wire.WriteSuback(c, wire.SubackOpts{
+				PacketID:    id,
+				ReasonCodes: []wire.ReasonCode{wire.ReasonGrantedQoS0},
+			})
+			continue
+		}
+		pkt.Release()
+	}
+}
+
+// TestIdlePING_InboundFloodSuppressesFalseTimeout is the estavelle
+// RFC 0009 regression: a subscriber under a steady inbound stream whose
+// PINGRESP never lands in time must NOT self-disconnect — the fresh
+// inbound read window is definitive proof the broker is alive. Before
+// the fix this tore the connection down (pingResp < pingSent at the
+// deadline), which on the estavelle cross-node bench looked like ~20%
+// QoS 0 "loss": the subscriber vanished mid-run and the broker forwarded
+// to no one.
+func TestIdlePING_InboundFloodSuppressesFalseTimeout(t *testing.T) {
+	t.Parallel()
+	b := &streamingDropPingBroker{pubInterval: 5 * time.Millisecond}
+	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+		b.serve(t, fb, c)
+	})
+
+	var downs atomic.Int32
+	var msgs atomic.Int32
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithKeepAlive(1),
+		WithPingTimeout(300*time.Millisecond),
+		WithReconnectBackoff(ConstantBackoff(time.Hour)),
+		WithOnConnectionDown(func() bool {
+			downs.Add(1)
+			return true
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	ch, _, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "flood/topic"}})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	go func() {
+		for range ch {
+			msgs.Add(1)
+		}
+	}()
+
+	// Hold across three keepalive+ping windows. The inbound stream keeps
+	// lastRead fresh the whole time, so a correct liveness check never
+	// fires OnConnectionDown despite the dropped PINGRESPs.
+	time.Sleep(3500 * time.Millisecond)
+
+	if n := downs.Load(); n != 0 {
+		t.Fatalf("connection falsely torn down %d time(s) under inbound flood — a fresh read window must suppress the PINGRESP timeout", n)
+	}
+	if n := msgs.Load(); n == 0 {
+		t.Fatal("no inbound messages received — the flood broker never streamed; test is not exercising the path")
+	}
+}
+
 // TestIdlePING_TimeoutStillDetectsHalfOpen verifies that the PINGRESP
 // timeout path still works after the rewrite: if the broker silently
 // drops PINGREQs, the connection is torn down within PingTimeout.
