@@ -46,7 +46,7 @@ func TestAdapterConsumersEndWithTheBenchmark(t *testing.T) {
 						if err := srv.publish("adapter/t", qos, Payload(64), 1); err != nil {
 							b.Fatal(err)
 						}
-						await(b, s.done, 5*time.Second, s.String)
+						s.wait(b, 5*time.Second)
 					})
 					if res.N == 0 {
 						t.Fatal("the benchmark failed")

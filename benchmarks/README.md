@@ -54,9 +54,12 @@ The rules that make the comparison fair:
    grants publishers a Receive Maximum of 20 and the MQTT 5 libraries
    honour it; MQTT 3.1.1 has no Receive Maximum, so `paho3` publishes
    without that limit. MQTT 5 subscribers advertise a Receive Maximum of
-   20, the window mosquitto uses for MQTT 3.1.1 subscribers. A QoS 0
-   publish returns once the packet is written to the connection in every
-   library (mqttv5 with `PublishWaitForFlush`; the others always do).
+   20, the window mosquitto uses for MQTT 3.1.1 subscribers. In
+   `Publish`, a QoS 0 publish returns once the packet is written to the
+   connection in every library (mqttv5 with `PublishWaitForFlush`; the
+   others always do); the scenarios that time delivery instead use
+   mqttv5's default, which returns once the packet is queued for its
+   writer.
    A subscriber acknowledges a QoS 1/2 message at the same point in
    every library: in callback mode when the callback returns; in channel
    and queue mode when a consumer takes it, before processing it —
@@ -73,9 +76,11 @@ The rules that make the comparison fair:
    counts each sequence number once and fails the run on a duplicate, a
    wrong size, a payload whose two stamps disagree (pieces of two
    messages), a sequence number never sent, or one missing at the end.
-   Every scenario that receives checks this way, the round-trip and
-   latency ones included. The check runs once the subscriber has
-   stopped. Each adapter's stop returns only when its library will
+   Every scenario that receives checks this way, with two allowances:
+   in `SlowConsumer` a message the library dropped, and counted, stands
+   in for its delivery, and in `Reconnect` a QoS 1 redelivery after the
+   reconnect is allowed and reported as `duplicates/op`. The check runs
+   once the subscriber has stopped. Each adapter's stop returns only when its library will
    deliver nothing more: mqttv5's and autopaho's `Disconnect` wait for
    the goroutines that run callbacks, and paho3's counts as a stop only
    when it returns before its quiesce period ends, which it does once
@@ -117,9 +122,9 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 | `BenchmarkE2E_Receive` | a subscriber fed by `rawClient` at the rate the broker sustains; `mode` callback/chan/queue, `consumers` goroutines for chan/queue | time per delivered message |
 | `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed, a reference point for the harness's own cost | time per delivered message through the whole pipeline — source, socket, subscriber and sink — at QoS 1 set by the round trip of a 20-message window between client and source |
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
-| `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule interval; read the `p50-ns` … `max-ns` metrics |
+| `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule plus the wait for the last deliveries, over N: about the schedule interval; read the `p50-ns` … `max-ns` metrics |
 | `BenchmarkE2E_Reconnect` | 20 QoS 1 publishes vanish in a proxy, the connection is cut; time until a subscriber has all 20 after the client reconnects with its session and resends them | one cut-and-recover cycle |
-| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the largest growth of the process's heap objects over the burst's start, sampled every millisecond, `delivered-%` how much reached the consumer | not meaningful |
+| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the largest growth of the process's heap objects over the burst's start, sampled every millisecond, `delivered-%` how many messages reached the consumer intact; the library dropped, and counted, the rest | not meaningful |
 | `BenchmarkDecodePublish`, `BenchmarkDecodePublishRead`, `BenchmarkEncodePublish` | the codecs alone, no network (`props=none` or a content type and five user properties) | one packet |
 | `BenchmarkReceive`, `BenchmarkReceiveWindow`, `BenchmarkReceiveFilters` (core package) | mqttv5's inbound path against an in-process feed: decode, route, deliver, ack | one delivered message |
 

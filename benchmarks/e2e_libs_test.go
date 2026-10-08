@@ -588,12 +588,20 @@ type sink struct {
 	ready   chan struct{}
 	once    sync.Once
 	done    chan struct{}
+	// invalid is closed by the first delivery that fails the run.
+	invalid     chan struct{}
+	invalidOnce sync.Once
+
+	// allowDrops accepts a message the library dropped, and counted, in
+	// place of its delivery; allowDups accepts redeliveries, still
+	// counted in dup.
+	allowDrops, allowDups bool
 }
 
 func newSink(size, target int) *sink {
 	s := &sink{
 		size: size, target: int64(target), seen: make([]atomic.Uint64, (target+63)/64),
-		ready: make(chan struct{}), done: make(chan struct{}),
+		ready: make(chan struct{}), done: make(chan struct{}), invalid: make(chan struct{}),
 	}
 	if size >= 2*seqBytes {
 		s.pattern = Payload(size)[seqBytes : size-seqBytes]
@@ -601,23 +609,47 @@ func newSink(size, target int) *sink {
 	return s
 }
 
-func (s *sink) onMsg(p []byte) {
+func (s *sink) onMsg(p []byte) { s.accept(p) }
+
+// accept records p and reports whether it is a message's first intact
+// delivery.
+func (s *sink) accept(p []byte) bool {
 	if len(p) == 0 {
 		s.once.Do(func() { close(s.ready) })
-		return
+		return false
 	}
 	seq, ok := readSeq(p)
 	if len(p) != s.size || !ok || seq >= uint64(s.target) || !bytes.Equal(p[seqBytes:len(p)-seqBytes], s.pattern) {
 		s.wrong.Add(1)
-		return
+		s.fail()
+		return false
 	}
 	bit := uint64(1) << (seq % 64)
 	if s.seen[seq/64].Or(bit)&bit != 0 {
 		s.dup.Add(1)
-		return
+		if !s.allowDups {
+			s.fail()
+		}
+		return false
 	}
 	if s.got.Add(1) == s.target {
 		close(s.done)
+	}
+	return true
+}
+
+func (s *sink) fail() { s.invalidOnce.Do(func() { close(s.invalid) }) }
+
+// wait waits up to d for every message, failing b at once when a
+// delivery has made the run invalid.
+func (s *sink) wait(b *testing.B, d time.Duration) {
+	b.Helper()
+	select {
+	case <-s.done:
+	case <-s.invalid:
+		b.Fatalf("invalid delivery: %s", s)
+	case <-time.After(d):
+		b.Fatalf("timed out after %v: %s", d, s)
 	}
 }
 
@@ -654,11 +686,12 @@ const stopBound = 10 * time.Second
 // verify reports anything but every message once and intact. Call it
 // once delivery has ended.
 func (s *sink) verify(dropped func() int64) error {
-	if n := dropped(); n > 0 {
+	n := dropped()
+	if n > 0 && !s.allowDrops {
 		return fmt.Errorf("subscriber dropped %d messages; a run with drops measures nothing", n)
 	}
-	if s.wrong.Load() > 0 || s.dup.Load() > 0 || s.got.Load() != s.target {
-		return errors.New(s.String())
+	if s.wrong.Load() > 0 || (s.dup.Load() > 0 && !s.allowDups) || s.got.Load()+n != s.target {
+		return fmt.Errorf("%s, %d dropped", s, n)
 	}
 	return nil
 }

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/metrics"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,8 +17,9 @@ import (
 // its consumer stops. The consumer blocks on its first message while the
 // raw publisher sends b.N QoS 0 messages; once the client has stopped
 // taking in data the consumer is released and drains. peak-heap-B is the
-// largest growth of the live Go heap over the run, delivered-% how many
-// messages reached the consumer; the rest were dropped by the library.
+// largest growth of the process's heap objects over the run,
+// delivered-% how many messages reached the consumer intact; the library
+// dropped, and counted, the rest.
 // A library whose consumer holds back its read loop stops reading, and
 // the backlog stays in the broker. Run with a fixed iteration count,
 // e.g. -benchtime=200000x; ns/op is not meaningful here.
@@ -37,19 +37,20 @@ func BenchmarkE2E_SlowConsumer(b *testing.B) {
 func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	topic := "bench/slow/" + uniqueID("")
 	release := make(chan struct{})
+	// The library may drop what does not fit; the rest must arrive once
+	// and intact.
+	s := newSink(size, b.N)
+	s.allowDrops = true
 	var delivered atomic.Int64
-	ready := make(chan struct{})
-	var once sync.Once
 	sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-slow")}, topic, 0, m, 1, func(p []byte) {
-		if len(p) == 0 {
-			once.Do(func() { close(ready) })
-			return
+		if len(p) > 0 {
+			<-release
+			delivered.Add(1)
 		}
-		<-release
-		delivered.Add(1)
+		s.onMsg(p)
 	})
 	pub := dialRaw(b, uniqueID("raw-pub"))
-	waitLive(b, &sink{ready: ready}, func() error { return pub.publish(topic, 0, nil, 1) })
+	waitLive(b, s, func() error { return pub.publish(topic, 0, nil, 1) })
 
 	runtime.GC()
 	sampler := startHeapSampler()
@@ -74,6 +75,11 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	close(release)
 	deadline := time.Now().Add(2 * time.Minute)
 	for delivered.Load()+sub.dropped() < int64(b.N) {
+		select {
+		case <-s.invalid:
+			b.Fatalf("invalid delivery: %s", s)
+		default:
+		}
 		if time.Now().After(deadline) {
 			b.Fatalf("delivered %d and dropped %d of %d", delivered.Load(), sub.dropped(), b.N)
 		}
@@ -81,12 +87,13 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	}
 	b.StopTimer()
 	peak := sampler.stop()
+	s.check(b, sub)
 	b.ReportMetric(float64(peak), "peak-heap-B")
-	b.ReportMetric(100*float64(delivered.Load())/float64(b.N), "delivered-%")
+	b.ReportMetric(100*float64(s.got.Load())/float64(b.N), "delivered-%")
 }
 
-// heapSampler records the largest live heap seen above the level at
-// which it started.
+// heapSampler records the largest growth of the process's heap-object
+// bytes, live or not yet collected, over the level at which it started.
 type heapSampler struct {
 	base  uint64
 	peak  atomic.Uint64

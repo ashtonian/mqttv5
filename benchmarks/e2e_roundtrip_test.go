@@ -24,51 +24,55 @@ func BenchmarkE2E_RoundTrip(b *testing.B) {
 		for _, qos := range []byte{0, 1, 2} {
 			for _, sz := range []size{size64B, size1KiB, size1MiB} {
 				b.Run(fmt.Sprintf("lib=%s/qos=%d/size=%s", l.name, qos, sz.name), func(b *testing.B) {
-					topic := "bench/roundtrip/" + uniqueID("")
-					s := newSink(sz.bytes, b.N)
-					arrived := make(chan uint64, 1)
-					sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
-						if len(p) > 0 {
-							// Torn stamps are the sink's to report, and so is
-							// a delivery the loop is not waiting for.
-							seq, _ := readSeq(p)
-							select {
-							case arrived <- seq:
-							default:
-							}
-						}
-						s.onMsg(p)
-					})
-					p := l.connect(b, clientConfig{id: uniqueID(l.name + "-pub")})
-					ctx := context.Background()
-					waitLive(b, s, func() error { return p.publish(ctx, topic, 0, nil) })
-					// One buffer, stamped for each message: the previous one
-					// has arrived, so no library still holds it.
-					payload := Payload(sz.bytes)
-
-					b.SetBytes(int64(sz.bytes))
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := range b.N {
-						stampSeq(payload, uint64(i))
-						if err := p.publish(ctx, topic, qos, payload); err != nil {
-							b.Fatalf("publish %d: %v", i, err)
-						}
-						select {
-						case seq := <-arrived:
-							if seq != uint64(i) {
-								b.Fatalf("waiting for message %d, message %d arrived; %s", i, seq, s)
-							}
-						case <-time.After(10 * time.Second):
-							b.Fatalf("message %d never arrived", i)
-						}
-					}
-					b.StopTimer()
-					s.check(b, sub)
+					runRoundTrip(b, l, qos, sz.bytes)
 				})
 			}
 		}
 	}
+}
+
+func runRoundTrip(b *testing.B, l lib, qos byte, size int) {
+	topic := "bench/roundtrip/" + uniqueID("")
+	s := newSink(size, b.N)
+	arrived := make(chan uint64, 1)
+	sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
+		if len(p) > 0 {
+			// Torn stamps are the sink's to report, and so is a delivery
+			// the loop is not waiting for.
+			seq, _ := readSeq(p)
+			select {
+			case arrived <- seq:
+			default:
+			}
+		}
+		s.onMsg(p)
+	})
+	p := l.connect(b, clientConfig{id: uniqueID(l.name + "-pub")})
+	ctx := context.Background()
+	waitLive(b, s, func() error { return p.publish(ctx, topic, 0, nil) })
+	// One buffer, stamped for each message: the previous one has
+	// arrived, so no library still holds it.
+	payload := Payload(size)
+
+	b.SetBytes(int64(size))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		stampSeq(payload, uint64(i))
+		if err := p.publish(ctx, topic, qos, payload); err != nil {
+			b.Fatalf("publish %d: %v", i, err)
+		}
+		select {
+		case seq := <-arrived:
+			if seq != uint64(i) {
+				b.Fatalf("waiting for message %d, message %d arrived; %s", i, seq, s)
+			}
+		case <-time.After(10 * time.Second):
+			b.Fatalf("message %d never arrived", i)
+		}
+	}
+	b.StopTimer()
+	s.check(b, sub)
 }
 
 // latencyWorkers publish on behalf of the open-loop pacer, so a slow
@@ -81,8 +85,9 @@ const latencyWorkers = 32
 // time it was scheduled to the time the subscriber receives it. A
 // stalled client therefore shows up as latency instead of as a lower
 // send rate (no coordinated omission). The p50/p90/p99/p99.9/max metrics
-// are in nanoseconds; ns/op is just the schedule interval. Run with a
-// fixed iteration count, e.g. -benchtime=20000x.
+// are in nanoseconds; ns/op, the schedule plus the wait for the last
+// deliveries over N, is about the schedule interval. Run with a fixed
+// iteration count, e.g. -benchtime=20000x.
 func BenchmarkE2E_Latency(b *testing.B) {
 	requireBroker(b)
 	for _, l := range libs {
@@ -148,7 +153,7 @@ func runLatency(b *testing.B, l lib, qos byte, rate, size int) {
 		jobs <- i
 	}
 	close(jobs)
-	await(b, s.done, time.Minute, s.String)
+	s.wait(b, time.Minute)
 	b.StopTimer()
 	wg.Wait()
 	if err := failed.Load(); err != nil {

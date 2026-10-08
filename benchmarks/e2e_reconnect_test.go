@@ -6,7 +6,6 @@ package benchmarks
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -50,32 +49,21 @@ func runReconnect(b *testing.B, l lib) {
 	frameLen := len(*frame)
 	wire.ReleaseBuf(frame)
 
-	// Each payload carries its sequence number, so the observer can tell
-	// a redelivery from a first delivery.
+	// Each payload carries its sequence number, so the sink can tell a
+	// redelivery, which QoS 1 allows after the reconnect, from a first
+	// delivery.
 	total := b.N * replayWindow
 	payloads := make([][]byte, total)
 	for i := range payloads {
 		payloads[i] = Payload(size256B.bytes)
-		binary.BigEndian.PutUint64(payloads[i], uint64(i))
+		stampSeq(payloads[i], uint64(i))
 	}
-	seen := make([]bool, total)
-	var firsts, duplicates atomic.Int64
+	s := newSink(size256B.bytes, total)
+	s.allowDups = true
 	roundDone := make(chan struct{}, 1)
-	ready := make(chan struct{})
-	var once sync.Once
 	sub := dialRaw(b, uniqueID("raw-sub"))
 	sub.subscribe(topic, 0, func(p *wire.Publish) {
-		if len(p.Payload) == 0 {
-			once.Do(func() { close(ready) })
-			return
-		}
-		seq := binary.BigEndian.Uint64(p.Payload)
-		if seq >= uint64(total) || seen[seq] {
-			duplicates.Add(1)
-			return
-		}
-		seen[seq] = true
-		if firsts.Add(1)%replayWindow == 0 {
+		if s.accept(p.Payload) && s.got.Load()%replayWindow == 0 {
 			roundDone <- struct{}{}
 		}
 	})
@@ -83,7 +71,7 @@ func runReconnect(b *testing.B, l lib) {
 	px := newProxy(b, brokerAddr(b))
 	p := l.connect(b, clientConfig{id: uniqueID(l.name + "-resume"), addr: px.addr(), session: true})
 	ctx := context.Background()
-	waitLive(b, &sink{ready: ready}, func() error { return p.publish(ctx, topic, 0, nil) })
+	waitLive(b, s, func() error { return p.publish(ctx, topic, 0, nil) })
 
 	var publishErrors atomic.Int64
 	b.ReportAllocs()
@@ -107,14 +95,21 @@ func runReconnect(b *testing.B, l lib) {
 		px.cut()
 		select {
 		case <-roundDone:
+		case <-s.invalid:
+			b.Fatalf("round %d: invalid delivery; %s", round, s)
 		case <-time.After(30 * time.Second):
-			b.Fatalf("round %d: %d messages arrived in all, want %d", round, firsts.Load(), (round+1)*replayWindow)
+			b.Fatalf("round %d: want %d messages; %s", round, (round+1)*replayWindow, s)
 		}
 		b.StopTimer()
 		wg.Wait()
 	}
+	// The reader stops before the counts are read.
+	sub.close()
+	if err := s.verify(noDrops); err != nil {
+		b.Fatal(err)
+	}
 	b.ReportMetric(float64(publishErrors.Load())/float64(b.N), "publish-errors/op")
-	b.ReportMetric(float64(duplicates.Load())/float64(b.N), "duplicates/op")
+	b.ReportMetric(float64(s.dup.Load())/float64(b.N), "duplicates/op")
 }
 
 // proxy relays a client's connections to the broker. swallow makes the

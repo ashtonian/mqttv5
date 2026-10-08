@@ -46,6 +46,15 @@ func brokerAddr(b *testing.B) string {
 	return u.Host
 }
 
+// brokerHost is brokerURL's host:port, empty when it does not parse.
+func brokerHost() string {
+	u, err := url.Parse(brokerURL())
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
 // requireBroker skips the benchmark when no broker is listening.
 func requireBroker(b *testing.B) {
 	b.Helper()

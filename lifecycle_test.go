@@ -588,14 +588,20 @@ func TestDisconnectCancelsAConnectAwaitingConnack(t *testing.T) {
 	old := make(chan error, 1)
 	go func() { old <- cli.Connect(ctx) }()
 	<-sent
-	err = cli.Disconnect(ctx)
-	release()
-	if err != nil {
+	if err := cli.Disconnect(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-old; !errors.Is(err, ErrClosed) {
-		t.Fatalf("the cancelled Connect returned %v, want ErrClosed", err)
+	// The broker still holds the CONNACK: only the cancellation can
+	// have ended Connect.
+	select {
+	case err := <-old:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("the cancelled Connect returned %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect kept waiting for the CONNACK after Disconnect")
 	}
+	release()
 	if err := cli.SetBrokers(next.URL()); err != nil {
 		t.Fatal(err)
 	}

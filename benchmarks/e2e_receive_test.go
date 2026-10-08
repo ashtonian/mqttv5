@@ -60,7 +60,7 @@ func BenchmarkE2E_Receive(b *testing.B) {
 					b.ResetTimer()
 					cpu := startCPU(b)
 					published := pub.publishAsync(topic, v.qos, payload, b.N)
-					await(b, s.done, 2*time.Minute, s.String)
+					s.wait(b, 2*time.Minute)
 					b.StopTimer()
 					cpu.stop()
 					if err := published(); err != nil {

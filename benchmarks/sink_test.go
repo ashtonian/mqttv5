@@ -53,6 +53,44 @@ func TestSinkChecksEveryDelivery(t *testing.T) {
 	}
 }
 
+// A sink that allows drops counts each message its library dropped in
+// place of a delivery, and one that allows duplicates counts them
+// without failing; neither accepts a damaged or missing message.
+func TestSinkPolicies(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		allowDrops, dups bool
+		deliver          []uint64
+		dropped          int64
+		damaged          bool
+		ok               bool
+	}{
+		{name: "drops counted in place of deliveries", allowDrops: true, deliver: []uint64{0}, dropped: 1, ok: true},
+		{name: "drops that leave a message missing", allowDrops: true, deliver: []uint64{0}, ok: false},
+		{name: "drops refused by default", deliver: []uint64{0}, dropped: 1, ok: false},
+		{name: "a duplicate where drops are allowed", allowDrops: true, deliver: []uint64{0, 0}, dropped: 1, ok: false},
+		{name: "duplicates allowed", dups: true, deliver: []uint64{0, 1, 1}, ok: true},
+		{name: "duplicates allowed, one missing", dups: true, deliver: []uint64{0, 0}, ok: false},
+		{name: "damage where duplicates are allowed", dups: true, deliver: []uint64{0, 1}, damaged: true, ok: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSink(64, 2)
+			s.allowDrops, s.allowDups = tc.allowDrops, tc.dups
+			for i, seq := range tc.deliver {
+				p := stamped(seq)
+				if tc.damaged && i == len(tc.deliver)-1 {
+					p[32] ^= 0xff
+				}
+				s.onMsg(p)
+			}
+			err := s.verify(func() int64 { return tc.dropped })
+			if (err == nil) != tc.ok {
+				t.Fatalf("verify: %v, want ok %v", err, tc.ok)
+			}
+		})
+	}
+}
+
 func fakeSubscription(stop func(ctx context.Context) error) *subscription {
 	s := newSubscription()
 	s.subscriber = subscriber{dropped: noDrops, stop: stop}
