@@ -82,7 +82,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	result, err := c.connectOnce(ctx, brokerURL, cleanStart)
 	if err == nil {
 		if err = c.runConnection(life, result); err != nil {
-			// The session store failed; storeFailed ends the span.
+			// The span is ending; its teardown is under way.
 			select {
 			case <-life.finished:
 			case <-ctx.Done():
@@ -113,9 +113,9 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
-	// The supervisor starts only while the span is not ending: a store
-	// failure's teardown waits for a supervisor that started before it,
-	// and none may start after it.
+	// The supervisor starts only while the span is not ending: the
+	// teardown waits for a supervisor that started before it, and none
+	// may start after it.
 	life.mu.Lock()
 	if err := c.activationErr(life); err != nil {
 		life.mu.Unlock()
@@ -129,7 +129,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 		return err
 	}
-	c.supWg.Add(1)
+	life.supervisor.Add(1)
 	go c.supervisor(life, cleanStart, connected)
 	life.mu.Unlock()
 	return nil
@@ -160,13 +160,19 @@ func (c *Client) AwaitConnection(ctx context.Context) error {
 // connection. For a custom reason / properties use
 // [Client.DisconnectWith]. Does not fire OnConnectionDown.
 // Idempotent.
+//
+// Disconnect waits for the goroutines that run the lifecycle callbacks
+// (all but OnStoreFailure) and [Client.SubscribeCallback] handlers, so
+// calling it from one of them deadlocks: start it on another goroutine.
 func (c *Client) Disconnect(ctx context.Context) error {
 	return c.DisconnectWith(ctx, DisconnectOptions{ReasonCode: ReasonNormalDisconnection})
 }
 
 // DisconnectWith sends a DISCONNECT with opts, stops the supervisor,
 // and tears down the current connection. Pool-member disconnect
-// errors are joined into the returned error. Idempotent.
+// errors are joined into the returned error. Idempotent. Like
+// [Client.Disconnect], it must not be called from a callback's own
+// goroutine.
 func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) error {
 	c.startMu.Lock()
 	started := c.started
@@ -179,15 +185,25 @@ func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) err
 		return fmt.Errorf("%w: CONNECT sent 0, DISCONNECT asks for %d", ErrInvalidSessionExpiry, *opts.SessionExpiryInterval)
 	}
 
-	life := c.life.Load()
+	return c.stop(ctx, c.life.Load(), opts.wire(), nil)
+}
+
+// stop ends span life with a DISCONNECT carrying opts and tears it
+// down; cause, when not nil, is why. From here on no connection is
+// installed in the span and no supervisor started, so the teardown sees
+// whatever was.
+func (c *Client) stop(ctx context.Context, life *lifecycle, opts wire.DisconnectOpts, cause error) error {
+	life.mu.Lock()
+	life.stopping = true
+	life.mu.Unlock()
 	life.disconnOnce.Do(func() {
-		c.sendDisconnectWith(ctx, opts.wire())
-		life.end()
+		c.sendDisconnectWith(ctx, opts)
+		life.endWith(cause)
 		if cs := c.cur.Load(); cs != nil {
 			cs.signalDown()
 		}
 	})
-	c.supWg.Wait()
+	life.supervisor.Wait()
 	return c.finish(ctx, life)
 }
 
@@ -274,10 +290,10 @@ func (c *Client) newDecoder(conn transport.Conn) *wire.Decoder {
 }
 
 // connectOnce performs the dial + CONNECT/CONNACK handshake with the
-// given CleanStart flag and returns what the CONNACK revealed. A broker
-// that reports a present session for a CleanStart=1 CONNECT violates
-// [MQTT-3.2.2-2]; the attempt fails with a [*ProtocolError] after
-// DISCONNECT 0x82.
+// given CleanStart flag and returns what the CONNACK revealed. ctx
+// bounds the whole handshake. A broker that reports a present session
+// for a CleanStart=1 CONNECT violates [MQTT-3.2.2-2]; the attempt fails
+// with a [*ProtocolError] after DISCONNECT 0x82.
 func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart bool) (*connectResult, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, c.cfg.ConnectTimeout)
 	defer cancel()
@@ -290,11 +306,23 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 	if dl, ok := dialCtx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
+	// The deadline covers expiry; a cancelled ctx fails the read or
+	// write in progress through a deadline in the past.
+	interrupt := context.AfterFunc(dialCtx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer interrupt()
+	// ioErr reports a handshake I/O failure as ctx's error when ctx
+	// ended: the timeout the past deadline produced is not the cause.
+	ioErr := func(err error) error {
+		if cerr := dialCtx.Err(); cerr != nil {
+			return cerr
+		}
+		return err
+	}
 
 	sent, err := c.writeConnect(dialCtx, conn, cleanStart)
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("mqttv5: write CONNECT: %w", err)
+		return nil, fmt.Errorf("mqttv5: write CONNECT: %w", ioErr(err))
 	}
 
 	dec := c.newDecoder(conn)
@@ -310,7 +338,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 		}
 		if err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("mqttv5: read CONNACK: %w", err)
+			return nil, fmt.Errorf("mqttv5: read CONNACK: %w", ioErr(err))
 		}
 		switch p := pkt.(type) {
 		case *wire.Auth:
@@ -337,7 +365,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				AuthenticationData:   response,
 			}); err != nil {
 				_ = conn.Close()
-				return nil, fmt.Errorf("mqttv5: write AUTH: %w", err)
+				return nil, fmt.Errorf("mqttv5: write AUTH: %w", ioErr(err))
 			}
 			// Loop — broker, not us, decides when to send CONNACK.
 		case *wire.Connack:
@@ -370,6 +398,11 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 			}
 			info := parseConnack(p, sent)
 			p.Release()
+			if !interrupt() {
+				// ctx ended as the CONNACK arrived.
+				_ = conn.Close()
+				return nil, fmt.Errorf("mqttv5: connect: %w", dialCtx.Err())
+			}
 			_ = conn.SetDeadline(time.Time{})
 			r := &connectResult{url: brokerURL, conn: conn, decoder: dec, info: info}
 			if sent.SessionExpiryInterval != nil {
@@ -389,8 +422,9 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 // the session with the CONNACK (resume or session loss), starts the
 // read/write/ping goroutines, and re-issues subscriptions when the
 // broker has no session. Each call allocates a fresh connState. An
-// error means the session store failed: the connection is closed and
-// storeFailed is ending the span.
+// error means the span is ending, because the session store failed or
+// the client is being stopped: the connection is closed and the
+// teardown is under way.
 func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 	cs := &connState{
 		clk:           c.cfg.clock,
@@ -531,18 +565,7 @@ func (c *Client) storeFailed(err error) {
 func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
 	defer cancel()
-	life.mu.Lock()
-	life.stopping = true
-	life.mu.Unlock()
-	life.disconnOnce.Do(func() {
-		c.sendDisconnectWith(ctx, wire.DisconnectOpts{ReasonCode: wire.ReasonUnspecifiedError})
-		life.endWith(err)
-		if cs := c.cur.Load(); cs != nil {
-			cs.signalDown()
-		}
-	})
-	c.supWg.Wait()
-	_ = c.finish(ctx, life)
+	_ = c.stop(ctx, life, wire.DisconnectOpts{ReasonCode: wire.ReasonUnspecifiedError}, err)
 	if c.cfg.OnStoreFailure != nil {
 		c.cfg.OnStoreFailure(err)
 	}
@@ -554,7 +577,7 @@ func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 // healthy endpoints; a successful connect leaves the index parked on
 // whichever URL accepted us.
 func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
-	defer c.supWg.Done()
+	defer life.supervisor.Done()
 	// attempts counts reconnect attempts since the last connection that
 	// lasted; it carries the backoff across connections that do not.
 	attempts := 0
@@ -573,6 +596,11 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 		case <-life.shutdown:
 			cs.signalDown()
 			cs.wg.Wait()
+			return
+		}
+		if life.isStopping() {
+			// The broker closed the connection after the teardown's
+			// DISCONNECT: that is the teardown, not a drop.
 			return
 		}
 
@@ -641,10 +669,16 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			c.cfg.OnReconnectAttempt(attempt, brokerURL)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
+		ctx, cancel := life.attemptContext(c.cfg.ConnectTimeout)
 		result, err := c.connectOnce(ctx, brokerURL, cleanStart)
 		cancel()
 		if err != nil {
+			select {
+			case <-life.shutdown:
+				// The span ended during the attempt and cut it short.
+				return false, attempt
+			default:
+			}
 			c.stats.addConnectFailure()
 			c.redirectFrom(err)
 			if c.cfg.OnConnectError != nil {

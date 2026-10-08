@@ -193,8 +193,7 @@ type Config struct {
 	WriteOverflowPolicy WriteOverflowPolicy
 
 	// WriteBatchMax caps how many pre-encoded packets the writer
-	// goroutine coalesces into one writev. 0 disables batching.
-	// Worth enabling only for sustained concurrent publishers; see
+	// goroutine coalesces into one writev. 0 disables batching. See
 	// [WithWriteBatch].
 	WriteBatchMax int
 

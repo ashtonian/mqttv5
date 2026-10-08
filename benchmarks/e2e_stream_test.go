@@ -7,6 +7,7 @@ package benchmarks
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -49,7 +50,7 @@ func BenchmarkE2E_ReceiveStream(b *testing.B) {
 					srv := newRawServer(b, l.v5)
 					topic := "bench/stream/" + uniqueID("")
 					s := newSink(sz.bytes, b.N)
-					sub := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-stream"), addr: srv.addr(), receiveMaximum: receiveWindow},
+					sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-stream"), addr: srv.addr(), receiveMaximum: receiveWindow},
 						topic, v.qos, v.mode, 1, s.onMsg)
 					srv.awaitSubscribed(b)
 					waitLive(b, s, func() error { return srv.publish(topic, 0, nil, 1) })
@@ -356,13 +357,13 @@ func rawRemaining(frame []byte) uint32 {
 // floorLib is the cheapest subscriber the harness can feed: MQTT 5 on
 // the wire package, taking each PUBLISH's payload straight from the read
 // buffer and acknowledging QoS 1 in one write per read. Its column in
-// BenchmarkE2E_ReceiveStream shows what rawServer, the sink and the
+// BenchmarkE2E_ReceiveStream shows what rawServer, the gated sink and the
 // loopback socket cost with almost no subscriber: a reference point, not
 // an amount to subtract, since how often rawServer wakes depends on the
 // subscriber.
 var floorLib = lib{name: "floor", v5: true, modes: []mode{modeCallback}, subscribe: subscribeFloor}
 
-func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ mode, _ int, onMsg func([]byte)) *subscription {
+func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ mode, _ int, onMsg func([]byte)) subscriber {
 	b.Helper()
 	conn, err := net.DialTimeout("tcp", cfg.host(b), 5*time.Second)
 	if err != nil {
@@ -410,10 +411,15 @@ func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ m
 			}
 		}
 	}()
-	return newSubscription(b, func() int64 { return 0 }, func() {
+	return subscriber{dropped: noDrops, stop: func(ctx context.Context) error {
 		_ = conn.Close()
-		<-done
-	})
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}}
 }
 
 // floorPublish returns an MQTT 5 PUBLISH frame's payload and, for QoS 1

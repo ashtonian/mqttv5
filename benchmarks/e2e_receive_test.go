@@ -49,7 +49,7 @@ func BenchmarkE2E_Receive(b *testing.B) {
 				b.Run(name, func(b *testing.B) {
 					topic := "bench/receive/" + uniqueID("")
 					s := newSink(sz.bytes, b.N)
-					sub := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-sub"), receiveMaximum: receiveWindow},
+					sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub"), receiveMaximum: receiveWindow},
 						topic, v.qos, v.mode, v.consumers, s.onMsg)
 					pub := dialRaw(b, uniqueID("raw-pub"))
 					waitLive(b, s, func() error { return pub.publish(topic, 0, nil, 1) })

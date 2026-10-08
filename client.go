@@ -3,9 +3,11 @@
 package mqttv5
 
 import (
+	"context"
 	mathrand "math/rand/v2"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/internal/trie"
@@ -53,7 +55,6 @@ type Client struct {
 	startMu sync.Mutex
 	started bool
 	life    atomic.Pointer[lifecycle]
-	supWg   sync.WaitGroup
 
 	// cur is the current live connection. Producers (Publish, Subscribe,
 	// etc.) load it atomically; nil means "not connected right now".
@@ -165,10 +166,13 @@ type lifecycle struct {
 	// before shutdown is closed.
 	err error
 	// mu orders a connection's activation, and the supervisor's start,
-	// against a store failure's teardown of the span: stopping is set
-	// under it, and both happen under it only while stopping is unset.
+	// against the span's teardown: stopping is set under it, and both
+	// happen under it only while stopping is unset.
 	mu       sync.Mutex
 	stopping bool
+	// supervisor counts the span's supervisor, which its teardown waits
+	// for.
+	supervisor sync.WaitGroup
 }
 
 func newLifecycle() *lifecycle {
@@ -176,6 +180,27 @@ func newLifecycle() *lifecycle {
 }
 
 func (l *lifecycle) end() { l.endWith(nil) }
+
+// isStopping reports whether the span's teardown has started.
+func (l *lifecycle) isStopping() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stopping
+}
+
+// attemptContext bounds a reconnect attempt: it ends after d, or when
+// the span ends.
+func (l *lifecycle) attemptContext(d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	go func() {
+		select {
+		case <-l.shutdown:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
 
 // endWith ends the span, recording err as the reason when it is the
 // first to.

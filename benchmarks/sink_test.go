@@ -5,6 +5,8 @@
 package benchmarks
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -51,24 +53,80 @@ func TestSinkChecksEveryDelivery(t *testing.T) {
 	}
 }
 
-// The check counts what a consumer still delivers before the subscriber
-// stops: a duplicate in a consumer's hands when the last expected message
-// arrived fails the run.
-func TestSinkCheckWaitsForTheSubscriberToStop(t *testing.T) {
+func fakeSubscription(stop func(ctx context.Context) error) *subscription {
+	s := newSubscription()
+	s.subscriber = subscriber{dropped: noDrops, stop: stop}
+	return s
+}
+
+// A delivery in progress when the library's stop returns, as paho3's
+// does after its quiesce period, is part of the run: the check waits for
+// it, so a duplicate in a consumer's hands fails the run.
+func TestCheckWaitsForADeliveryInProgress(t *testing.T) {
 	s := newSink(64, 1)
-	s.onMsg(stamped(0))
-	delivered := make(chan struct{})
+	sub := fakeSubscription(func(context.Context) error { return nil })
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	deliver := sub.through(func(p []byte) {
+		if s.got.Load() == 1 {
+			close(entered)
+			<-release
+		}
+		s.onMsg(p)
+	})
+	deliver(stamped(0))
+	go deliver(stamped(0))
+	<-entered
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		s.onMsg(stamped(0))
-		close(delivered)
+		close(release)
 	}()
-	sub := &subscription{dropped: func() int64 { return 0 }, stop: func() { <-delivered }}
-	if err := s.finish(sub, time.Second); err == nil {
-		t.Fatal("a duplicate delivered before the subscriber stopped passed the check")
+	if err := s.finish(sub, 5*time.Second); err == nil {
+		t.Fatal("a duplicate delivered while the subscriber stopped passed the check")
 	}
-	stuck := &subscription{dropped: func() int64 { return 0 }, stop: func() { select {} }}
+}
+
+// Nothing reaches onMsg once Stop has returned, and a message the library
+// delivers after its stop returned fails the check.
+func TestDeliveryAfterStopFailsTheCheck(t *testing.T) {
+	s := newSink(64, 1)
+	sub := fakeSubscription(func(context.Context) error { return nil })
+	deliver := sub.through(s.onMsg)
+	deliver(stamped(0))
+	if err := sub.Stop(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	deliver(stamped(0))
+	deliver(nil) // a trailing probe is not a delivery
+	if s.dup.Load() != 0 {
+		t.Fatal("a delivery after Stop reached onMsg")
+	}
+	if err := s.finish(sub, time.Second); err == nil {
+		t.Fatal("a delivery after the library stopped passed the check")
+	}
+}
+
+// A subscriber that does not stop within the bound fails the check, a
+// failed library stop fails it too, and the benchmark's cleanup, which
+// stops the subscription again, does not wait a second bound.
+func TestStopIsBounded(t *testing.T) {
+	stuck := fakeSubscription(func(context.Context) error { select {} })
 	if err := newSink(64, 0).finish(stuck, 10*time.Millisecond); err == nil {
 		t.Fatal("a subscriber that never stops passed the check")
+	}
+	again := make(chan error, 1)
+	go func() { again <- stuck.Stop(stopBound) }()
+	select {
+	case err := <-again:
+		if err == nil {
+			t.Fatal("a second Stop of a stuck subscriber succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a second Stop waited again for a subscriber that already timed out")
+	}
+
+	failing := fakeSubscription(func(context.Context) error { return errors.New("disconnect failed") })
+	if err := newSink(64, 0).finish(failing, time.Second); err == nil {
+		t.Fatal("a failed library stop passed the check")
 	}
 }

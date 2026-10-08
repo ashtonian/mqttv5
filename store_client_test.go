@@ -497,7 +497,7 @@ func TestStoreFailureWhilePoolConnects(t *testing.T) {
 	// No supervisor of the ended span may be left running.
 	done := make(chan struct{})
 	go func() {
-		cli.supWg.Wait()
+		cli.life.Load().supervisor.Wait()
 		close(done)
 	}()
 	select {

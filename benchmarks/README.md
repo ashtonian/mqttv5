@@ -73,17 +73,25 @@ The rules that make the comparison fair:
    counts each sequence number once and fails the run on a duplicate, a
    wrong size, a payload whose two stamps disagree (pieces of two
    messages), a sequence number never sent, or one missing at the end.
+   The check runs once the subscriber has stopped: the library's own
+   stop, then a gate in front of the sink that waits for the deliveries
+   in progress and refuses later ones, so a duplicate still in a
+   consumer's hands is counted; a delivery after the library's stop
+   returned, or a stop that takes over 10 s, fails the run.
    A run with drops measures nothing, and the broker is configured never
    to drop queued messages ([`broker/mosquitto.conf`](broker/mosquitto.conf)).
 5. **Recorded, not typed.** [`scripts/run.sh`](scripts/run.sh) records
    the commit (with a hash of any uncommitted changes, which it records
    only when asked), toolchain, host, CPU, GOMAXPROCS, broker image and
    the load average before, during (per run, in a side file) and after,
-   and repeats the whole sweep `RUNS` times so a load spike lands on
-   every library in turn. With `LOAD_MAX` set each run starts only on a
-   quiet host, and a recording whose host never quietens is marked
-   invalid rather than kept; load that rises during a run is not
-   controlled, only recorded at the start of the next. `benchtab` renders each table from a recording: the
+   and repeats the whole sweep `RUNS` times, so each library is measured
+   at several points of the recording rather than in one stretch: a
+   change in load is spread across libraries, not cancelled, and the
+   load record shows when it happened. With `LOAD_MAX` set each run
+   starts only on a quiet host, and a recording whose host never
+   quietens is marked invalid rather than kept; load that rises during
+   a run is not controlled, only recorded at the start of the next.
+   `benchtab` renders each table from a recording: the
    median of the runs with a 95% confidence interval, and, where
    libraries are compared, the change with its Mann-Whitney U p-value.
    The recordings themselves stay out of the repository; each table
@@ -104,7 +112,7 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
 | `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule interval; read the `p50-ns` … `max-ns` metrics |
 | `BenchmarkE2E_Reconnect` | 20 QoS 1 publishes vanish in a proxy, the connection is cut; time until a subscriber has all 20 after the client reconnects with its session and resends them | one cut-and-recover cycle |
-| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the largest growth of the process's heap, sampled every millisecond, `delivered-%` how much reached the consumer | not meaningful |
+| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the largest growth of the process's heap objects over the burst's start, sampled every millisecond, `delivered-%` how much reached the consumer | not meaningful |
 | `BenchmarkDecodePublish`, `BenchmarkDecodePublishRead`, `BenchmarkEncodePublish` | the codecs alone, no network (`props=none` or a content type and five user properties) | one packet |
 | `BenchmarkReceive`, `BenchmarkReceiveWindow`, `BenchmarkReceiveFilters` (core package) | mqttv5's inbound path against an in-process feed: decode, route, deliver, ack | one delivered message |
 
@@ -466,10 +474,15 @@ What each library does with the backlog:
   `Stats().InboundDropped` (`SubOnDrop` sees each one). A full queue
   holds about as much memory as autopaho's channel.
 
-`peak-heap-B` is the whole process's heap, sampled every millisecond: it
-counts objects the garbage collector has not freed yet as well as live
-ones, and whatever else the process allocates, so it is an upper bound
-on the backlog's memory rather than a measure of it.
+`peak-heap-B` is the largest increase, over its value when the burst
+started, of the process's heap-object bytes
+(`/memory/classes/heap/objects:bytes`), sampled every millisecond. It
+counts live objects and those the garbage collector has not freed yet,
+from anywhere in the process. It is neither the backlog's size nor a
+bound on it: a collection that frees older objects during the burst
+offsets the backlog's growth, and a peak between two samples is
+missed. Read it as the scale of what a backlog costs, not as an exact
+figure.
 
 ### Codec
 
@@ -715,11 +728,14 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 ## API: adding a library or scenario
 
 A library is a `lib` value in [`e2e_libs_test.go`](e2e_libs_test.go):
-`connect` returns a `publisher`, `subscribe` delivers payloads to a
-callback through a delivery `mode`. Add it to `libs` and every scenario
-runs it. A scenario is a benchmark in an `e2e_*_test.go` file that
-loops over `libs`; name sub-benchmarks with `key=value` pairs and fail
-the run on any lost message (`sink.check`).
+`connect` returns a `publisher`; `subscribe` delivers payloads to a
+callback through a delivery `mode` and returns a `subscriber`, whose
+`stop` disconnects it and reports an error when the library fails to
+stop. Add it to `libs` and every scenario runs it. A scenario is a
+benchmark in an `e2e_*_test.go` file that loops over `libs` and
+subscribes through the package's `subscribe`, which puts the gate in
+front of the callback; name sub-benchmarks with `key=value` pairs and
+fail the run on any lost message (`sink.check`).
 
 `benchtab` tables are declared in Markdown:
 
@@ -739,7 +755,8 @@ the run on any lost message (`sink.check`).
 | `received X of Y` / timeouts | broker logs (`docker logs mqttv5-bench-mosquitto`), `max_queued_messages` | The broker dropped or stalled; a run with losses is not valid. |
 | `raw publisher stalled` | the broker stopped acknowledging QoS 1 | Restart the broker; check its memory if a previous run left a backlog. |
 | Wide confidence intervals | `load-before` / `load-after` in the raw file | Re-run on a quieter host; do not publish. |
-| CI `benchtab -check` fails | a table was edited by hand or a raw file changed | Run `go run ./cmd/benchtab README.md ../README.md` and commit the result. |
+| `benchtab -check` fails (run where the recordings are) | a table was edited by hand, or its recording changed | Run `go run ./cmd/benchtab README.md ../README.md` and commit the result. |
+| `benchtab: … results/…: no such file or directory` | the recordings stay out of the repository | Render on the machine that recorded them, or record again with `scripts/run.sh`. |
 
 ## Security
 
@@ -752,7 +769,7 @@ when the run is done. The suite sends synthetic payloads only.
 | Path | What |
 |---|---|
 | `e2e_helpers_test.go` | broker address, sizes, CPU meter |
-| `e2e_libs_test.go` | per-library adapters, `sink`, subscription probe |
+| `e2e_libs_test.go` | per-library adapters, the gated `subscription`, `sink`, subscription probe |
 | `e2e_raw_test.go` | `rawClient`, the library-neutral publisher and subscriber |
 | `e2e_stream_test.go` | `rawServer`, the library-neutral source for `ReceiveStream`, and that scenario |
 | `e2e_publish_test.go`, `e2e_receive_test.go`, `e2e_roundtrip_test.go`, `e2e_reconnect_test.go`, `e2e_slowconsumer_test.go` | scenarios |

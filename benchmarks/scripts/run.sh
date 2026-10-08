@@ -29,8 +29,10 @@
 #
 # RUNS (default 10) repeats the whole sweep that many times with
 # -count 1, instead of -count N running each benchmark N times in a row:
-# a load spike on a shared host then lands on every library in turn
-# rather than on whichever was running. Do not pass -count.
+# each library is then measured at several points of the recording, so
+# a change in load is spread across libraries rather than falling on
+# whichever was running. It is not cancelled; the .load file shows it.
+# Do not pass -count.
 #
 # Examples:
 #   scripts/run.sh codec . -run '^$' -bench '^Benchmark(Decode|Encode)Publish' -benchmem

@@ -137,7 +137,8 @@ Three real patterns, each its own API:
 - Publish-only pool against one broker — `WithPublisherPool`
 
 Compose them: `WithBrokers` inside a `GroupMember` for HA-per-region,
-then `WithPublisherPool` on top for throughput.
+then `WithPublisherPool` on top to publish over more than one
+connection.
 
 **Writes inline when idle, batched when busy.**
 On a TCP connection, a publish that waits for its write (QoS 1/2, or
@@ -658,7 +659,7 @@ them otherwise.
 | Option | Default | Effect |
 |---|---|---|
 | `WithWriteQueueSize(n)` | 256 | Internal MPSC write buffer. |
-| `WithWriteBatch(n)` | 0 (off) | Coalesce up to n pre-encoded packets per writev syscall. Wins under sustained concurrent publishers; measure before enabling. |
+| `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per writev syscall. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
 | `WithWriteOverflowPolicy(p)` | `WriteBlock` | QoS 0 only. See note below. |
 | `WithPublishMode(mode)` | `PublishFireAndForget` | `PublishWaitForFlush` makes QoS 0 wait until the packet is written; on an idle TCP or Unix connection the caller writes it itself, without copying the payload. ctx bounds the wait; a write it interrupts is finished by the writer goroutine. |
 | `WithPublisherPool(N)` | 0 (off) | N dedicated publish-only conns. |
@@ -693,7 +694,10 @@ them otherwise.
 
 #### Lifecycle callbacks
 
-All callbacks must not block.
+All callbacks must not block. `Disconnect` waits for the goroutines
+that run them (all but `OnStoreFailure`, which fires after the client
+has stopped) and `SubscribeCallback` handlers, so calling it from one
+deadlocks: run it on another goroutine (`go cli.Disconnect(ctx)`).
 
 | Option | Signature / when | Effect |
 |---|---|---|

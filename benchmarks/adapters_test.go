@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"runtime/pprof"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -38,7 +39,7 @@ func TestAdapterConsumersEndWithTheBenchmark(t *testing.T) {
 					res := testing.Benchmark(func(b *testing.B) {
 						srv := newRawServer(b, l.v5)
 						s := newSink(64, 1)
-						l.subscribe(b, clientConfig{id: uniqueID("adapter"), addr: srv.addr(), receiveMaximum: receiveWindow},
+						subscribe(b, l, clientConfig{id: uniqueID("adapter"), addr: srv.addr(), receiveMaximum: receiveWindow},
 							"adapter/t", qos, m, 4, s.onMsg)
 						srv.awaitSubscribed(b)
 						if err := srv.publish("adapter/t", qos, Payload(64), 1); err != nil {
@@ -59,5 +60,52 @@ func TestAdapterConsumersEndWithTheBenchmark(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// Stopping a real adapter's subscription while its callback still holds
+// a duplicate waits for that delivery, so the check counts it.
+func TestAdapterStopWaitsForADeliveryInProgress(t *testing.T) {
+	for _, l := range append(libs, floorLib) {
+		t.Run("lib="+l.name, func(t *testing.T) {
+			var checked error
+			res := testing.Benchmark(func(b *testing.B) {
+				srv := newRawServer(b, l.v5)
+				s := newSink(64, 1)
+				entered, release := make(chan struct{}), make(chan struct{})
+				var calls atomic.Int64
+				sub := subscribe(b, l, clientConfig{id: uniqueID("adapter-stop"), addr: srv.addr(), receiveMaximum: receiveWindow},
+					"adapter/t", 0, modeCallback, 1, func(p []byte) {
+						if calls.Add(1) == 2 {
+							close(entered)
+							<-release
+						}
+						s.onMsg(p)
+					})
+				srv.awaitSubscribed(b)
+				for range 2 {
+					if err := srv.publish("adapter/t", 0, Payload(64), 1); err != nil {
+						b.Fatal(err)
+					}
+				}
+				await(b, entered, 5*time.Second, s.String)
+				// Held past paho3's 250 ms quiesce, after which its
+				// Disconnect returns whatever its router is doing.
+				go func() {
+					time.Sleep(time.Second)
+					close(release)
+				}()
+				checked = s.finish(sub, stopBound)
+			})
+			if res.N == 0 {
+				t.Fatal("the benchmark failed")
+			}
+			if checked == nil {
+				t.Fatal("the check passed with a duplicate still being delivered")
+			}
+			if !strings.Contains(checked.Error(), "1 duplicates") {
+				t.Fatalf("the check failed for another reason: %v", checked)
+			}
+		})
 	}
 }

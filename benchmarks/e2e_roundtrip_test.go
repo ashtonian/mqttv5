@@ -29,7 +29,7 @@ func BenchmarkE2E_RoundTrip(b *testing.B) {
 					arrived := make(chan int, 1)
 					ready := make(chan struct{})
 					var once sync.Once
-					l.subscribe(b, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
+					subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
 						if len(p) == 0 {
 							once.Do(func() { close(ready) })
 							return
@@ -99,7 +99,7 @@ func runLatency(b *testing.B, l lib, qos byte, rate, size int) {
 	done := make(chan struct{})
 	ready := make(chan struct{})
 	var once sync.Once
-	l.subscribe(b, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
+	subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
 		if len(p) == 0 {
 			once.Do(func() { close(ready) })
 			return

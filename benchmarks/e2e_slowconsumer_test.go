@@ -40,7 +40,7 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	var delivered atomic.Int64
 	ready := make(chan struct{})
 	var once sync.Once
-	sub := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-slow")}, topic, 0, m, 1, func(p []byte) {
+	sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-slow")}, topic, 0, m, 1, func(p []byte) {
 		if len(p) == 0 {
 			once.Do(func() { close(ready) })
 			return
