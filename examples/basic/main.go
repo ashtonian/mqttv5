@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 func main() {
@@ -64,7 +63,7 @@ func main() {
 	for i := 0; ; i++ {
 		select {
 		case <-t.C:
-			err := cli.Publish(ctx, wire.PublishOpts{
+			err := cli.Publish(ctx, mqttv5.PublishOptions{
 				Topic:   fmt.Sprintf("demo/counter/%d", i%3),
 				Payload: fmt.Appendf(nil, "tick %d", i),
 				QoS:     1,

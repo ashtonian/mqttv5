@@ -1,6 +1,8 @@
-// Package benchmarks holds head-to-head benchmarks comparing
-// github.com/ashtonian/mqttv5 (the rewrite) against
-// github.com/eclipse/paho.golang/packets (the baseline).
+// Package benchmarks compares github.com/ashtonian/mqttv5 with the
+// Eclipse Paho Go clients: codec benchmarks against
+// github.com/eclipse/paho.golang/packets, and end-to-end benchmarks
+// (build tag e2e) against autopaho and paho.mqtt.golang through a live
+// broker. See README.md.
 //
 // Fixtures are pre-built wire-format byte slices for representative
 // packet shapes. Generating them lives outside the benchmark loop so the
@@ -11,6 +13,8 @@ import (
 	"bytes"
 
 	"github.com/eclipse/paho.golang/packets"
+
+	"github.com/ashtonian/mqttv5/wire"
 )
 
 // PayloadSize is a parameterised payload size for size-sweep benchmarks.
@@ -60,14 +64,9 @@ func EclipsePublishBytesWithProps(topic string, payload []byte) []byte {
 	pub.PacketID = 1
 	pub.Topic = topic
 	pub.Payload = payload
-	contentType := "application/json"
 	pub.Properties.ContentType = contentType
-	pub.Properties.User = []packets.User{
-		{Key: "device_id", Value: "sensor-0001"},
-		{Key: "site", Value: "us-west-2"},
-		{Key: "schema", Value: "v3"},
-		{Key: "tenant", Value: "acme"},
-		{Key: "trace_id", Value: "01HXZ7QY9V5N3RW4G6FJ8KE2BD"},
+	for _, u := range userProperties {
+		pub.Properties.User = append(pub.Properties.User, packets.User{Key: u.Key, Value: u.Value})
 	}
 
 	var buf bytes.Buffer
@@ -90,3 +89,15 @@ func Payload(size int) []byte {
 
 // Topic is the canonical benchmark topic — depth 4, no wildcards.
 const Topic = "bench/devices/sensor-0001/telemetry"
+
+// contentType and userProperties are the properties of the props=five
+// codec cases.
+const contentType = "application/json"
+
+var userProperties = []wire.UserProperty{
+	{Key: "device_id", Value: "sensor-0001"},
+	{Key: "site", Value: "us-west-2"},
+	{Key: "schema", Value: "v3"},
+	{Key: "tenant", Value: "acme"},
+	{Key: "trace_id", Value: "01HXZ7QY9V5N3RW4G6FJ8KE2BD"},
+}

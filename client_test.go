@@ -116,7 +116,7 @@ func TestPublishQoS0(t *testing.T) {
 	}
 	defer cli.Disconnect(context.Background())
 
-	if err := cli.Publish(context.Background(), wire.PublishOpts{
+	if err := cli.Publish(context.Background(), PublishOptions{
 		Topic:   "sensor/temp",
 		Payload: []byte("42.7"),
 		QoS:     0,
@@ -162,7 +162,7 @@ func TestPublishQoS1(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := cli.Publish(ctx, wire.PublishOpts{
+	if err := cli.Publish(ctx, PublishOptions{
 		Topic:   "events",
 		Payload: []byte("hi"),
 		QoS:     1,
@@ -212,7 +212,7 @@ func TestPublishQoS2(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := cli.Publish(ctx, wire.PublishOpts{
+	if err := cli.Publish(ctx, PublishOptions{
 		Topic:   "events/important",
 		Payload: []byte("once-and-only-once"),
 		QoS:     2,
@@ -353,7 +353,7 @@ func TestUnsubscribe(t *testing.T) {
 
 func TestPublishWithoutConnect(t *testing.T) {
 	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
-	err := cli.Publish(context.Background(), wire.PublishOpts{Topic: "x", QoS: 0})
+	err := cli.Publish(context.Background(), PublishOptions{Topic: "x", QoS: 0})
 	if !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("got %v, want ErrNotConnected", err)
 	}
@@ -487,15 +487,15 @@ func TestOnServerDisconnect(t *testing.T) {
 	})
 
 	var (
-		got      atomic.Pointer[wire.Disconnect]
+		got      atomic.Pointer[DisconnectInfo]
 		fired    atomic.Int32
 		callDone = make(chan struct{}, 1)
 	)
 	cli, err := New(
 		WithBroker(fb.URL()),
 		WithClientID("server-disco-test"),
-		WithOnServerDisconnect(func(d *wire.Disconnect) {
-			got.Store(d)
+		WithOnServerDisconnect(func(d DisconnectInfo) {
+			got.Store(&d)
 			fired.Add(1)
 			select {
 			case callDone <- struct{}{}:
@@ -529,9 +529,8 @@ func TestOnServerDisconnect(t *testing.T) {
 	if d.ReasonCode != wire.ReasonServerMoved {
 		t.Fatalf("ReasonCode = 0x%02X, want ReasonServerMoved", byte(d.ReasonCode))
 	}
-	ref, ok := d.Properties.String(wire.PropServerReference)
-	if !ok || ref != "mqtt://elsewhere.example:1883" {
-		t.Fatalf("ServerReference = %q (ok=%v), want elsewhere", ref, ok)
+	if d.ServerReference != "mqtt://elsewhere.example:1883" {
+		t.Fatalf("ServerReference = %q, want elsewhere", d.ServerReference)
 	}
 	if fired.Load() != 1 {
 		t.Fatalf("callback fired %d times, want 1", fired.Load())

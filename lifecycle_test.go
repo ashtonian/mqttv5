@@ -31,11 +31,11 @@ func TestOnConnectionUpReceivesConnack(t *testing.T) {
 		<-fb.Done()
 	})
 
-	received := make(chan *wire.Connack, 1)
+	received := make(chan ConnackInfo, 1)
 	cli, err := New(
 		WithBroker(fb.URL()),
-		WithOnConnectionUp(func(ack *wire.Connack) {
-			received <- ack
+		WithOnConnectionUp(func(info ConnackInfo) {
+			received <- info
 		}),
 	)
 	if err != nil {
@@ -47,17 +47,18 @@ func TestOnConnectionUpReceivesConnack(t *testing.T) {
 	defer cli.Disconnect(context.Background())
 
 	select {
-	case ack := <-received:
-		if ack == nil {
-			t.Fatal("OnConnectionUp received nil Connack")
+	case info := <-received:
+		if info.AssignedClientID != "broker-assigned-id" {
+			t.Errorf("AssignedClientID = %q, want broker-assigned-id", info.AssignedClientID)
 		}
-		assigned, _ := ack.Properties.String(wire.PropAssignedClientID)
-		if assigned != "broker-assigned-id" {
-			t.Errorf("AssignedClientIdentifier = %q, want broker-assigned-id", assigned)
+		if info.MaximumQoS != 1 {
+			t.Errorf("MaximumQoS = %d, want 1", info.MaximumQoS)
 		}
-		qos, ok := ack.Properties.Byte(wire.PropMaximumQoS)
-		if !ok || qos != 1 {
-			t.Errorf("MaximumQoS = (%d, %v), want (1, true)", qos, ok)
+		if info.ReceiveMaximum != 65535 || !info.RetainAvailable || !info.SharedSubscriptionAvailable {
+			t.Errorf("defaults not applied: %+v", info)
+		}
+		if got, ok := cli.ServerInfo(); !ok || got.AssignedClientID != info.AssignedClientID {
+			t.Errorf("ServerInfo() = %+v, %v", got, ok)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnConnectionUp not fired within 2s")
@@ -331,7 +332,7 @@ func TestClientGroupCallbacksFirePerMember(t *testing.T) {
 	group, err := NewClientGroup(members,
 		WithGroupSharedOpts(
 			WithClientID("group-callback-test"),
-			WithOnConnectionUp(func(_ *wire.Connack) { upCount.Add(1) }),
+			WithOnConnectionUp(func(ConnackInfo) { upCount.Add(1) }),
 		),
 	)
 	if err != nil {
@@ -391,12 +392,10 @@ func TestSetBrokersAfterServerMoved(t *testing.T) {
 		WithBroker(origin.URL()),
 		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
 		WithConnectTimeout(200*time.Millisecond),
-		WithOnServerDisconnect(func(d *wire.Disconnect) {
-			ref, ok := d.Properties.String(wire.PropServerReference)
-			if !ok {
-				return
+		WithOnServerDisconnect(func(d DisconnectInfo) {
+			if d.ServerReference != "" {
+				_ = cli.SetBrokers(d.ServerReference)
 			}
-			_ = cli.SetBrokers(ref)
 		}),
 		WithOnConnectionDown(func() bool { return true }),
 	)

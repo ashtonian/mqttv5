@@ -51,6 +51,9 @@ type UnsubscribeOpts struct {
 
 // WriteUnsubscribe emits an UNSUBSCRIBE packet (flags = 0x02).
 func WriteUnsubscribe(w io.Writer, opts UnsubscribeOpts) (int64, error) {
+	if err := validateUnsubscribeOpts(&opts); err != nil {
+		return 0, err
+	}
 	if len(opts.Topics) == 0 {
 		return 0, ErrEmptyFilterList
 	}

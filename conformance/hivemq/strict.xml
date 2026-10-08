@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!--
+  HiveMQ CE with tight limits for the limit-enforcement tests
+  (strict_test.go): every value here is announced in CONNACK, and the
+  client must honour it before anything reaches the wire.
+-->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+    </listeners>
+    <mqtt>
+        <quality-of-service>
+            <max-qos>1</max-qos>
+        </quality-of-service>
+        <packets>
+            <max-packet-size>2048</max-packet-size>
+        </packets>
+        <keep-alive>
+            <max-keep-alive>4</max-keep-alive>
+            <allow-unlimited>false</allow-unlimited>
+        </keep-alive>
+        <receive-maximum>
+            <server-receive-maximum>4</server-receive-maximum>
+        </receive-maximum>
+        <topic-alias>
+            <enabled>true</enabled>
+            <max-per-client>2</max-per-client>
+        </topic-alias>
+        <retained-messages>
+            <enabled>false</enabled>
+        </retained-messages>
+        <wildcard-subscriptions>
+            <enabled>false</enabled>
+        </wildcard-subscriptions>
+        <shared-subscriptions>
+            <enabled>false</enabled>
+        </shared-subscriptions>
+        <subscription-identifier>
+            <enabled>false</enabled>
+        </subscription-identifier>
+    </mqtt>
+    <anonymous-usage-statistics>
+        <enabled>false</enabled>
+    </anonymous-usage-statistics>
+</hivemq>

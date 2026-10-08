@@ -14,7 +14,6 @@ import (
 
 	"github.com/ashtonian/mqttv5"
 	"github.com/ashtonian/mqttv5/transport"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 // connWatcher captures the most recent transport.Conn handed back by a
@@ -64,7 +63,9 @@ func (w *connWatcher) closeConn() bool {
 // caller decides whether to drop it (ungraceful) or Disconnect it
 // (graceful). Both paths are accounted for so the broker session is
 // always torn down.
-func newWillClient(t *testing.T, will *wire.WillOpts) (*mqttv5.Client, *connWatcher) {
+// newWillClient connects a client carrying will whose session lasts
+// sessionExpiry seconds after its connection ends.
+func newWillClient(t *testing.T, will *mqttv5.WillOptions, sessionExpiry uint32) (*mqttv5.Client, *connWatcher) {
 	t.Helper()
 	requireBroker(t, brokerURL())
 
@@ -74,9 +75,7 @@ func newWillClient(t *testing.T, will *wire.WillOpts) (*mqttv5.Client, *connWatc
 		mqttv5.WithClientID(t.Name()+"-will-"+randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5*time.Second),
-		// Session ends with the connection; nothing for the broker to
-		// retain or resume that could re-arm the will.
-		mqttv5.WithSessionExpiry(0),
+		mqttv5.WithSessionExpiry(sessionExpiry),
 		// Stop the supervisor on connection loss so the ungraceful
 		// close is terminal — no reconnect, no re-armed will.
 		mqttv5.WithOnConnectionDown(func() bool { return false }),
@@ -111,12 +110,12 @@ func TestWill_DeliveredOnUngracefulDisconnect(t *testing.T) {
 	wantPayload := []byte("client-A-died")
 	wantContentType := "application/octet-stream"
 	wantCorrelation := []byte{0xDE, 0xAD, 0xBE, 0xEF}
-	wantUserProps := []wire.UserProperty{
+	wantUserProps := []mqttv5.UserProperty{
 		{Key: "reason", Value: "lwt"},
 		{Key: "node", Value: "alpha"},
 	}
 
-	will := &wire.WillOpts{
+	will := &mqttv5.WillOptions{
 		Topic:           willTopic,
 		Payload:         wantPayload,
 		QoS:             1,
@@ -137,7 +136,7 @@ func TestWill_DeliveredOnUngracefulDisconnect(t *testing.T) {
 
 	// Build A with the will, then drop its socket directly — no
 	// Disconnect, which would clear the will.
-	_, w := newWillClient(t, will)
+	_, w := newWillClient(t, will, 0)
 	if !w.closeConn() {
 		t.Fatal("no captured connection to close")
 	}
@@ -151,11 +150,11 @@ func TestWill_DeliveredOnUngracefulDisconnect(t *testing.T) {
 	if m.QoS != 1 {
 		t.Errorf("will QoS = %d, want 1", m.QoS)
 	}
-	if ct, ok := m.Properties.String(wire.PropContentType); !ok || ct != wantContentType {
-		t.Errorf("will ContentType = %q (ok=%v), want %q", ct, ok, wantContentType)
+	if ct := m.Properties.ContentType(); ct != wantContentType {
+		t.Errorf("will ContentType = %q, want %q", ct, wantContentType)
 	}
-	if cd, ok := m.Properties.Binary(wire.PropCorrelationData); !ok || !bytes.Equal(cd, wantCorrelation) {
-		t.Errorf("will CorrelationData = %x (ok=%v), want %x", cd, ok, wantCorrelation)
+	if cd := m.Properties.CorrelationData(); !bytes.Equal(cd, wantCorrelation) {
+		t.Errorf("will CorrelationData = %x, want %x", cd, wantCorrelation)
 	}
 	gotProps := map[string]string{}
 	for k, v := range m.Properties.UserProperties() {
@@ -176,7 +175,7 @@ func TestWill_SuppressedOnGracefulDisconnect(t *testing.T) {
 	requireBroker(t, brokerURL())
 
 	willTopic := "conformance/will/graceful/" + randSuffix()
-	will := &wire.WillOpts{
+	will := &mqttv5.WillOptions{
 		Topic:   willTopic,
 		Payload: []byte("should-not-be-published"),
 		QoS:     1,
@@ -190,7 +189,7 @@ func TestWill_SuppressedOnGracefulDisconnect(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	cli, _ := newWillClient(t, will)
+	cli, _ := newWillClient(t, will, 0)
 
 	// Graceful DISCONNECT (§3.14.4): the Will Message is discarded.
 	dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -205,36 +204,27 @@ func TestWill_SuppressedOnGracefulDisconnect(t *testing.T) {
 
 // TestWill_DelayInterval verifies WillDelayInterval defers publication:
 // after an ungraceful drop the will must not arrive before the delay
-// elapses, but must arrive once it does. Will-delay timing is
-// broker-dependent (a broker may publish at session-expiry instead, or
-// not honor the delay at all), so a broker that delivers early — before
-// the delay — is treated as "delay not honored" and skipped rather than
-// failed, keeping the test a signal instead of a flake.
-//
-// The central assertion measures the time from the ungraceful drop to
-// delivery and requires it to be at least the full delay minus a small
-// slack (not half the delay): a broker that ignores the delay and
-// delivers well inside the window — e.g. ~1.2s against a 3s delay — must
-// fail, while a broker that honors it (delivers ~3s) passes. The 3s
-// delay gives loopback-timer jitter room above the slack.
+// elapses, but must arrive once it does. The will client's session
+// outlives the delay, since a session that ends publishes the will at
+// once. Delivery must come no earlier than the full delay minus a small
+// slack for timer and loopback jitter.
 func TestWill_DelayInterval(t *testing.T) {
 	requireBroker(t, brokerURL())
 
 	const delaySecs = 3
 	delay := uint32(delaySecs)
-	// Required lower bound on observed delivery latency: the full delay
-	// minus a small slack for timer/loopback jitter. A correct broker
-	// (delivers ~delaySecs) clears this; one that delivers early does not.
-	const slack = 500 * time.Millisecond
-	minDelay := time.Duration(delaySecs)*time.Second - slack
+	// Brokers count the delay in whole seconds (mosquitto fires up to a
+	// second early), so the floor is one second under the delay: still
+	// far from the immediate publish of a broker that ignores it.
+	minDelay := time.Duration(delaySecs-1) * time.Second
 
 	willTopic := "conformance/will/delay/" + randSuffix()
 	wantPayload := []byte("delayed-will")
-	will := &wire.WillOpts{
-		Topic:             willTopic,
-		Payload:           wantPayload,
-		QoS:               1,
-		WillDelayInterval: &delay,
+	will := &mqttv5.WillOptions{
+		Topic:         willTopic,
+		Payload:       wantPayload,
+		QoS:           1,
+		DelayInterval: &delay,
 	}
 
 	sub := connect(t)
@@ -245,24 +235,23 @@ func TestWill_DelayInterval(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	_, w := newWillClient(t, will)
+	// The broker publishes the will when the delay passes or the
+	// session ends, whichever comes first (§3.1.3.2.2): the session
+	// must outlive the delay for the delay to show.
+	_, w := newWillClient(t, will, 60)
 	dropAt := time.Now()
 	if !w.closeConn() {
 		t.Fatal("no captured connection to close")
 	}
 
-	// First window: wait half the delay. Nothing should arrive this
-	// early; anything that does is below minDelay and means the broker
-	// ignored WillDelayInterval, so skip (don't fail) — timing is
-	// broker-dependent and this keeps the test a signal, not a flake.
+	// First window: half the delay, in which nothing may arrive.
 	firstWindow := time.Duration(delaySecs) * time.Second / 2
 	select {
 	case m := <-ch:
 		elapsed := time.Since(dropAt)
 		_ = m.Ack()
 		if elapsed < minDelay {
-			t.Skipf("broker delivered will after %v, before the %ds delay (min ~%v) — "+
-				"WillDelayInterval not honored, skipping", elapsed, delaySecs, minDelay)
+			t.Fatalf("will delivered %v after the drop, before the %ds delay", elapsed, delaySecs)
 		}
 		// Arrived at or after the full delay despite the short first
 		// window (clock jitter at the boundary): validate and finish.
@@ -279,13 +268,9 @@ func TestWill_DelayInterval(t *testing.T) {
 	m := expectMessage(t, ch, 6*time.Second)
 	defer m.Ack()
 
-	// Validate the delay was actually honored: delivery latency must be
-	// at least the full delay minus slack. With delaySecs=3 a correct
-	// broker (~3s) clears minDelay (~2.5s); a broker that ignores the
-	// delay and delivers at ~1.2s fails here.
 	elapsed := time.Since(dropAt)
 	if elapsed < minDelay {
-		t.Errorf("will arrived after %v, expected >= ~%v (delay %ds minus slack)",
+		t.Errorf("will arrived after %v, expected >= %v (delay %ds, counted in whole seconds)",
 			elapsed, minDelay, delaySecs)
 	}
 	if !bytes.Equal(m.Payload, wantPayload) {

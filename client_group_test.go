@@ -138,7 +138,7 @@ func TestClientGroupPerMemberAuth(t *testing.T) {
 	defer g.Disconnect(context.Background())
 
 	waitForGroupConnected(t, g, 2*time.Second)
-	if err := g.Publish(context.Background(), wire.PublishOpts{
+	if _, err := g.Publish(context.Background(), PublishOptions{
 		Topic: "t", Payload: []byte("p"), QoS: 1,
 	}); err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -194,7 +194,7 @@ func TestClientGroupPublishRoundRobin(t *testing.T) {
 	// 9 publishes to the same topic — every member must take at
 	// least one.
 	for range 9 {
-		if err := g.Publish(context.Background(), wire.PublishOpts{
+		if _, err := g.Publish(context.Background(), PublishOptions{
 			Topic: "rr", Payload: []byte("x"), QoS: 1,
 		}); err != nil {
 			t.Fatalf("Publish: %v", err)
@@ -249,12 +249,12 @@ func TestClientGroupPublishHashByTopic(t *testing.T) {
 	waitForGroupConnected(t, g, 2*time.Second)
 
 	for range 5 {
-		if err := g.Publish(context.Background(), wire.PublishOpts{
+		if _, err := g.Publish(context.Background(), PublishOptions{
 			Topic: "alpha", Payload: []byte("x"), QoS: 1,
 		}); err != nil {
 			t.Fatalf("Publish alpha: %v", err)
 		}
-		if err := g.Publish(context.Background(), wire.PublishOpts{
+		if _, err := g.Publish(context.Background(), PublishOptions{
 			Topic: "beta", Payload: []byte("x"), QoS: 1,
 		}); err != nil {
 			t.Fatalf("Publish beta: %v", err)

@@ -12,6 +12,14 @@
 #   - Refuses if any target tag already exists.
 #   - Warns when not on main / master.
 #   - Pre-flight: `go test -race ./...` on core and every opt-in submodule.
+#
+# The modules of this repository reach each other through replace
+# directives, which apply only inside it; a consumer's go command reads
+# the require lines instead. Before tagging, every requirement on a module
+# of this repository is pinned to the release version in a release commit,
+# so the tagged go.mod files resolve from the module proxy. After the
+# push, scripts/verify-release.sh installs the release from the proxy in
+# a module outside this repository and builds it.
 
 set -euo pipefail
 
@@ -48,16 +56,30 @@ EOF
     exit 1
 fi
 
-# Opt-in submodules that ship as importable packages. Internal-only
-# modules (benchmarks, conformance, examples) aren't tagged — nobody
-# imports them from outside this repo.
+# Opt-in submodules that ship as importable packages. internal/filedb
+# cannot be imported from outside this repository, but store/file and
+# queue/file depend on it, so it is tagged with them. The modules that
+# only run here (benchmarks, conformance, examples) aren't tagged.
 SUBMODULES=(
+    internal/filedb
     codec/json
     codec/msgpack
-    queue/file
     store/file
+    queue/file
     transport/ws
 )
+
+# Modules whose requirements on this repository are pinned at release.
+PINNED=("${SUBMODULES[@]}" examples conformance benchmarks)
+
+# siblings prints the modules of this repository that the go.mod at $1
+# requires.
+siblings() {
+    awk '/^require \(/ { block = 1; next }
+         block && /^\)/ { block = 0 }
+         /^require [^(]/ { print $2 }
+         block { print $1 }' "$1" | grep '^github.com/ashtonian/mqttv5' | sort -u
+}
 
 # Core tag first. The release workflow trigger only matches the
 # core-style tag pattern (vX.Y.Z), so pushing it last would still
@@ -101,21 +123,40 @@ if [[ "$BRANCH" != "main" && "$BRANCH" != "master" ]]; then
     echo "Warning: releasing from '$BRANCH' (not main/master)."
 fi
 
+echo
+echo "Requirements pinned to $VERSION:"
+for m in "${PINNED[@]}"; do
+    for dep in $(siblings "$m/go.mod"); do
+        printf '  %-20s %s\n' "$m" "$dep"
+    done
+done
+
 if [[ "$MODE" == "--dry" ]]; then
     echo
     echo "(dry run — no tests run, no tags created)"
     exit 0
 fi
 
+# --- pin ---
+
+PINNED_FILES=()
+for m in "${PINNED[@]}"; do
+    for dep in $(siblings "$m/go.mod"); do
+        (cd "$m" && go mod edit -require="$dep@$VERSION")
+    done
+    PINNED_FILES+=("$m/go.mod")
+done
+unpin() { git checkout -- "${PINNED_FILES[@]}"; }
+
 # --- pre-flight tests ---
 
 echo
 echo "Pre-flight: testing core..."
-go test -race -timeout 5m ./... >/dev/null
+go test -race -timeout 5m ./... >/dev/null || { unpin; exit 1; }
 
 for m in "${SUBMODULES[@]}"; do
     echo "Pre-flight: testing $m..."
-    (cd "$m" && go test -race -timeout 5m ./... >/dev/null)
+    (cd "$m" && go test -race -timeout 5m ./... >/dev/null) || { unpin; exit 1; }
 done
 
 echo "Pre-flight passed."
@@ -124,11 +165,16 @@ echo "Pre-flight passed."
 
 if [[ "$MODE" != "--yes" ]]; then
     echo
-    read -r -p "Create and push ${#TAGS[@]} tags? [y/N] " REPLY
+    read -r -p "Commit the pinned requirements, create and push ${#TAGS[@]} tags? [y/N] " REPLY
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+        unpin
         echo "Aborted."
         exit 1
     fi
+fi
+
+if [[ -n "$(git status --porcelain -- "${PINNED_FILES[@]}")" ]]; then
+    git commit -m "Release $VERSION" -- "${PINNED_FILES[@]}"
 fi
 
 echo
@@ -138,8 +184,12 @@ for t in "${TAGS[@]}"; do
 done
 
 echo
-echo "Pushing tags to origin..."
-git push origin "${TAGS[@]}"
+echo "Pushing $BRANCH and the tags to origin..."
+git push origin "HEAD:$BRANCH" "${TAGS[@]}"
+
+echo
+echo "Installing $VERSION from the module proxy, outside this repository..."
+"$(dirname "$0")/verify-release.sh" "$VERSION"
 
 echo
 echo "Done. The release workflow fires on the $VERSION tag push."

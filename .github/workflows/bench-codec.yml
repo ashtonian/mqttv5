@@ -15,16 +15,16 @@ on:
     branches: [main, master]
     paths:
       - 'wire/**'
-      - 'benchmarks/decode_**'
-      - 'benchmarks/encode_**'
+      - 'benchmarks/codec_bench_test.go'
+      - 'benchmarks/fixtures.go'
       - 'benchmarks/go.mod'
       - 'benchmarks/go.sum'
       - '.github/workflows/bench-codec.yml'
   pull_request:
     paths:
       - 'wire/**'
-      - 'benchmarks/decode_**'
-      - 'benchmarks/encode_**'
+      - 'benchmarks/codec_bench_test.go'
+      - 'benchmarks/fixtures.go'
       - 'benchmarks/go.mod'
       - 'benchmarks/go.sum'
       - '.github/workflows/bench-codec.yml'
@@ -44,9 +44,9 @@ jobs:
     name: codec micro benchmarks (track + alert)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: benchmarks/go.sum

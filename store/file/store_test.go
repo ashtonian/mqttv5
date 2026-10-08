@@ -3,221 +3,159 @@
 package file
 
 import (
-	"bytes"
-	"os"
-	"path/filepath"
+	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/ashtonian/mqttv5/session"
+	"github.com/ashtonian/mqttv5/session/storetest"
 )
 
-func newStore(t *testing.T) *Store {
-	t.Helper()
+func factory(opts ...Option) storetest.Factory {
+	return storetest.Factory{
+		Open: func(t *testing.T) session.Store {
+			s, err := Open(t.TempDir(), opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+		Reopen: func(t *testing.T, s session.Store) session.Store {
+			dir := filepathDir(s.(*Store).Path())
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r, err := Open(dir, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return r
+		},
+	}
+}
+
+func filepathDir(p string) string { return p[:len(p)-len(FileName)-1] }
+
+func TestConformanceGroupCommit(t *testing.T) { storetest.Run(t, factory()) }
+
+func TestConformanceSyncEveryWrite(t *testing.T) {
+	storetest.Run(t, factory(WithSyncPolicy(SyncEveryWrite)))
+}
+
+func TestConformanceSyncNone(t *testing.T) { storetest.Run(t, factory(WithSyncPolicy(SyncNone))) }
+
+func TestSecondOpenIsLocked(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s
+	defer s.Close()
+	start := time.Now()
+	_, err = Open(dir, WithLockTimeout(50*time.Millisecond))
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open = %v, want ErrLocked", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("lock timeout not honoured")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(dir, WithLockTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Open after the holder closed: %v", err)
+	}
+	_ = r.Close()
 }
 
-func TestOpen_CreatesSubdirs(t *testing.T) {
+func TestCorruptRecordsAreSkippedAndReported(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Root() != dir {
-		t.Errorf("Root() = %q, want %q", s.Root(), dir)
+	ctx := context.Background()
+	good := session.Record{Key: session.RecordKey{Dir: session.Outbound, PacketID: 1}, Seq: 1, QoS: 1, Phase: session.AwaitPuback, Packet: []byte("ok")}
+	if err := s.Put(ctx, good); err != nil {
+		t.Fatal(err)
 	}
-	for _, sub := range []string{"outbound", "inbound"} {
-		info, err := os.Stat(filepath.Join(dir, sub))
-		if err != nil {
-			t.Fatalf("subdir %s: %v", sub, err)
-		}
-		if !info.IsDir() {
-			t.Errorf("subdir %s is not a directory", sub)
-		}
-	}
-}
+	path := s.Path()
+	_ = s.Close()
 
-func TestPutRangeDelete_Outbound(t *testing.T) {
-	s := newStore(t)
-
-	want := map[uint16][]byte{
-		1:    []byte("first"),
-		42:   []byte("second"),
-		1000: []byte("third"),
-	}
-	for id, b := range want {
-		if err := s.PutOutbound(id, b); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	got := map[uint16][]byte{}
-	err := s.RangeOutbound(func(id uint16, packet []byte) bool {
-		got[id] = packet
-		return true
-	})
+	db, err := bolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != len(want) {
-		t.Errorf("got %d entries, want %d", len(got), len(want))
-	}
-	for id, w := range want {
-		if !bytes.Equal(got[id], w) {
-			t.Errorf("entry %d: got %q, want %q", id, got[id], w)
-		}
-	}
-
-	// Delete one.
-	if err := s.DeleteOutbound(42); err != nil {
+	if err := db.Update(func(tx *bolt.Tx) error {
+		v := encodeRecord(session.Record{Seq: 2, QoS: 1, Phase: session.AwaitPuback, Packet: []byte("flipped")})
+		v[len(v)/2] ^= 0xff
+		return tx.Bucket(bucketOut).Put(idKey(2), v)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	count := 0
-	_ = s.RangeOutbound(func(uint16, []byte) bool { count++; return true })
-	if count != 2 {
-		t.Errorf("after delete: %d entries, want 2", count)
-	}
+	_ = db.Close()
 
-	// Deleting a missing entry is not an error.
-	if err := s.DeleteOutbound(9999); err != nil {
-		t.Errorf("Delete missing returned %v, want nil", err)
-	}
-}
-
-func TestPutRangeDelete_Inbound(t *testing.T) {
-	s := newStore(t)
-	for _, id := range []uint16{7, 8, 9} {
-		if err := s.PutInbound(id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got := map[uint16]bool{}
-	err := s.RangeInbound(func(id uint16) bool {
-		got[id] = true
-		return true
-	})
+	s, err = Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []uint16{7, 8, 9} {
-		if !got[want] {
-			t.Errorf("missing inbound id %d", want)
-		}
+	defer s.Close()
+	_, recs, err := s.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load with a corrupt record: %v", err)
 	}
-	if err := s.DeleteInbound(8); err != nil {
-		t.Fatal(err)
+	if len(recs) != 1 || recs[0].Key.PacketID != 1 {
+		t.Fatalf("records = %+v, want only the intact one", recs)
 	}
-	count := 0
-	_ = s.RangeInbound(func(uint16) bool { count++; return true })
-	if count != 2 {
-		t.Errorf("after delete: %d entries, want 2", count)
+	if c := s.Corrupt(); len(c) != 1 || !errors.Is(c[0], ErrCorrupt) {
+		t.Fatalf("Corrupt() = %v", c)
 	}
 }
 
-func TestReset_WipesBoth(t *testing.T) {
-	s := newStore(t)
-	_ = s.PutOutbound(1, []byte("x"))
-	_ = s.PutInbound(2)
-	if err := s.Reset(); err != nil {
-		t.Fatal(err)
-	}
-	outCount, inCount := 0, 0
-	_ = s.RangeOutbound(func(uint16, []byte) bool { outCount++; return true })
-	_ = s.RangeInbound(func(uint16) bool { inCount++; return true })
-	if outCount != 0 || inCount != 0 {
-		t.Errorf("after Reset: outCount=%d inCount=%d, want 0/0", outCount, inCount)
-	}
-}
-
-// TestSurvivesReopen is the headline test: write entries, close the
-// Store, open a new Store at the same path, verify the entries are
-// still there. This is what disk-backed storage is for.
-func TestSurvivesReopen(t *testing.T) {
-	dir := t.TempDir()
-
-	first, err := Open(dir)
+func TestClosedStoreReturnsErrClosed(t *testing.T) {
+	s, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []byte("survives-the-restart")
-	if err := first.PutOutbound(99, want); err != nil {
-		t.Fatal(err)
+	_ = s.Close()
+	if err := s.Delete(context.Background(), session.RecordKey{Dir: session.Outbound, PacketID: 1}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Delete after Close = %v", err)
 	}
-	if err := first.PutInbound(101); err != nil {
-		t.Fatal(err)
-	}
+}
 
-	// Simulate process restart.
-	second, err := Open(dir)
+// Group commit batches concurrent writers into shared transactions; all
+// of them must still land.
+func TestGroupCommitUnderConcurrency(t *testing.T) {
+	s, err := Open(t.TempDir(), WithCommitWindow(2*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	var gotPacket []byte
-	_ = second.RangeOutbound(func(id uint16, p []byte) bool {
-		if id == 99 {
-			gotPacket = p
-		}
-		return true
-	})
-	if !bytes.Equal(gotPacket, want) {
-		t.Errorf("after reopen: outbound[99] = %q, want %q", gotPacket, want)
-	}
-	gotInbound := false
-	_ = second.RangeInbound(func(id uint16) bool {
-		if id == 101 {
-			gotInbound = true
-		}
-		return true
-	})
-	if !gotInbound {
-		t.Error("after reopen: inbound[101] missing")
-	}
-}
-
-// TestImplementsStoreInterface verifies *Store satisfies
-// session.Store. The var _ = at the top of store.go already does
-// this at compile time; the test makes it visible to humans reading
-// the test output.
-func TestImplementsStoreInterface(t *testing.T) {
-	var _ session.Store = newStore(t)
-}
-
-// TestConcurrent runs concurrent Puts + Deletes on different IDs to
-// confirm the mutex is doing its job.
-func TestConcurrent(t *testing.T) {
-	s := newStore(t)
-	const goroutines = 8
-	const perGoroutine = 16
-
-	wg := sync.WaitGroup{}
-	wg.Add(goroutines)
-	for g := range goroutines {
-		go func(base int) {
-			defer wg.Done()
-			for i := range perGoroutine {
-				id := uint16(base*100 + i + 1)
-				if err := s.PutOutbound(id, []byte{byte(i)}); err != nil {
-					t.Errorf("PutOutbound: %v", err)
-					return
-				}
-				if err := s.DeleteOutbound(id); err != nil {
-					t.Errorf("DeleteOutbound: %v", err)
+	defer s.Close()
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for w := 0; w < 32; w++ {
+		wg.Go(func() {
+			for i := 0; i < 20; i++ {
+				id := uint16(w*20 + i + 1)
+				r := session.Record{Key: session.RecordKey{Dir: session.Outbound, PacketID: id}, Seq: uint64(id), QoS: 1, Phase: session.AwaitPuback, Packet: []byte{byte(id)}}
+				if err := s.Put(ctx, r); err != nil {
+					t.Error(err)
 					return
 				}
 			}
-		}(g)
+		})
 	}
 	wg.Wait()
-
-	count := 0
-	_ = s.RangeOutbound(func(uint16, []byte) bool { count++; return true })
-	if count != 0 {
-		t.Errorf("after concurrent put+delete: %d entries, want 0", count)
+	_, recs, err := s.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 32*20 {
+		t.Fatalf("%d records, want %d", len(recs), 32*20)
 	}
 }

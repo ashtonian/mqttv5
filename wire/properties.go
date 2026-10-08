@@ -191,6 +191,28 @@ func (p Properties) UserProperties() iter.Seq2[string, string] {
 	}
 }
 
+// SubscriptionIdentifiers yields every Subscription Identifier on a
+// PUBLISH, one per subscription of the receiver that matched it
+// (§3.3.2.3.8).
+func (p Properties) SubscriptionIdentifiers() iter.Seq[uint32] {
+	return func(yield func(uint32) bool) {
+		for off := 0; off < len(p.raw); {
+			id := p.raw[off]
+			off++
+			size, err := propValueSize(id, p.raw[off:])
+			if err != nil || off+size > len(p.raw) {
+				return
+			}
+			if id == PropSubscriptionIdentifier {
+				if v, _, err := DecodeVarint(p.raw[off : off+size]); err == nil && !yield(v) {
+					return
+				}
+			}
+			off += size
+		}
+	}
+}
+
 // find locates the property with the given id and returns a slice
 // positioned at the value (i.e., past the ID byte).
 //

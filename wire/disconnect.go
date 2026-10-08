@@ -66,6 +66,9 @@ type DisconnectOpts struct {
 
 // WriteDisconnect emits a DISCONNECT packet.
 func WriteDisconnect(w io.Writer, opts DisconnectOpts) (int64, error) {
+	if err := validateDisconnectOpts(&opts); err != nil {
+		return 0, err
+	}
 	propsLen := 0
 	if opts.SessionExpiryInterval != nil {
 		propsLen += 5
@@ -135,7 +138,10 @@ func decodeDisconnect(frame *[]byte, flags byte) (*Disconnect, error) {
 		reason = ReasonCode(buf[0])
 		buf = buf[1:]
 		if len(buf) > 0 {
-			p, _, err := readProperties(buf)
+			p, n, err := readProperties(buf)
+			if err == nil && n != len(buf) {
+				err = errTrailing
+			}
 			if err != nil {
 				releaseBuf(frame)
 				return nil, fmt.Errorf("%w: DISCONNECT properties: %w", ErrInvalidPacket, err)

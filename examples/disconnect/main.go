@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 func main() {
@@ -37,7 +36,7 @@ func main() {
 	}
 
 	// Do some work.
-	_ = cli.Publish(context.Background(), wire.PublishOpts{
+	_ = cli.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic:   "demo/disconnect",
 		Payload: []byte("about to leave"),
 		QoS:     1,
@@ -50,8 +49,8 @@ func main() {
 	expiry := uint32(0)
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := cli.DisconnectWith(shutdown, wire.DisconnectOpts{
-		ReasonCode:            wire.ReasonAdministrativeAction,
+	if err := cli.DisconnectWith(shutdown, mqttv5.DisconnectOptions{
+		ReasonCode:            mqttv5.ReasonAdministrativeAction,
 		ReasonString:          "planned shutdown",
 		SessionExpiryInterval: &expiry,
 	}); err != nil {

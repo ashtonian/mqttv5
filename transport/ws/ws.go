@@ -11,16 +11,18 @@
 //	    })),
 //	)
 //
-// Both ws:// and wss:// are first-class. wss:// requires DialOpts
-// to carry a *tls.Config — DialFunc / Dial fail before opening the
-// socket if one is not supplied, so there is no silent downgrade.
+// Both ws:// and wss:// are first-class. Like mqtts://, wss:// without
+// a DialOpts.TLSConfig verifies the broker against the system roots
+// with the URL's host as the server name.
 //
 // External dependency: github.com/gobwas/ws — chosen for its low
-// per-frame allocation profile, in line with mqttv5's zero-alloc
-// receive-path contract.
+// per-frame allocation profile, in line with mqttv5's allocation-free
+// decoder.
 package ws
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -29,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	gws "github.com/gobwas/ws"
@@ -41,11 +44,15 @@ import (
 // used when DialOpts.HandshakeTimeout is zero.
 const DefaultHandshakeTimeout = 10 * time.Second
 
+// DefaultCloseFrameTimeout bounds the Close frame Conn.Close sends, when
+// DialOpts.CloseFrameTimeout is zero.
+const DefaultCloseFrameTimeout = time.Second
+
 // DialOpts customises a Dial call. Zero value is valid.
 type DialOpts struct {
-	// TLSConfig is required for wss:// URLs and ignored otherwise.
-	// Dial fails before opening the socket if TLSConfig is nil for a
-	// wss:// scheme — no implicit downgrade to ws://.
+	// TLSConfig configures TLS for wss:// URLs and is ignored for
+	// ws://. Nil verifies against the system roots; an empty ServerName
+	// is filled in from the URL's host.
 	TLSConfig *tls.Config
 
 	// HTTPHeaders are added to the HTTP upgrade request — useful for
@@ -60,14 +67,14 @@ type DialOpts struct {
 	// DefaultHandshakeTimeout.
 	HandshakeTimeout time.Duration
 
+	// CloseFrameTimeout bounds the Close frame sent when the connection
+	// is closed. Defaults to DefaultCloseFrameTimeout.
+	CloseFrameTimeout time.Duration
+
 	// NetDial overrides the underlying TCP dial. Use this to inject a
 	// SOCKS / HTTP CONNECT proxy or a custom net.Dialer.
 	NetDial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
-
-// ErrMissingTLSConfig is returned by Dial when the URL scheme is
-// wss:// but no TLSConfig was supplied. We never downgrade.
-var ErrMissingTLSConfig = errors.New("mqttv5/transport/ws: wss:// requires DialOpts.TLSConfig")
 
 // DialFunc binds opts and returns a [transport.DialFunc] that's
 // directly compatible with mqttv5.WithDialFunc — typical usage:
@@ -94,11 +101,7 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 		return nil, errors.New("mqttv5/transport/ws: nil URL")
 	}
 	switch brokerURL.Scheme {
-	case "ws":
-	case "wss":
-		if opts.TLSConfig == nil {
-			return nil, ErrMissingTLSConfig
-		}
+	case "ws", "wss":
 	default:
 		return nil, fmt.Errorf("mqttv5/transport/ws: unsupported scheme %q", brokerURL.Scheme)
 	}
@@ -122,38 +125,71 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 		dialer.Header = gws.HandshakeHeaderHTTP(opts.HTTPHeaders)
 	}
 
-	conn, _, _, err := dialer.Dial(ctx, brokerURL.String())
+	conn, buffered, _, err := dialer.Dial(ctx, brokerURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("mqttv5/transport/ws: dial %s: %w", brokerURL.String(), err)
 	}
-	return newConn(conn), nil
+	closeTimeout := opts.CloseFrameTimeout
+	if closeTimeout == 0 {
+		closeTimeout = DefaultCloseFrameTimeout
+	}
+	return newConn(conn, buffered, closeTimeout), nil
 }
 
-// Conn wraps a websocket connection so every Read/Write maps to one
-// MQTT control packet. It is created by Dial; callers should treat
-// the returned transport.Conn as opaque.
+// ErrTextFrame reports a WebSocket text frame from the broker. MQTT
+// travels only in binary frames; any other data frame must close the
+// connection [MQTT-6.0.0-1].
+var ErrTextFrame = errors.New("mqttv5/transport/ws: text frame from the broker")
+
+// Conn wraps a websocket connection so every Write is one WebSocket
+// frame holding one MQTT control packet. It is created by Dial; callers
+// should treat the returned transport.Conn as opaque.
 type Conn struct {
-	raw    net.Conn
-	reader *wsutil.Reader
+	raw     net.Conn
+	reader  *wsutil.Reader
+	control wsutil.FrameHandlerFunc
+
+	// wmu keeps frames whole: the client's writer and the pongs and
+	// close replies Read sends write to the same connection.
+	wmu sync.Mutex
+
+	closeTimeout time.Duration
 }
 
-func newConn(raw net.Conn) *Conn {
-	c := &Conn{raw: raw}
+// newConn wraps raw. buffered, when not nil, holds frames the server
+// sent right behind its handshake response, read along with it; they
+// come first.
+func newConn(raw net.Conn, buffered *bufio.Reader, closeTimeout time.Duration) *Conn {
+	c := &Conn{raw: raw, closeTimeout: closeTimeout}
+	c.control = wsutil.ControlFrameHandler(frameWriter{c}, gws.StateClientSide)
+	src := io.Reader(raw)
+	if buffered != nil {
+		src = io.MultiReader(buffered, raw)
+	}
 	c.reader = &wsutil.Reader{
-		Source: raw,
+		Source: src,
 		State:  gws.StateClientSide,
-		// Auto-handle pings: reply with Pong on the same conn.
-		OnIntermediate: wsutil.ControlFrameHandler(raw, gws.StateClientSide),
+		// Control frames between the fragments of a message.
+		OnIntermediate: c.control,
 	}
 	return c
+}
+
+// frameWriter writes what the control-frame handler produces — one
+// Write per frame — under the connection's write lock.
+type frameWriter struct{ c *Conn }
+
+func (w frameWriter) Write(p []byte) (int, error) {
+	w.c.wmu.Lock()
+	defer w.c.wmu.Unlock()
+	return w.c.raw.Write(p)
 }
 
 // Read returns the next available bytes from the MQTT byte stream.
 // Each underlying WebSocket binary frame is one MQTT control packet,
 // but the MQTT decoder reads field-at-a-time — so Read may be called
-// many times per frame. At frame boundaries we transparently advance
-// to the next data frame; control frames (Ping/Pong/Close) are
-// handled inline so the caller never sees them.
+// many times per frame. Between frames it answers Ping with Pong and
+// Close with Close (then reports io.EOF); a text frame is an error.
 func (c *Conn) Read(p []byte) (int, error) {
 	for {
 		n, err := c.reader.Read(p)
@@ -164,46 +200,78 @@ func (c *Conn) Read(p []byte) (int, error) {
 		// ErrNoFrameAdvance, and "current frame payload consumed"
 		// via io.EOF. Both mean "fetch the next frame".
 		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, wsutil.ErrNoFrameAdvance) {
-			return n, err
+			return 0, err
 		}
 		h, err := c.reader.NextFrame()
 		if err != nil {
 			return 0, err
 		}
-		switch h.OpCode {
-		case gws.OpClose:
-			return 0, io.EOF
-		case gws.OpBinary, gws.OpContinuation:
-			// fall through and Read again
-		default:
-			// Unknown / non-data frame — skip its payload.
-			if err := c.reader.Discard(); err != nil {
+		switch {
+		case h.OpCode.IsControl():
+			if err := c.control(h, c.reader); err != nil {
+				var closed wsutil.ClosedError
+				if errors.As(err, &closed) {
+					return 0, io.EOF
+				}
 				return 0, err
 			}
+		case h.OpCode == gws.OpText:
+			return 0, ErrTextFrame
 		}
 	}
 }
 
-// Write emits p as one WebSocket binary frame (Fin=true, masked).
-// The caller's buffer is not modified — wsutil copies before masking.
+// framePool recycles frame buffers up to maxPooledFrame bytes.
+var framePool = sync.Pool{New: func() any { return new([]byte) }}
+
+const maxPooledFrame = 64 << 10
+
+// Write emits p as one masked WebSocket binary frame in a single write
+// to the connection. p is not modified.
 func (c *Conn) Write(p []byte) (int, error) {
-	if err := wsutil.WriteClientBinary(c.raw, p); err != nil {
+	h := gws.Header{Fin: true, OpCode: gws.OpBinary, Masked: true, Mask: gws.NewMask(), Length: int64(len(p))}
+	size := gws.HeaderSize(h) + len(p)
+	bp := framePool.Get().(*[]byte)
+	if cap(*bp) < size {
+		*bp = make([]byte, 0, size)
+	}
+	b := bytes.NewBuffer((*bp)[:0])
+	if err := gws.WriteHeader(b, h); err != nil {
+		framePool.Put(bp)
+		return 0, err
+	}
+	frame := append(b.Bytes(), p...)
+	gws.Cipher(frame[len(frame)-len(p):], h.Mask, 0)
+
+	c.wmu.Lock()
+	_, err := c.raw.Write(frame)
+	c.wmu.Unlock()
+
+	*bp = frame[:0]
+	if cap(frame) <= maxPooledFrame {
+		framePool.Put(bp)
+	}
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
-// Close sends a Close frame (best effort) and closes the underlying
-// TCP connection.
+// Close closes the underlying connection, first sending a Close frame
+// when no write is in progress, within DialOpts.CloseFrameTimeout. A
+// write in progress is not waited for: it may be stalled behind a peer
+// that stopped reading, and closing the connection is what ends it.
 func (c *Conn) Close() error {
-	// Best-effort Close frame; ignore errors — the next operation
-	// will close the conn anyway.
-	_ = gws.WriteHeader(c.raw, gws.Header{
-		Fin:    true,
-		OpCode: gws.OpClose,
-		Masked: true,
-		Mask:   gws.NewMask(),
-	})
+	if c.wmu.TryLock() {
+		_ = c.raw.SetWriteDeadline(time.Now().Add(c.closeTimeout))
+		_ = gws.WriteHeader(c.raw, gws.Header{
+			Fin:    true,
+			OpCode: gws.OpClose,
+			Masked: true,
+			Mask:   gws.NewMask(),
+		})
+		c.wmu.Unlock()
+	}
 	return c.raw.Close()
 }
 

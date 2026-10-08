@@ -49,6 +49,9 @@ type SubackOpts struct {
 
 // WriteSuback emits a SUBACK packet.
 func WriteSuback(w io.Writer, opts SubackOpts) (int64, error) {
+	if err := validateAckList(SUBACK, opts.PacketID, opts.ReasonCodes, opts.ReasonString, opts.UserProperties); err != nil {
+		return 0, err
+	}
 	return writeSubAckLike(w, SUBACK, opts.PacketID, opts.ReasonCodes, opts.ReasonString, opts.UserProperties)
 }
 

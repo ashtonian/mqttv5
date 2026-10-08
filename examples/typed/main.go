@@ -19,7 +19,6 @@ import (
 
 	"github.com/ashtonian/mqttv5"
 	jsoncodec "github.com/ashtonian/mqttv5/codec/json"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 type Reading struct {
@@ -74,7 +73,7 @@ func main() {
 				Temp:     20.0 + float64(i%10),
 				Site:     "us-west-2",
 			}
-			err := typed.Publish(ctx, wire.PublishOpts{
+			err := typed.Publish(ctx, mqttv5.PublishOptions{
 				Topic: "sensors/" + r.DeviceID,
 				QoS:   1,
 			}, r)

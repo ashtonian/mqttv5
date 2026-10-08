@@ -1,0 +1,99 @@
+name: nightly
+
+# Long-running checks too slow for every push:
+#
+#   - the model-based fault-injection tests with a million seeds that
+#     change every night (a failure prints its seed; reproduce with
+#     MQTTV5_SEED_BASE=<seed> MQTTV5_SEEDS=1);
+#   - the conformance suite against mosquitto, EMQX and HiveMQ CE,
+#     with the strict-limit tests against a HiveMQ that announces tight
+#     CONNACK limits, and a ten-minute connection-cut soak per broker.
+#
+# Fuzzing runs in fuzz.yml.
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      soak:
+        description: soak duration per broker (Go duration)
+        default: 10m
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  models:
+    name: model-based tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: seed base for tonight
+        run: echo "BASE=$(( $(date -u +%s) / 86400 * 10000000 ))" >> "$GITHUB_ENV"
+
+      - name: session engine, 1,000,000 seeds
+        run: MQTTV5_SEED_BASE=$BASE MQTTV5_SEEDS=1000000 go test -count=1 -timeout 60m -run '^TestSessionFaultInjection$' ./internal/inflight
+
+      - name: session engine, 50,000 seeds with -race
+        run: MQTTV5_SEED_BASE=$((BASE + 5000000)) MQTTV5_SEEDS=50000 go test -race -count=1 -timeout 60m -run '^TestSessionFaultInjection$' ./internal/inflight
+
+      - name: subscriptions, 2,000 seeds with -race
+        run: MQTTV5_SEED_BASE=$BASE MQTTV5_SEEDS=2000 go test -race -count=1 -timeout 60m -run '^TestSubscriptionModel$' .
+
+  conformance:
+    name: conformance (${{ matrix.broker.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        broker:
+          - { name: mosquitto, url: "mqtt://127.0.0.1:1883", second: "mqtt://127.0.0.1:1884" }
+          - { name: emqx, url: "mqtt://127.0.0.1:1884", second: "mqtt://127.0.0.1:1883" }
+          - { name: hivemq, url: "mqtt://127.0.0.1:1886", second: "mqtt://127.0.0.1:1883" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: conformance/go.sum
+
+      - name: start brokers
+        run: docker compose -f conformance/docker-compose.yml --profile hivemq up -d --wait
+
+      - name: wait for the emqx-scram REST API
+        timeout-minutes: 2
+        run: |
+          until curl -fsS -o /dev/null \
+            -u conformancekey:conformanceSecret0123456789 \
+            http://127.0.0.1:18084/api/v5/authentication; do
+            sleep 2
+          done
+
+      - name: run conformance
+        env:
+          MQTT_BROKER: ${{ matrix.broker.url }}
+          MQTT_BROKER_2: ${{ matrix.broker.second }}
+          MQTTV5_SOAK: ${{ inputs.soak || '10m' }}
+        run: go test -tags conformance -race -count=1 -v -timeout 45m ./...
+        working-directory: conformance
+
+      - name: broker logs (on failure)
+        if: failure()
+        run: docker compose -f conformance/docker-compose.yml --profile hivemq logs --no-color
+
+      - name: stop brokers
+        if: always()
+        run: docker compose -f conformance/docker-compose.yml --profile hivemq down -v

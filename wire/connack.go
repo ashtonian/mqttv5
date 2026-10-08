@@ -75,6 +75,9 @@ type ConnackOpts struct {
 
 // WriteConnack emits a CONNACK packet.
 func WriteConnack(w io.Writer, opts ConnackOpts) (int64, error) {
+	if err := validateConnackOpts(&opts); err != nil {
+		return 0, err
+	}
 	propsLen := connackPropsLen(&opts)
 	bodyLen := 1 + 1 + VarintSize(uint32(propsLen)) + propsLen
 
@@ -141,14 +144,15 @@ func decodeConnack(frame *[]byte, flags byte) (*Connack, error) {
 	reason := ReasonCode(buf[1])
 	buf = buf[2:]
 
-	var props Properties
-	if len(buf) > 0 {
-		p, _, err := readProperties(buf)
-		if err != nil {
-			releaseBuf(frame)
-			return nil, fmt.Errorf("%w: CONNACK properties: %w", ErrInvalidPacket, err)
-		}
-		props = p
+	// Unlike the acknowledgement packets, CONNACK always carries its
+	// Property Length (§3.2.2.3.1).
+	props, n, err := readProperties(buf)
+	if err == nil && n != len(buf) {
+		err = errTrailing
+	}
+	if err != nil {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: CONNACK properties: %w", ErrInvalidPacket, err)
 	}
 
 	c := connackPool.Get().(*Connack)

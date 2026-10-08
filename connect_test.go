@@ -84,9 +84,9 @@ func TestConnectExposesV5Properties(t *testing.T) {
 	if !ok || rri != 1 {
 		t.Errorf("RequestResponseInformation = (%d, %v), want (1, true)", rri, ok)
 	}
-	rpi, ok := conn.Properties.Byte(wire.PropRequestProblemInfo)
-	if !ok || rpi != 1 {
-		t.Errorf("RequestProblemInformation = (%d, %v), want (1, true)", rpi, ok)
+	// Requested (the default): the property is omitted, which means 1.
+	if rpi, ok := conn.Properties.Byte(wire.PropRequestProblemInfo); ok && rpi != 1 {
+		t.Errorf("RequestProblemInformation = %d, want absent or 1", rpi)
 	}
 	props := map[string]string{}
 	for k, v := range conn.Properties.UserProperties() {
@@ -104,7 +104,7 @@ func TestConnectPacketBuilderMutates(t *testing.T) {
 	cli, err := New(
 		WithBroker(fb.URL()),
 		WithClientID("from-config"),
-		WithConnectPacketBuilder(func(ctx context.Context, opts *wire.ConnectOpts) error {
+		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
 			opts.Username = "from-builder"
 			opts.Password = []byte("rotated-token")
 			return nil
@@ -136,7 +136,7 @@ func TestConnectPacketBuilderErrorFailsAttempt(t *testing.T) {
 	wantErr := errors.New("builder rejected the attempt")
 	cli, err := New(
 		WithBroker(fb.URL()),
-		WithConnectPacketBuilder(func(ctx context.Context, opts *wire.ConnectOpts) error {
+		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
 			return wantErr
 		}),
 	)
@@ -185,7 +185,7 @@ func TestConnectPacketBuilderRotatesCredentialsAcrossAttempts(t *testing.T) {
 		WithBroker(fb.URL()),
 		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
 		WithConnectTimeout(200*time.Millisecond),
-		WithConnectPacketBuilder(func(ctx context.Context, opts *wire.ConnectOpts) error {
+		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
 			n := counter.Add(1)
 			opts.Username = fmt.Sprintf("token-%d", n)
 			return nil

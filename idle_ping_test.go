@@ -3,379 +3,285 @@
 package mqttv5
 
 import (
-	"context"
-	"net"
-	"sync/atomic"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/ashtonian/mqttv5/internal/clock"
+	"github.com/ashtonian/mqttv5/internal/testbroker"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
-// TestNextPingWait exercises the deadline math without spinning up a
-// connection. It's the unit-test part of the idle-PINGREQ scheduler.
-func TestNextPingWait(t *testing.T) {
-	keep := time.Second
-	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	cases := []struct {
-		name      string
-		lastWrite time.Time
-		lastRead  time.Time
-		now       time.Time
-		wantMin   time.Duration
-		wantMax   time.Duration
+func TestKeepAliveDecide(t *testing.T) {
+	base := time.Unix(1_000, 0)
+	keep, timeout := 10*time.Second, 2*time.Second
+	tests := []struct {
+		name       string
+		k          keepAlive
+		send, dead bool
+		wait       time.Duration
 	}{
-		{
-			name:      "both fresh - wait full keepalive",
-			lastWrite: base,
-			lastRead:  base,
-			now:       base,
-			wantMin:   900 * time.Millisecond,
-			wantMax:   keep,
-		},
-		{
-			name:      "outbound stale, inbound fresh - fire soon",
-			lastWrite: base.Add(-2 * keep),
-			lastRead:  base,
-			now:       base,
-			wantMin:   1,
-			wantMax:   10 * time.Millisecond,
-		},
-		{
-			name:      "inbound stale, outbound fresh - fire soon",
-			lastWrite: base,
-			lastRead:  base.Add(-2 * keep),
-			now:       base,
-			wantMin:   1,
-			wantMax:   10 * time.Millisecond,
-		},
-		{
-			name:      "both stale - fire immediately (clamped)",
-			lastWrite: base.Add(-3 * keep),
-			lastRead:  base.Add(-3 * keep),
-			now:       base,
-			wantMin:   1,
-			wantMax:   10 * time.Millisecond,
-		},
-		{
-			name:      "earlier deadline dominates",
-			lastWrite: base.Add(-500 * time.Millisecond),
-			lastRead:  base,
-			now:       base,
-			wantMin:   450 * time.Millisecond,
-			wantMax:   550 * time.Millisecond,
-		},
+		{"fresh both ways", keepAlive{now: base, lastWrite: base, lastRead: base}, false, false, keep},
+		{"outbound quiet", keepAlive{now: base, lastWrite: base.Add(-keep), lastRead: base}, true, false, 0},
+		{"inbound quiet", keepAlive{now: base, lastWrite: base, lastRead: base.Add(-keep)}, true, false, 0},
+		{"earlier window wins", keepAlive{now: base, lastWrite: base.Add(-4 * time.Second), lastRead: base}, false, false, 6 * time.Second},
+		{"ping outstanding", keepAlive{now: base, lastWrite: base, lastRead: base.Add(-keep), pingSent: base.Add(-time.Second)}, false, false, time.Second},
+		{"ping timed out", keepAlive{now: base, lastWrite: base, lastRead: base.Add(-keep), pingSent: base.Add(-timeout)}, false, true, 0},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cs := &connState{}
-			cs.lastWriteUnixNano.Store(tc.lastWrite.UnixNano())
-			cs.lastReadUnixNano.Store(tc.lastRead.UnixNano())
-			got := nextPingWait(cs, keep, tc.now)
-			if got < tc.wantMin || got > tc.wantMax {
-				t.Fatalf("nextPingWait = %v, want in [%v, %v]", got, tc.wantMin, tc.wantMax)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.k.keep, tt.k.timeout = keep, timeout
+			send, dead, wait := tt.k.decide()
+			if send != tt.send || dead != tt.dead || wait != tt.wait {
+				t.Fatalf("decide() = send %v dead %v wait %v, want %v %v %v", send, dead, wait, tt.send, tt.dead, tt.wait)
 			}
 		})
 	}
 }
 
-// pingCounterBroker is a fake broker handler that counts inbound
-// PINGREQ packets. Replies with PINGRESP unless dropPing is true.
-type pingCounterBroker struct {
-	pings    atomic.Int32
-	dropPing atomic.Bool
+func TestEffectivePingTimeout(t *testing.T) {
+	if got := effectivePingTimeout(3*time.Second, 10*time.Second); got != 3*time.Second {
+		t.Fatalf("within keep-alive: %v", got)
+	}
+	// The broker granted a keep-alive shorter than the configured timeout.
+	if got := effectivePingTimeout(10*time.Second, 4*time.Second); got != 2*time.Second {
+		t.Fatalf("above granted keep-alive: %v", got)
+	}
 }
 
-func (p *pingCounterBroker) serve(t *testing.T, fb *fakeBroker, c net.Conn) {
-	t.Helper()
-	defer c.Close()
-	dec := wire.NewDecoder(c)
-	acceptConnect(t, c, dec)
-	for {
-		select {
-		case <-fb.Done():
-			return
-		default:
-		}
-		pkt, err := dec.ReadPacket()
+// PingTimeout defaults below the keep-alive and is validated.
+func TestPingTimeoutDefaultsAndValidation(t *testing.T) {
+	for _, tt := range []struct {
+		keep uint16
+		want time.Duration
+	}{{30, 10 * time.Second}, {8, 4 * time.Second}, {1, 500 * time.Millisecond}} {
+		c, err := New(WithBroker("mqtt://127.0.0.1:1"), WithKeepAlive(tt.keep))
 		if err != nil {
+			t.Fatal(err)
+		}
+		if c.cfg.PingTimeout != tt.want {
+			t.Errorf("keep-alive %ds: default PingTimeout %v, want %v", tt.keep, c.cfg.PingTimeout, tt.want)
+		}
+	}
+	_, err := New(WithBroker("mqtt://127.0.0.1:1"), WithKeepAlive(5), WithPingTimeout(5*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "PingTimeout") {
+		t.Fatalf("PingTimeout equal to KeepAlive accepted: %v", err)
+	}
+	if _, err := New(WithBroker("mqtt://127.0.0.1:1"), WithoutKeepAlive(), WithPingTimeout(time.Minute)); err != nil {
+		t.Fatalf("PingTimeout with keep-alive disabled: %v", err)
+	}
+}
+
+// pingHarness runs pingLoop against a fake clock, playing writer and
+// broker: it reads the write queue, records each PINGREQ, and optionally
+// answers it.
+type pingHarness struct {
+	t     *testing.T
+	clk   *clock.Fake
+	cs    *connState
+	pings []time.Time
+	died  time.Time
+
+	answer  bool                                // reply to PINGREQ
+	traffic func(now time.Time, h *pingHarness) // application traffic per step
+}
+
+func newPingHarness(t *testing.T, keep time.Duration, timeout time.Duration) *pingHarness {
+	clk := clock.NewFake(time.Unix(1_000, 0))
+	c := &Client{cfg: &Config{PingTimeout: timeout, Logger: quietLogger(), clock: clk}}
+	life := newLifecycle()
+	c.life.Store(life)
+	cs := &connState{
+		clk:        clk,
+		writeQueue: make(chan writeReq, 64),
+		life:       life,
+		dying:      make(chan struct{}),
+		info:       ConnackInfo{KeepAlive: uint16(keep / time.Second)},
+	}
+	now := clk.Now().UnixNano()
+	cs.lastWriteUnixNano.Store(now)
+	cs.lastReadUnixNano.Store(now)
+	cs.wg.Add(1)
+	go c.pingLoop(cs)
+	t.Cleanup(func() {
+		life.end()
+		cs.wg.Wait()
+	})
+	return &pingHarness{t: t, clk: clk, cs: cs, answer: true}
+}
+
+func (h *pingHarness) write(now time.Time) { h.cs.lastWriteUnixNano.Store(now.UnixNano()) }
+
+func (h *pingHarness) read(now time.Time) {
+	h.cs.lastReadUnixNano.Store(now.UnixNano())
+	h.cs.reads.Add(1)
+}
+
+// run advances the clock by total in steps, servicing the write queue
+// whenever the loop has parked on its timer.
+func (h *pingHarness) run(total, step time.Duration) {
+	h.t.Helper()
+	for elapsed := time.Duration(0); elapsed <= total; elapsed += step {
+		if !h.parked() {
 			return
 		}
-		switch pkt.Type() {
-		case wire.PINGREQ:
-			p.pings.Add(1)
-			pkt.Release()
-			if p.dropPing.Load() {
-				continue
-			}
-			if _, err := wire.WritePingresp(c); err != nil {
-				return
-			}
-		case wire.PUBLISH:
-			pub := pkt.(*wire.Publish)
-			// Auto-ack QoS 1 publishes so the client's read window
-			// stays fresh — this is the codepath the idle scheduler
-			// is designed to take advantage of.
-			if pub.QoS == 1 {
-				_, _ = wire.WritePuback(c, wire.PubRespOpts{
-					PacketID:   pub.PacketID,
-					ReasonCode: wire.ReasonSuccess,
-				})
-			}
-			pkt.Release()
-		case wire.DISCONNECT:
-			pkt.Release()
-			return
-		default:
-			pkt.Release()
-		}
-	}
-}
-
-// TestIdlePING_BusyConnectionSkipsPINGREQ verifies that a connection
-// publishing QoS 1 (and therefore receiving PUBACKs back) emits zero
-// PINGREQs over several KeepAlive windows. This is the central
-// optimisation: outbound + inbound traffic together cover both halves
-// of §3.1.2.10.
-func TestIdlePING_BusyConnectionSkipsPINGREQ(t *testing.T) {
-	t.Parallel()
-	pb := &pingCounterBroker{}
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		pb.serve(t, fb, c)
-	})
-
-	cli, err := New(
-		WithBroker(fb.URL()),
-		WithKeepAlive(1), // 1 s keepalive
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	// Run busy traffic for ~2.5 keepalive windows.
-	stop := time.After(2500 * time.Millisecond)
-	tick := time.NewTicker(150 * time.Millisecond)
-	defer tick.Stop()
-loop:
-	for {
-		select {
-		case <-stop:
-			break loop
-		case <-tick.C:
-			err := cli.Publish(context.Background(), wire.PublishOpts{
-				Topic:   "busy/topic",
-				Payload: []byte("x"),
-				QoS:     1,
-			})
-			if err != nil {
-				t.Fatalf("Publish: %v", err)
-			}
-		}
-	}
-
-	if got := pb.pings.Load(); got != 0 {
-		t.Fatalf("PINGREQ count = %d, want 0 (busy connection should skip)", got)
-	}
-}
-
-// TestIdlePING_IdleConnectionStillSendsPINGREQ verifies the fallback:
-// a connection with no application traffic still fires PINGREQ on
-// schedule so the broker doesn't disconnect us.
-func TestIdlePING_IdleConnectionStillSendsPINGREQ(t *testing.T) {
-	t.Parallel()
-	pb := &pingCounterBroker{}
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		pb.serve(t, fb, c)
-	})
-
-	cli, err := New(
-		WithBroker(fb.URL()),
-		WithKeepAlive(1),                      // 1 s keepalive
-		WithPingTimeout(200*time.Millisecond), // override 10 s default so cycles complete in test window
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	// No traffic at all — expect PINGREQ to fire on the keepalive
-	// cadence. Wait for ~2.5 windows then check.
-	time.Sleep(2500 * time.Millisecond)
-
-	if got := pb.pings.Load(); got < 2 {
-		t.Fatalf("PINGREQ count = %d over 2.5 KeepAlive windows, want >= 2", got)
-	}
-}
-
-// streamingDropPingBroker accepts a subscription, then streams QoS 0
-// PUBLISHes at a steady cadence — keeping the client's inbound read
-// window perpetually fresh — while DROPPING every PINGRESP. It models
-// the real-world failure the estavelle RFC 0009 forward-ceiling
-// forensics surfaced: under a sustained inbound flood the client's
-// readLoop dispatches serially, so a PINGRESP sits behind a deep
-// backlog and pingResp does not advance within PingTimeout — even
-// though bytes are visibly arriving the whole time. A liveness check
-// that keys on PINGRESP alone falsely tears the connection down; one
-// that also honours inbound data (lastRead) does not.
-type streamingDropPingBroker struct {
-	pubInterval time.Duration
-}
-
-func (b *streamingDropPingBroker) serve(t *testing.T, fb *fakeBroker, c net.Conn) {
-	t.Helper()
-	defer c.Close()
-	dec := wire.NewDecoder(c)
-	acceptConnect(t, c, dec)
-
-	// A dedicated writer streams PUBLISHes until the conn dies, so the
-	// client's inbound window stays fresh independent of PINGREQ timing.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		tk := time.NewTicker(b.pubInterval)
-		defer tk.Stop()
-		for {
+		now := h.clk.Now()
+		for drained := false; !drained; {
 			select {
-			case <-stop:
-				return
-			case <-fb.Done():
-				return
-			case <-tk.C:
-				if _, err := wire.WritePublish(c, wire.PublishOpts{
-					Topic:   "flood/topic",
-					Payload: []byte("x"),
-					QoS:     0,
-				}); err != nil {
-					return
+			case req := <-h.cs.writeQueue:
+				if req.fn == nil {
+					continue
 				}
+				var buf strings.Builder
+				if _, err := req.fn(&writerTo{&buf}); err != nil {
+					h.t.Fatal(err)
+				}
+				h.pings = append(h.pings, now)
+				h.write(now)
+				if h.answer {
+					h.read(now)
+				}
+			default:
+				drained = true
 			}
 		}
-	}()
+		if h.traffic != nil {
+			h.traffic(now, h)
+		}
+		h.clk.Advance(step)
+	}
+}
 
-	for {
-		pkt, err := dec.ReadPacket()
-		if err != nil {
+// parked waits until the loop is blocked on its timer, or reports false
+// once the connection was declared dead.
+func (h *pingHarness) parked() bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-h.cs.dying:
+			if h.died.IsZero() {
+				h.died = h.clk.Now()
+			}
+			return false
+		default:
+		}
+		if h.clk.Pending() > 0 {
+			return true
+		}
+		time.Sleep(50 * time.Microsecond)
+	}
+	h.t.Fatal("ping loop neither parked nor died")
+	return false
+}
+
+type writerTo struct{ b *strings.Builder }
+
+func (w *writerTo) Write(p []byte) (int, error) { return w.b.Write(p) }
+
+// On an idle connection PINGREQs are never further apart than the
+// keep-alive, whatever the ping timeout.
+func TestKeepAliveIdleGapsWithinKeepAlive(t *testing.T) {
+	keep := 10 * time.Second
+	for _, timeout := range []time.Duration{100 * time.Millisecond, keep / 4, keep / 2, keep - time.Millisecond} {
+		t.Run(fmt.Sprint(timeout), func(t *testing.T) {
+			h := newPingHarness(t, keep, timeout)
+			h.run(2*time.Minute, 100*time.Millisecond)
+			if !h.died.IsZero() {
+				t.Fatalf("answered pings, yet declared dead at %v", h.died)
+			}
+			if len(h.pings) < 11 {
+				t.Fatalf("%d PINGREQs in 2 minutes", len(h.pings))
+			}
+			prev := time.Unix(1_000, 0)
+			for _, p := range h.pings {
+				if gap := p.Sub(prev); gap > keep {
+					t.Fatalf("PINGREQ gap %v exceeds keep-alive %v; pings %v", gap, keep, h.pings)
+				}
+				prev = p
+			}
+		})
+	}
+}
+
+// Traffic in both directions makes PINGREQ unnecessary.
+func TestKeepAliveBusyConnectionSendsNoPing(t *testing.T) {
+	h := newPingHarness(t, 10*time.Second, 2*time.Second)
+	h.traffic = func(now time.Time, h *pingHarness) {
+		h.write(now)
+		h.read(now)
+	}
+	h.run(time.Minute, time.Second)
+	if len(h.pings) != 0 {
+		t.Fatalf("%d PINGREQs on a busy connection", len(h.pings))
+	}
+}
+
+// Any inbound packet after a PINGREQ proves the broker alive: a stream of
+// PUBLISHes whose PINGRESPs are stuck behind the backlog must not tear
+// the connection down (estavelle RFC 0009 regression).
+func TestKeepAliveInboundTrafficCountsAsAnswer(t *testing.T) {
+	h := newPingHarness(t, 2*time.Second, time.Second)
+	h.answer = false
+	h.traffic = func(now time.Time, h *pingHarness) { h.read(now) }
+	h.run(30*time.Second, 100*time.Millisecond)
+	if !h.died.IsZero() {
+		t.Fatalf("declared dead at %v despite inbound traffic", h.died)
+	}
+	if len(h.pings) == 0 {
+		t.Fatal("outbound-idle connection sent no PINGREQ")
+	}
+}
+
+// A broker that answers nothing is detected one ping timeout after the
+// PINGREQ.
+func TestKeepAliveDetectsHalfOpen(t *testing.T) {
+	keep, timeout := 10*time.Second, 3*time.Second
+	h := newPingHarness(t, keep, timeout)
+	h.answer = false
+	h.run(time.Minute, 100*time.Millisecond)
+	if h.died.IsZero() {
+		t.Fatal("silent broker not detected")
+	}
+	if len(h.pings) != 1 {
+		t.Fatalf("%d PINGREQs before detection, want 1", len(h.pings))
+	}
+	if got := h.died.Sub(h.pings[0]); got < timeout || got > timeout+100*time.Millisecond {
+		t.Fatalf("detected %v after the PINGREQ, want %v", got, timeout)
+	}
+}
+
+// The broker's Server Keep Alive replaces the requested one.
+func TestServerKeepAliveOverridesRequested(t *testing.T) {
+	ka := uint16(2)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		if ci := c.AcceptConnect(wire.ConnackOpts{ServerKeepAlive: &ka}); ci.KeepAlive != 60 {
+			c.T.Errorf("CONNECT keep-alive %d", ci.KeepAlive)
+		}
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b)
+	if info, _ := cli.ServerInfo(); info.KeepAlive != 2 {
+		t.Fatalf("effective keep-alive %d, want the broker's 2", info.KeepAlive)
+	}
+	// With a 2 s keep-alive an idle connection must ping within ~2 s.
+	waitLogFor(t, b.Conn(0, time.Second), wire.PINGREQ, 1, 4*time.Second)
+}
+
+func waitLogFor(t *testing.T, conn *testbroker.Conn, pt wire.PacketType, n int, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		count := 0
+		for _, p := range conn.Log() {
+			if p.Type == pt {
+				count++
+			}
+		}
+		if count >= n {
 			return
 		}
-		// A SUBSCRIBE gets a SUBACK; a PINGREQ gets NOTHING (the
-		// PINGRESP is dropped, modelling one buried behind the inbound
-		// backlog); everything else is released.
-		if sub, ok := pkt.(*wire.Subscribe); ok {
-			id := sub.PacketID
-			pkt.Release()
-			_, _ = wire.WriteSuback(c, wire.SubackOpts{
-				PacketID:    id,
-				ReasonCodes: []wire.ReasonCode{wire.ReasonGrantedQoS0},
-			})
-			continue
-		}
-		pkt.Release()
+		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-// TestIdlePING_InboundFloodSuppressesFalseTimeout is the estavelle
-// RFC 0009 regression: a subscriber under a steady inbound stream whose
-// PINGRESP never lands in time must NOT self-disconnect — the fresh
-// inbound read window is definitive proof the broker is alive. Before
-// the fix this tore the connection down (pingResp < pingSent at the
-// deadline), which on the estavelle cross-node bench looked like ~20%
-// QoS 0 "loss": the subscriber vanished mid-run and the broker forwarded
-// to no one.
-func TestIdlePING_InboundFloodSuppressesFalseTimeout(t *testing.T) {
-	t.Parallel()
-	b := &streamingDropPingBroker{pubInterval: 5 * time.Millisecond}
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		b.serve(t, fb, c)
-	})
-
-	var downs atomic.Int32
-	var msgs atomic.Int32
-	cli, err := New(
-		WithBroker(fb.URL()),
-		WithKeepAlive(1),
-		WithPingTimeout(300*time.Millisecond),
-		WithReconnectBackoff(ConstantBackoff(time.Hour)),
-		WithOnConnectionDown(func() bool {
-			downs.Add(1)
-			return true
-		}),
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	ch, _, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "flood/topic"}})
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
-	go func() {
-		for range ch {
-			msgs.Add(1)
-		}
-	}()
-
-	// Hold across three keepalive+ping windows. The inbound stream keeps
-	// lastRead fresh the whole time, so a correct liveness check never
-	// fires OnConnectionDown despite the dropped PINGRESPs.
-	time.Sleep(3500 * time.Millisecond)
-
-	if n := downs.Load(); n != 0 {
-		t.Fatalf("connection falsely torn down %d time(s) under inbound flood — a fresh read window must suppress the PINGRESP timeout", n)
-	}
-	if n := msgs.Load(); n == 0 {
-		t.Fatal("no inbound messages received — the flood broker never streamed; test is not exercising the path")
-	}
-}
-
-// TestIdlePING_TimeoutStillDetectsHalfOpen verifies that the PINGRESP
-// timeout path still works after the rewrite: if the broker silently
-// drops PINGREQs, the connection is torn down within PingTimeout.
-func TestIdlePING_TimeoutStillDetectsHalfOpen(t *testing.T) {
-	t.Parallel()
-	pb := &pingCounterBroker{}
-	pb.dropPing.Store(true)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		pb.serve(t, fb, c)
-	})
-
-	downSignaled := make(chan struct{}, 1)
-	cli, err := New(
-		WithBroker(fb.URL()),
-		WithKeepAlive(1),
-		WithPingTimeout(300*time.Millisecond),
-		WithReconnectBackoff(ConstantBackoff(time.Hour)), // don't reconnect during the test
-		WithOnConnectionDown(func() bool {
-			select {
-			case downSignaled <- struct{}{}:
-			default:
-			}
-			return true
-		}),
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	// Wait for one keepalive + ping timeout window, plus generous slack.
-	select {
-	case <-downSignaled:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("OnConnectionDown not fired within 3s after broker dropped PINGRESP")
-	}
+	t.Fatalf("fewer than %d %s within %v", n, pt, d)
 }

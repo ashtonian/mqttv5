@@ -4,345 +4,652 @@ package mqttv5
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
-	"net"
+	"fmt"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ashtonian/mqttv5/internal/clock"
+	"github.com/ashtonian/mqttv5/internal/testbroker"
+	"github.com/ashtonian/mqttv5/session"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
-// ---------------- MemoryPublisherQueue ----------------
+// queueBroker answers PUBLISHes and records them. answer picks the
+// PUBACK/PUBREC reason for each; gate, when set, holds every answer
+// until it is closed.
+type queueBroker struct {
+	mu     sync.Mutex
+	got    []testbroker.Packet
+	held   []testbroker.Packet
+	open   bool
+	answer func(p testbroker.Packet) wire.ReasonCode
+	gate   chan struct{}
+	seen   chan testbroker.Packet
+}
 
-func TestMemoryQueueEnqueuePeekAck(t *testing.T) {
-	q := NewMemoryPublisherQueue()
-	ctx := context.Background()
+func newQueueBroker() *queueBroker {
+	return &queueBroker{seen: make(chan testbroker.Packet, 256)}
+}
 
-	for i := 0; i < 3; i++ {
-		err := q.Enqueue(ctx, QueueEntry{
-			Publish:    wire.PublishOpts{Topic: "t", Payload: []byte{byte(i)}, QoS: 1},
-			EnqueuedAt: time.Now(),
-		})
-		if err != nil {
-			t.Fatalf("Enqueue[%d]: %v", i, err)
+func (qb *queueBroker) serve(c *testbroker.Conn) {
+	if qb.gate != nil {
+		go func() {
+			select {
+			case <-qb.gate:
+			case <-c.Gone():
+				return
+			}
+			qb.mu.Lock()
+			qb.open = true
+			held := qb.held
+			qb.held = nil
+			qb.mu.Unlock()
+			for _, p := range held {
+				qb.reply(c, p)
+			}
+		}()
+	}
+	for {
+		p, ok, err := c.Next(time.Minute)
+		if !ok {
+			if errors.Is(err, testbroker.ErrTimeout) {
+				continue
+			}
+			return
 		}
-	}
-
-	n, _ := q.Len(ctx)
-	if n != 3 {
-		t.Fatalf("Len after 3 enqueues = %d, want 3", n)
-	}
-
-	entries, tokens, err := q.PeekBatch(ctx, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 3 {
-		t.Fatalf("PeekBatch returned %d entries, want 3", len(entries))
-	}
-	for i, e := range entries {
-		if e.Publish.Payload[0] != byte(i) {
-			t.Fatalf("entries[%d].Payload[0] = %d, want %d", i, e.Publish.Payload[0], i)
+		switch p.Type {
+		case wire.PUBLISH:
+			qb.mu.Lock()
+			qb.got = append(qb.got, p)
+			hold := qb.gate != nil && !qb.open
+			if hold {
+				qb.held = append(qb.held, p)
+			}
+			qb.mu.Unlock()
+			qb.seen <- p
+			if !hold {
+				qb.reply(c, p)
+			}
+		case wire.PUBREL:
+			c.Pubcomp(p.PacketID, wire.ReasonSuccess)
+		case wire.PINGREQ:
+			c.Write(wire.WritePingresp)
+		case wire.DISCONNECT:
+			return
 		}
-	}
-
-	if err := q.Ack(ctx, tokens[1]); err != nil {
-		t.Fatalf("Ack middle: %v", err)
-	}
-	n, _ = q.Len(ctx)
-	if n != 2 {
-		t.Fatalf("Len after mid-Ack = %d, want 2", n)
-	}
-
-	entries, _, _ = q.PeekBatch(ctx, 10)
-	if len(entries) != 2 || entries[0].Publish.Payload[0] != 0 || entries[1].Publish.Payload[0] != 2 {
-		t.Fatalf("after mid-Ack: entries payloads = %v", entryBytes(entries))
 	}
 }
 
-func TestMemoryQueueClosed(t *testing.T) {
-	q := NewMemoryPublisherQueue()
-	if err := q.Close(); err != nil {
-		t.Fatal(err)
+func (qb *queueBroker) reply(c *testbroker.Conn, p testbroker.Packet) {
+	rc := wire.ReasonSuccess
+	if qb.answer != nil {
+		rc = qb.answer(p)
 	}
-	err := q.Enqueue(context.Background(), QueueEntry{Publish: wire.PublishOpts{Topic: "t", QoS: 1}})
-	if !errors.Is(err, ErrQueueClosed) {
-		t.Fatalf("Enqueue after Close: got %v, want ErrQueueClosed", err)
+	if p.QoS == 1 {
+		c.Puback(p.PacketID, rc)
+	} else {
+		c.Pubrec(p.PacketID, rc)
 	}
 }
 
-func entryBytes(es []QueueEntry) []byte {
-	out := make([]byte, len(es))
-	for i, e := range es {
-		if len(e.Publish.Payload) > 0 {
-			out[i] = e.Publish.Payload[0]
-		}
+func (qb *queueBroker) payloads() []string {
+	qb.mu.Lock()
+	defer qb.mu.Unlock()
+	var out []string
+	for _, p := range qb.got {
+		out = append(out, string(p.Payload))
 	}
 	return out
 }
 
-// ---------------- QueuePublisher end-to-end ----------------
-
-func TestQueuePublisherRejectsQoS0(t *testing.T) {
-	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
-	q := NewMemoryPublisherQueue()
-	p, err := NewQueuePublisher(cli, q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close(context.Background())
-
-	err = p.Publish(context.Background(),
-		wire.PublishOpts{Topic: "t", QoS: 0, Payload: []byte("x")})
-	if !errors.Is(err, ErrQoS0NotQueueable) {
-		t.Fatalf("got %v, want ErrQoS0NotQueueable", err)
+func (qb *queueBroker) next(t *testing.T) testbroker.Packet {
+	t.Helper()
+	select {
+	case p := <-qb.seen:
+		return p
+	case <-time.After(3 * time.Second):
+		t.Fatal("broker received no PUBLISH")
+		return testbroker.Packet{}
 	}
 }
 
-func TestQueuePublisherEnqueuesWhileDisconnected(t *testing.T) {
-	// Client is constructed but never connected. Publish should
-	// return immediately after enqueue.
-	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
-	q := NewMemoryPublisherQueue()
-	p, err := NewQueuePublisher(cli, q)
+func newQueuePublisher(t *testing.T, cli *Client, q PublisherQueue, opts ...QueueOption) *QueuePublisher {
+	t.Helper()
+	p, err := NewQueuePublisher(cli, q, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close(context.Background())
-
-	for i := 0; i < 5; i++ {
-		if err := p.Publish(context.Background(),
-			wire.PublishOpts{Topic: "t", QoS: 1, Payload: []byte{byte(i)}}); err != nil {
-			t.Fatalf("Publish[%d]: %v", i, err)
-		}
-	}
-	n, _ := q.Len(context.Background())
-	if n != 5 {
-		t.Fatalf("Len after 5 enqueues = %d, want 5", n)
-	}
-}
-
-func TestQueuePublisherDrainsAfterConnect(t *testing.T) {
-	// Broker accepts CONNECT, captures PUBLISH packets and PUBACKs
-	// them. We enqueue 3 publishes BEFORE Connect, then Connect, and
-	// verify all three are drained.
-	received := make(chan string, 8)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		defer c.Close()
-		dec := wire.NewDecoder(c)
-		acceptConnect(t, c, dec)
-		for {
-			pkt, err := dec.ReadPacket()
-			if err != nil {
-				return
-			}
-			pub, ok := pkt.(*wire.Publish)
-			if !ok {
-				pkt.Release()
-				continue
-			}
-			topic := pub.Topic
-			id := pub.PacketID
-			pkt.Release()
-			received <- topic
-			if id != 0 {
-				_, _ = wire.WritePuback(c, wire.PubRespOpts{
-					PacketID: id, ReasonCode: wire.ReasonSuccess,
-				})
-			}
-		}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = p.Close(ctx)
 	})
+	return p
+}
 
-	cli, _ := New(
-		WithBroker(fb.URL()),
-		WithClientID("queue-publisher-test"),
-	)
-	q := NewMemoryPublisherQueue()
-	p, err := NewQueuePublisher(cli, q, WithQueueBatchSize(8))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close(context.Background())
-
-	for i := 0; i < 3; i++ {
-		if err := p.Publish(context.Background(),
-			wire.PublishOpts{Topic: "sport/scores", QoS: 1, Payload: []byte{byte(i)}}); err != nil {
-			t.Fatalf("Publish[%d]: %v", i, err)
+func enqueueAll(t *testing.T, p *QueuePublisher, qos byte, payloads ...string) {
+	t.Helper()
+	for _, s := range payloads {
+		if err := p.Publish(context.Background(), PublishOptions{Topic: "q/t", QoS: qos, Payload: []byte(s)}); err != nil {
+			t.Fatalf("Publish(%s): %v", s, err)
 		}
 	}
+}
 
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	for i := 0; i < 3; i++ {
-		select {
-		case got := <-received:
-			if got != "sport/scores" {
-				t.Fatalf("received[%d] = %q, want sport/scores", i, got)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("only received %d/3 publishes within 3s", i)
-		}
-	}
-
-	// Queue should now be empty.
-	deadline := time.Now().Add(time.Second)
+func waitQueueLen(t *testing.T, q PublisherQueue, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
 	for {
-		n, _ := q.Len(context.Background())
-		if n == 0 {
-			break
+		got, err := q.Len(context.Background())
+		if err == nil && got == n {
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("queue still has %d entries after broker acked all", n)
+			t.Fatalf("queue length %d (%v), want %d", got, err, n)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 }
 
-func TestQueuePublisherTTLDropsAndDeadLetters(t *testing.T) {
-	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
-	q := NewMemoryPublisherQueue()
+type deadLetters struct {
+	mu   sync.Mutex
+	list []string
+	errs []error
+}
 
-	var dlCount atomic.Int32
-	var lastErr atomic.Value
-	dl := func(_ QueueEntry, err error) {
-		dlCount.Add(1)
-		lastErr.Store(err)
-	}
-	p, err := NewQueuePublisher(cli, q,
-		WithQueueTTL(50*time.Millisecond),
-		WithDeadLetter(dl),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close(context.Background())
+func (d *deadLetters) record(e QueueEntry, err error) {
+	d.mu.Lock()
+	d.list = append(d.list, string(e.Publish.Payload))
+	d.errs = append(d.errs, err)
+	d.mu.Unlock()
+}
 
-	// Enqueue an entry, then wait past TTL.
-	if err := p.Publish(context.Background(),
-		wire.PublishOpts{Topic: "x", QoS: 1, Payload: []byte("aged")}); err != nil {
-		t.Fatal(err)
-	}
+func (d *deadLetters) get() ([]string, []error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.list), slices.Clone(d.errs)
+}
 
-	// The drain ticker is set to 500ms by default — but the entry will
-	// remain in the queue until drain runs (the client is never
-	// connected, so nothing publishes). After the ticker fires, the
-	// drain DOES check TTL even when not connected... actually it
-	// doesn't, because the inner loop bails on !Connected. So this
-	// test verifies that — the entry stays around without being
-	// dead-lettered while the client is offline.
-	time.Sleep(200 * time.Millisecond)
-	n, _ := q.Len(context.Background())
-	if n != 1 {
-		t.Fatalf("Len while offline = %d, want 1 (TTL must not fire without Connected)", n)
+func TestQueuePublisherRejectsInvalidMessages(t *testing.T) {
+	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"), WithLogger(quietLogger()))
+	p := newQueuePublisher(t, cli, NewMemoryPublisherQueue())
+	for _, tt := range []struct {
+		opts PublishOptions
+		want error
+	}{
+		{PublishOptions{Topic: "t", QoS: 0}, ErrQoS0NotQueueable},
+		{PublishOptions{Topic: "t/#", QoS: 1}, ErrInvalidTopic},
+		{PublishOptions{Topic: "t", QoS: 1, TopicAlias: 2}, ErrTopicAliasInvalid},
+	} {
+		if err := p.Publish(context.Background(), tt.opts); !errors.Is(err, tt.want) {
+			t.Errorf("Publish(%+v) = %v, want %v", tt.opts, err, tt.want)
+		}
 	}
-	if dlCount.Load() != 0 {
-		t.Fatalf("dead-letter fired %d times while offline, want 0", dlCount.Load())
+	if n, _ := p.queue.Len(context.Background()); n != 0 {
+		t.Fatalf("%d invalid messages queued", n)
 	}
 }
 
-// TestQueuePublisherMessageExpiryMirror checks that WithQueueTTL also
-// populates wire.PublishOpts.MessageExpiryInterval so the broker can
-// enforce TTL once we hand off. No broker round-trip needed — we
-// inspect the entry stored in the queue.
-func TestQueuePublisherMessageExpiryMirror(t *testing.T) {
-	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
+// Up to the window is in flight at once, sent in queue order.
+func TestQueuePublisherPipelines(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	cli := tbClient(t, b)
 	q := NewMemoryPublisherQueue()
-	p, err := NewQueuePublisher(cli, q, WithQueueTTL(30*time.Second))
-	if err != nil {
-		t.Fatal(err)
+	p := newQueuePublisher(t, cli, q, WithQueueWindow(8))
+	var want []string
+	for i := range 20 {
+		want = append(want, fmt.Sprint(i))
 	}
-	defer p.Close(context.Background())
+	enqueueAll(t, p, 1, want...)
 
-	if err := p.Publish(context.Background(),
-		wire.PublishOpts{Topic: "x", QoS: 1, Payload: []byte("hi")}); err != nil {
-		t.Fatal(err)
+	for range 8 {
+		qb.next(t)
 	}
-
-	entries, _, err := q.PeekBatch(context.Background(), 1)
-	if err != nil {
-		t.Fatal(err)
+	select {
+	case extra := <-qb.seen:
+		t.Fatalf("PUBLISH %q beyond the window of 8 before any PUBACK", extra.Payload)
+	case <-time.After(100 * time.Millisecond):
 	}
-	if len(entries) != 1 {
-		t.Fatalf("PeekBatch len = %d, want 1", len(entries))
-	}
-	mei := entries[0].Publish.MessageExpiryInterval
-	if mei == nil {
-		t.Fatal("MessageExpiryInterval not set — WithQueueTTL should mirror into property")
-	}
-	if *mei != 30 {
-		t.Fatalf("MessageExpiryInterval = %d, want 30", *mei)
+	close(qb.gate)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, want) {
+		t.Fatalf("broker received %q, want %q", got, want)
 	}
 }
 
-func TestQueuePublisherMaxSizeDropNewest(t *testing.T) {
-	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
+// A refusal that cannot pass is dead-lettered once and does not
+// hold up the messages behind it.
+func TestQueuePublisherDeadLettersPermanentRefusal(t *testing.T) {
+	qb := newQueueBroker()
+	qb.answer = func(p testbroker.Packet) wire.ReasonCode {
+		if string(p.Payload) == "bad" {
+			return wire.ReasonNotAuthorized
+		}
+		return wire.ReasonSuccess
+	}
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	var dl deadLetters
 	q := NewMemoryPublisherQueue()
-	p, err := NewQueuePublisher(cli, q, WithQueueMaxSize(2))
+	p := newQueuePublisher(t, tbClient(t, b), q, WithDeadLetter(dl.record))
+	enqueueAll(t, p, 1, "bad", "good")
+	waitQueueLen(t, q, 0)
+	got, errs := dl.get()
+	if !slices.Equal(got, []string{"bad"}) || !errors.Is(errs[0], ErrNotAuthorized) {
+		t.Fatalf("dead letters %q %v", got, errs)
+	}
+	if payloads := qb.payloads(); !slices.Equal(payloads, []string{"bad", "good"}) {
+		t.Fatalf("broker received %q", payloads)
+	}
+}
+
+// A refusal that may pass is retried after the backoff.
+func TestQueuePublisherRetriesPassingRefusal(t *testing.T) {
+	qb := newQueueBroker()
+	var attempts int
+	qb.answer = func(p testbroker.Packet) wire.ReasonCode {
+		if string(p.Payload) == "busy" {
+			attempts++
+			if attempts == 1 {
+				return wire.ReasonQuotaExceeded
+			}
+		}
+		return wire.ReasonSuccess
+	}
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	var dl deadLetters
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, tbClient(t, b), q, WithDeadLetter(dl.record), WithQueueRetryBackoff(ConstantBackoff(time.Millisecond)))
+	enqueueAll(t, p, 2, "busy", "next")
+	waitQueueLen(t, q, 0)
+	if got, _ := dl.get(); len(got) != 0 {
+		t.Fatalf("dead-lettered %q", got)
+	}
+	if got := qb.payloads(); len(got) != 3 || slices.Index(got, "next") < 0 || got[0] != "busy" {
+		t.Fatalf("broker received %q, want busy twice and next once", got)
+	}
+}
+
+// A slow broker never makes the publisher start a second exchange
+// for the same message.
+func TestQueuePublisherOneExchangePerMessage(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, tbClient(t, b), q)
+	enqueueAll(t, p, 2, "slow")
+	qb.next(t)
+	select {
+	case again := <-qb.seen:
+		t.Fatalf("second PUBLISH %+v while the first was unanswered", again)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(qb.gate)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); len(got) != 1 {
+		t.Fatalf("broker received %q", got)
+	}
+}
+
+// Constructing a publisher never removes queued entries.
+func TestQueuePublisherConstructionKeepsEntries(t *testing.T) {
+	q := NewMemoryPublisherQueue()
+	if _, _, err := q.Enqueue(context.Background(), QueueEntry{ID: "kept", Publish: PublishOptions{Topic: "t", QoS: 1}}, QueueLimit{}); err != nil {
+		t.Fatal(err)
+	}
+	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"), WithLogger(quietLogger()))
+	newQueuePublisher(t, cli, q, WithQueueDropPolicy(DropOldest), WithQueueMaxSize(1))
+	if n, _ := q.Len(context.Background()); n != 1 {
+		t.Fatalf("queue length %d after construction, want 1", n)
+	}
+}
+
+// DropOldest evicts only messages not yet being published.
+func TestQueuePublisherDropOldestSparesInFlight(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	var dl deadLetters
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, tbClient(t, b), q, WithQueueWindow(2), WithQueueMaxSize(3),
+		WithQueueDropPolicy(DropOldest), WithDeadLetter(dl.record))
+	enqueueAll(t, p, 1, "0", "1")
+	qb.next(t)
+	qb.next(t)
+	enqueueAll(t, p, 1, "2", "3", "4", "5")
+	got, errs := dl.get()
+	if !slices.Equal(got, []string{"2", "3", "4"}) || !errors.Is(errs[0], ErrQueueFull) {
+		t.Fatalf("evicted %q %v, want 2, 3 and 4 with ErrQueueFull", got, errs)
+	}
+	close(qb.gate)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"0", "1", "5"}) {
+		t.Fatalf("broker received %q", got)
+	}
+}
+
+// A message carries the lifetime it has left, and one that ran out
+// while queued is dead-lettered instead of sent.
+func TestQueuePublisherSendsRemainingLifetime(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	clk := clock.NewFake(time.Unix(1_000, 0))
+	cli, err := New(WithBroker(b.URL()), WithClientID("ttl"), WithLogger(quietLogger()), withClock(clk))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close(context.Background())
-
-	for i := 0; i < 2; i++ {
-		if err := p.Publish(context.Background(),
-			wire.PublishOpts{Topic: "t", QoS: 1, Payload: []byte{byte(i)}}); err != nil {
+	var dl deadLetters
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, cli, q, WithQueueTTL(time.Minute), WithDeadLetter(dl.record))
+	ctx := context.Background()
+	own, short := uint32(30), uint32(10)
+	for _, m := range []struct {
+		payload string
+		expiry  *uint32
+	}{{"ttl", nil}, {"own", &own}, {"short", &short}} {
+		if err := p.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte(m.payload), MessageExpiryInterval: m.expiry}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	err = p.Publish(context.Background(),
-		wire.PublishOpts{Topic: "t", QoS: 1, Payload: []byte("overflow")})
-	if !errors.Is(err, ErrQueueFull) {
-		t.Fatalf("got %v, want ErrQueueFull", err)
+	clk.Advance(25 * time.Second)
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	waitQueueLen(t, q, 0)
+
+	expiry := map[string]uint32{}
+	qb.mu.Lock()
+	for _, pk := range qb.got {
+		v, _ := pk.Properties().Uint32(wire.PropMessageExpiryInterval)
+		expiry[string(pk.Payload)] = v
+	}
+	qb.mu.Unlock()
+	if len(expiry) != 2 || expiry["ttl"] != 35 || expiry["own"] != 5 {
+		t.Fatalf("Message Expiry sent %v, want ttl 35 and own 5", expiry)
+	}
+	if got, errs := dl.get(); !slices.Equal(got, []string{"short"}) || !errors.Is(errs[0], ErrMessageExpired) {
+		t.Fatalf("dead letters %q %v", got, errs)
 	}
 }
 
-// TestQueuePublisherDropOldestEvicts verifies that
-// WithQueueDropPolicy(DropOldest) calls EvictHead on the backing
-// queue when the cap is reached, dead-letters the evicted entry,
-// and lets the new Publish succeed.
-func TestQueuePublisherDropOldestEvicts(t *testing.T) {
-	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"))
-	q := NewMemoryPublisherQueue()
-	var dropped []QueueEntry
-	var dropMu sync.Mutex
-	dl := func(e QueueEntry, _ error) {
-		dropMu.Lock()
-		dropped = append(dropped, e)
-		dropMu.Unlock()
-	}
-	p, err := NewQueuePublisher(cli, q,
-		WithQueueMaxSize(2),
-		WithQueueDropPolicy(DropOldest),
-		WithDeadLetter(dl),
-	)
-	if err != nil {
-		t.Fatalf("NewQueuePublisher: %v", err)
-	}
-	defer p.Close(context.Background())
+// A restarted process continues the exchange its predecessor started
+// instead of publishing the message again.
+func TestQueuePublisherContinuesExchangeAfterRestart(t *testing.T) {
+	for _, qos := range []byte{1, 2} {
+		t.Run(fmt.Sprint("qos", qos), func(t *testing.T) {
+			first := make(chan testbroker.Packet, 1)
+			resumed := make(chan []testbroker.Packet, 1)
+			b := testbroker.New(t,
+				func(c *testbroker.Conn) {
+					c.AcceptConnect(wire.ConnackOpts{})
+					p := c.Expect(wire.PUBLISH, 0)
+					if qos == 2 {
+						c.Pubrec(p.PacketID, wire.ReasonSuccess) // the restart finds it at AwaitPubcomp
+						c.Expect(wire.PUBREL, 0)
+					}
+					first <- p
+					<-c.Gone()
+				},
+				func(c *testbroker.Conn) {
+					c.AcceptConnect(wire.ConnackOpts{SessionPresent: true})
+					var got []testbroker.Packet
+					p, _ := c.Await(map[byte]wire.PacketType{1: wire.PUBLISH, 2: wire.PUBREL}[qos], 0)
+					got = append(got, p)
+					if qos == 1 {
+						c.Puback(p.PacketID, wire.ReasonSuccess)
+					} else {
+						c.Pubcomp(p.PacketID, wire.ReasonSuccess)
+					}
+					if extra, ok := c.Await(wire.PUBLISH, 300*time.Millisecond); ok {
+						got = append(got, extra)
+					}
+					resumed <- got
+					c.ServeAuto()
+				},
+			)
+			st := session.NewMemoryStore()
+			q := NewMemoryPublisherQueue()
+			var dl deadLetters
 
-	for i := 0; i < 3; i++ {
-		if err := p.Publish(context.Background(), wire.PublishOpts{
-			Topic: "drop/oldest", QoS: 1, Payload: []byte{byte(i)},
-		}); err != nil {
-			t.Fatalf("Publish[%d]: %v", i, err)
+			cli1 := tbClient(t, b, WithStore(st))
+			p1, err := NewQueuePublisher(cli1, q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enqueueAll(t, p1, qos, "once")
+			sent := <-first
+			// The process dies: its client and publisher stop; the store and
+			// queue keep what they hold.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := cli1.Disconnect(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			cli2 := tbClient(t, b, WithStore(st))
+			newQueuePublisher(t, cli2, q, WithDeadLetter(dl.record))
+			got := <-resumed
+			waitQueueLen(t, q, 0)
+			if len(got) != 1 || got[0].PacketID != sent.PacketID || (qos == 1 && !got[0].Dup) {
+				t.Fatalf("after the restart the broker received %+v; want only the resent %s for packet %d",
+					got, map[byte]string{1: "PUBLISH (DUP)", 2: "PUBREL"}[qos], sent.PacketID)
+			}
+			if letters, _ := dl.get(); len(letters) != 0 {
+				t.Fatalf("dead letters %q", letters)
+			}
+		})
+	}
+}
+
+// When the broker lost the session the message is published again, once.
+func TestQueuePublisherRepublishesAfterSessionLoss(t *testing.T) {
+	again := make(chan []testbroker.Packet, 1)
+	b := testbroker.New(t,
+		func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{})
+			c.Expect(wire.PUBLISH, 0)
+			<-c.Gone()
+		},
+		func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{})
+			var got []testbroker.Packet
+			for {
+				p, ok := c.Await(wire.PUBLISH, 300*time.Millisecond)
+				if !ok {
+					break
+				}
+				got = append(got, p)
+				c.Puback(p.PacketID, wire.ReasonSuccess)
+			}
+			again <- got
+			c.ServeAuto()
+		},
+	)
+	q := NewMemoryPublisherQueue()
+	cli := tbClient(t, b, WithSessionLossPolicy(SessionLossFail))
+	p := newQueuePublisher(t, cli, q)
+	enqueueAll(t, p, 1, "m")
+	waitLog(t, b.Conn(0, time.Second), wire.PUBLISH, 1)
+	b.Conn(0, 0).Close()
+	got := <-again
+	waitQueueLen(t, q, 0)
+	if len(got) != 1 || got[0].Dup || string(got[0].Payload) != "m" {
+		t.Fatalf("after the session loss the broker received %+v; want one new PUBLISH", got)
+	}
+}
+
+// A message the broker's limits rule out is dead-lettered, not retried.
+func TestQueuePublisherDeadLettersWhatTheBrokerCannotTake(t *testing.T) {
+	zero := byte(0)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{MaximumQoS: &zero})
+		c.ServeAuto()
+	})
+	var dl deadLetters
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, tbClient(t, b), q, WithDeadLetter(dl.record))
+	enqueueAll(t, p, 1, "qos1")
+	waitQueueLen(t, q, 0)
+	if got, errs := dl.get(); !slices.Equal(got, []string{"qos1"}) || !errors.Is(errs[0], ErrQoSNotSupported) {
+		t.Fatalf("dead letters %q %v", got, errs)
+	}
+}
+
+// The idempotency key carries the entry's ID; the queued copy is the
+// publisher's own.
+func TestQueuePublisherIdempotencyKeyAndOwnership(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, tbClient(t, b), q, WithQueueIdempotencyKey())
+	payload := []byte("orig")
+	if err := p.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	payload[0] = 'X'
+	got := qb.next(t)
+	close(qb.gate)
+	if string(got.Payload) != "orig" {
+		t.Fatalf("broker received %q after the caller reused its buffer", got.Payload)
+	}
+	var key string
+	for k, v := range got.Properties().UserProperties() {
+		if k == QueueIDProperty {
+			key = v
 		}
 	}
+	if b, err := hex.DecodeString(key); err != nil || len(b) != 16 {
+		t.Fatalf("%s = %q, want 32 hex digits", QueueIDProperty, key)
+	}
+}
 
-	n, _ := q.Len(context.Background())
-	if n != 2 {
-		t.Errorf("Len = %d after enqueue overflow, want 2", n)
+// BenchmarkQueuePublisherRTT drains a backlog through a broker that
+// answers each PUBLISH one round trip after receiving it, and reports
+// messages per second. With a window of W the drain approaches W/RTT.
+func BenchmarkQueuePublisherRTT(b *testing.B) {
+	for _, rtt := range []time.Duration{25 * time.Millisecond, 300 * time.Millisecond} {
+		for _, window := range []int{1, 16, 32} {
+			b.Run(fmt.Sprintf("rtt=%v/window=%d", rtt, window), func(b *testing.B) {
+				broker := testbroker.New(b, func(c *testbroker.Conn) {
+					c.AcceptConnect(wire.ConnackOpts{})
+					for {
+						p, ok, err := c.Next(time.Minute)
+						if !ok {
+							if errors.Is(err, testbroker.ErrTimeout) {
+								continue
+							}
+							return
+						}
+						if p.Type == wire.PUBLISH {
+							time.AfterFunc(rtt, func() { c.Puback(p.PacketID, wire.ReasonSuccess) })
+						}
+					}
+				})
+				cli, err := New(WithBroker(broker.URL()), WithClientID("rtt"), WithLogger(quietLogger()))
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := cli.Connect(context.Background()); err != nil {
+					b.Fatal(err)
+				}
+				defer cli.Disconnect(context.Background())
+				q := NewMemoryPublisherQueue()
+				p, err := NewQueuePublisher(cli, q, WithQueueWindow(window))
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer p.Close(context.Background())
+				n := max(b.N, 2*window)
+				b.ResetTimer()
+				start := time.Now()
+				for i := range n {
+					if err := p.Publish(context.Background(), PublishOptions{Topic: "rtt", QoS: 1, Payload: []byte{byte(i)}}); err != nil {
+						b.Fatal(err)
+					}
+				}
+				for {
+					if l, _ := q.Len(context.Background()); l == 0 {
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+				b.ReportMetric(float64(n)/time.Since(start).Seconds(), "msg/s")
+			})
+		}
 	}
-	dropMu.Lock()
-	defer dropMu.Unlock()
-	if len(dropped) != 1 {
-		t.Fatalf("dead-letter count = %d, want 1", len(dropped))
+}
+
+// A bounded queue whose head stays unacknowledged keeps memory for what
+// it holds, not for every message acknowledged behind the head.
+func TestMemoryQueueReclaimsAckedEntriesBehindTheHead(t *testing.T) {
+	q := NewMemoryPublisherQueue()
+	ctx := context.Background()
+	limit := QueueLimit{Max: 2}
+	if _, _, err := q.Enqueue(ctx, QueueEntry{ID: "head", Publish: PublishOptions{Topic: "q", QoS: 1}}, limit); err != nil {
+		t.Fatal(err)
 	}
-	if len(dropped[0].Publish.Payload) != 1 || dropped[0].Publish.Payload[0] != 0 {
-		t.Errorf("evicted payload = %v, want [0] (oldest)", dropped[0].Publish.Payload)
+	var seqs []uint64
+	payload := make([]byte, 64<<10)
+	for range 400 {
+		seq, _, err := q.Enqueue(ctx, QueueEntry{ID: "tail", Publish: PublishOptions{Topic: "q", QoS: 1, Payload: payload}}, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, seq)
+		if err := q.Ack(ctx, seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q.mu.Lock()
+	kept, referenced := len(q.entries)-q.head, 0
+	for _, e := range q.entries[q.head:] {
+		referenced += len(e.e.Publish.Payload)
+	}
+	q.mu.Unlock()
+	if kept > 70 || referenced != 0 {
+		t.Fatalf("after acking 400 entries behind the head the queue keeps %d slots referencing %d payload bytes", kept, referenced)
+	}
+	// Order and lookups survive the reclaiming.
+	if _, _, err := q.Enqueue(ctx, QueueEntry{ID: "last", Publish: PublishOptions{Topic: "q", QoS: 1}}, limit); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Peek(ctx, 0, 10)
+	if err != nil || len(got) != 2 || got[0].ID != "head" || got[1].ID != "last" {
+		t.Fatalf("Peek after reclaiming: %+v, %v", got, err)
+	}
+	if err := q.Ack(ctx, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := q.Len(ctx); n != 2 {
+		t.Fatalf("Len %d, want 2", n)
 	}
 }

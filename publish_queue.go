@@ -3,317 +3,323 @@
 package mqttv5
 
 import (
+	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/ashtonian/mqttv5/internal/clock"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
-// Errors returned by the [QueuePublisher] / [PublisherQueue] surface.
-var (
-	// ErrQueueClosed is returned by Enqueue / Publish after Close.
-	ErrQueueClosed = errors.New("mqttv5: queue is closed")
+// ErrQoS0NotQueueable is returned by [QueuePublisher.Publish] for a QoS 0
+// message: with no acknowledgement there is nothing to keep it queued
+// for.
+var ErrQoS0NotQueueable = errors.New("mqttv5: QueuePublisher requires QoS >= 1")
 
-	// ErrQueueFull is returned by [QueuePublisher.Publish] when the
-	// queue is at its [WithQueueMaxSize] cap and DropNewest is in
-	// effect.
-	ErrQueueFull = errors.New("mqttv5: queue is full")
+// QueueIDProperty is the user property [WithQueueIdempotencyKey] adds to
+// each queued message, holding its [QueueEntry.ID].
+const QueueIDProperty = "mqttv5-msg-id"
 
-	// ErrQoS0NotQueueable is returned when a QoS 0 publish reaches
-	// [QueuePublisher.Publish] — durable enqueue is meaningless when
-	// the broker has no delivery obligation.
-	ErrQoS0NotQueueable = errors.New("mqttv5: QueuePublisher requires QoS >= 1")
-
-	// ErrEvictionNotSupported is returned by
-	// [PublisherQueue.EvictHead] for backends that cannot evict
-	// (append-only disk queues, etc.). [NewQueuePublisher] surfaces
-	// this at construct time when [DropOldest] is requested.
-	ErrEvictionNotSupported = errors.New("mqttv5: queue backend does not support eviction")
-)
-
-// Default values used by NewQueuePublisher when QueueOptions leave a
-// field unset.
 const (
-	// DefaultQueueBatchSize caps the per-PeekBatch entry count.
-	DefaultQueueBatchSize = 16
-
-	// DefaultQueueIdleInterval is the drain-loop wakeup tick when no
-	// Enqueue signals have arrived. Lower values reduce the worst-
-	// case latency to pick up restored entries; higher values reduce
-	// wakeup cost.
-	DefaultQueueIdleInterval = 500 * time.Millisecond
-
-	// DefaultQueuePublishTimeout caps each per-message broker
-	// handshake (ack wait) inside the drain loop.
-	DefaultQueuePublishTimeout = 30 * time.Second
+	// DefaultQueueWindow is how many queued messages a QueuePublisher
+	// publishes at once when [WithQueueWindow] is not set.
+	DefaultQueueWindow = 32
 )
 
-// QueueEntry is one durable publish in flight between Publish
-// (enqueue) and broker PUBACK (Ack). The drain loop sets PacketID
-// and Dup per attempt; values in Publish are ignored.
-type QueueEntry struct {
-	Publish    wire.PublishOpts
-	EnqueuedAt time.Time
-}
+// DefaultQueueRetryBackoff spaces the attempts of a message whose
+// publish failed for a reason that may pass (a refusal such as 0x97
+// Quota exceeded, a store error).
+var DefaultQueueRetryBackoff = ExponentialBackoff(time.Second, time.Minute, 500*time.Millisecond)
 
-// QueueToken identifies one entry. Opaque to QueuePublisher —
-// implementations choose whatever value lets Ack remove the exact
-// entry PeekBatch returned (sequence number, byte offset, etc.).
-type QueueToken any
-
-// PublisherQueue is the durable backing store for QueuePublisher.
-// Implementations may be in-memory or disk-backed. Every method must
-// be safe for concurrent use.
-type PublisherQueue interface {
-	// Enqueue durably stores entry. Returns ErrQueueClosed after Close.
-	Enqueue(ctx context.Context, entry QueueEntry) error
-
-	// PeekBatch returns up to n oldest entries without removing them.
-	// The tokens slice is parallel to entries; the caller passes each
-	// token to Ack to mark the entry delivered. An empty result with
-	// nil error means "queue is empty right now".
-	PeekBatch(ctx context.Context, n int) (entries []QueueEntry, tokens []QueueToken, err error)
-
-	// Ack removes the entry identified by token. Acking an unknown
-	// token is a no-op (an entry already removed via another path).
-	Ack(ctx context.Context, token QueueToken) error
-
-	// EvictHead removes the oldest entry and returns it. Returns
-	// (zero, false, nil) when the queue is empty. Implementations
-	// that cannot evict the head out-of-band return
-	// ErrEvictionNotSupported and the caller must use DropNewest.
-	EvictHead(ctx context.Context) (QueueEntry, bool, error)
-
-	// Len returns the current entry count.
-	Len(ctx context.Context) (int, error)
-
-	// Close releases any underlying resources. After Close, subsequent
-	// Enqueue calls must return ErrQueueClosed.
-	Close() error
-}
-
-// QueuePublisher durably enqueues publishes and drains them to the
-// broker in order from a background goroutine. [QueuePublisher.Publish]
-// returns once the entry is stored, before the broker round-trip.
-// For crash safety, pair the queue/file submodule with the
-// store/file submodule (in-flight ack state) — independent layers.
+// QueuePublisher accepts QoS 1/2 messages into a [PublisherQueue] and
+// publishes them in the background, many at a time.
+//
+// [QueuePublisher.Publish] returns once the message is stored. A drain
+// goroutine keeps up to [WithQueueWindow] messages in flight, in queue
+// order, while the client is connected, and removes each from the queue
+// when the broker has accepted it. A refusal that cannot pass (see
+// [WithQueueClassifier]) and a message that expired go to the
+// [WithDeadLetter] callback and are removed; other failures are retried
+// with [WithQueueRetryBackoff], after the messages behind them if need
+// be, so one bad message never holds up the rest.
+//
+// Each message has one MQTT exchange at a time. Its [QueueEntry.ID] is
+// stored with the exchange in the client's session ([WithStore]), and the
+// message is removed from the queue before the session record, so with
+// a persistent queue and store a restarted process continues an
+// interrupted exchange instead of publishing the message again:
+// QoS 2 stays exactly-once across a crash, and QoS 1 is at most resent
+// with DUP=1. When removing a finished message from the queue fails, the
+// session keeps the exchange's record and the removal is retried with
+// [WithQueueRetryBackoff], in this process or after a restart, without
+// publishing the message again. A message is published again as new only
+// when the broker lost the session (see [SessionLossPolicy]).
+//
+// The QueuePublisher publishes on the client's own connection, never
+// through [WithPublisherPool].
 type QueuePublisher struct {
 	client *Client
 	queue  PublisherQueue
 	cfg    queueConfig
 	logger *slog.Logger
+	clk    clock.Clock
+
+	// claimMu keeps DropOldest from evicting an entry the drain has
+	// claimed: Publish holds it shared around Enqueue, the drain
+	// exclusively while it peeks and advances claimed.
+	claimMu sync.RWMutex
+	claimed uint64 // highest Seq handed to pending
+
+	mu      sync.Mutex
+	pending map[uint64]*queuedMessage // claimed and unfinished, at most cfg.window
 
 	notify    chan struct{}
+	closing   chan struct{}
+	done      chan struct{}
+	ctx       context.Context // canceled by Close
+	cancel    context.CancelFunc
 	closeOnce sync.Once
-	closeCh   chan struct{}
-	doneCh    chan struct{}
+	settling  sync.WaitGroup // exchanges whose outcome is still to come
 }
 
-// queueConfig holds resolved QueuePublisher options.
+type queuedMessage struct {
+	entry    QueueEntry
+	inFlight bool      // an exchange is running
+	attempts int       // exchanges started, or outcomes recorded again, in this process
+	retryAt  time.Time // when to start the next; zero: once connected
+	// accepted and deadLettered are set once the broker accepted the
+	// message or it was passed to the dead-letter callback, so retrying a
+	// failed removal does neither twice.
+	accepted     bool
+	deadLettered bool
+}
+
 type queueConfig struct {
-	batchSize      int
-	maxSize        int
-	dropPolicy     DropPolicy
-	ttl            time.Duration
-	deadLetter     func(QueueEntry, error)
-	idleInterval   time.Duration
-	publishTimeout time.Duration
-}
-
-func defaultQueueConfig() queueConfig {
-	return queueConfig{
-		batchSize:      DefaultQueueBatchSize,
-		dropPolicy:     DropNewest,
-		idleInterval:   DefaultQueueIdleInterval,
-		publishTimeout: DefaultQueuePublishTimeout,
-	}
+	window      int
+	maxSize     int
+	dropPolicy  DropPolicy
+	ttl         time.Duration
+	deadLetter  func(QueueEntry, error)
+	permanent   func(error) bool
+	backoff     Backoff
+	idempotency bool
 }
 
 // QueueOption customises a QueuePublisher.
 type QueueOption func(*queueConfig)
 
-// WithQueueBatchSize caps the number of entries the drain goroutine
-// pulls in one PeekBatch. Default 16.
-func WithQueueBatchSize(n int) QueueOption {
-	return func(c *queueConfig) {
-		if n > 0 {
-			c.batchSize = n
-		}
-	}
+// WithQueueWindow sets how many messages are published at once.
+// Default [DefaultQueueWindow]; the broker's Receive Maximum still
+// applies on top.
+func WithQueueWindow(n int) QueueOption {
+	return func(c *queueConfig) { c.window = n }
 }
 
-// WithQueueMaxSize bounds the queue. At capacity, Publish either returns
-// ErrQueueFull (DropNewest) or evicts the oldest entry via EvictHead
-// (DropOldest — see WithQueueDropPolicy).
+// WithQueueMaxSize bounds the queue at n entries; at the bound
+// [WithQueueDropPolicy] decides. 0 (default) means unbounded.
 func WithQueueMaxSize(n int) QueueOption {
-	return func(c *queueConfig) {
-		if n >= 0 {
-			c.maxSize = n
-		}
-	}
+	return func(c *queueConfig) { c.maxSize = n }
 }
 
-// WithQueueDropPolicy controls full-queue behaviour. DropNewest
-// (default) returns ErrQueueFull from Publish when the queue is at
-// capacity. DropOldest evicts the oldest entry via
-// PublisherQueue.EvictHead and dead-letters it (if a callback is
-// registered) before enqueuing the new one. Backends that cannot
-// evict (return ErrEvictionNotSupported) cause NewQueuePublisher to
-// fail rather than silently downgrade.
+// WithQueueDropPolicy decides what Publish does when the queue is at
+// [WithQueueMaxSize]: [DropNewest] (default) returns [ErrQueueFull];
+// [DropOldest] removes the oldest messages not yet being published,
+// passes them to the dead-letter callback with ErrQueueFull, and stores
+// the new one.
 func WithQueueDropPolicy(p DropPolicy) QueueOption {
-	return func(c *queueConfig) {
-		c.dropPolicy = p
-	}
+	return func(c *queueConfig) { c.dropPolicy = p }
 }
 
-// WithQueueIdleInterval overrides the drain loop's idle-tick
-// wakeup. Default DefaultQueueIdleInterval.
-func WithQueueIdleInterval(d time.Duration) QueueOption {
-	return func(c *queueConfig) {
-		if d > 0 {
-			c.idleInterval = d
-		}
-	}
-}
-
-// WithQueuePublishTimeout caps each per-message broker handshake
-// inside the drain loop. Default DefaultQueuePublishTimeout. Set
-// short to keep retries snappy at the cost of more wasted work
-// against a slow broker; set long for occasional huge payloads.
-func WithQueuePublishTimeout(d time.Duration) QueueOption {
-	return func(c *queueConfig) {
-		if d > 0 {
-			c.publishTimeout = d
-		}
-	}
-}
-
-// WithQueueTTL drops entries older than d at drain time and fires
-// the dead-letter callback. When d > 0 the value also mirrors into
-// each entry's MessageExpiryInterval so the broker enforces TTL
-// after hand-off.
+// WithQueueTTL limits how long a message may wait: it expires d after
+// Publish (or earlier, at its own Message Expiry Interval). An expired
+// message goes to the dead-letter callback with [ErrMessageExpired];
+// one that is sent carries the time it has left, in whole seconds
+// rounded up, as its Message Expiry Interval.
 func WithQueueTTL(d time.Duration) QueueOption {
-	return func(c *queueConfig) {
-		c.ttl = d
-	}
+	return func(c *queueConfig) { c.ttl = d }
 }
 
-// WithDeadLetter registers a callback for terminally failed entries
-// (e.g. TTL expiry). Runs on the drain goroutine — must not block.
+// WithDeadLetter receives every message removed without the broker
+// accepting it, with the reason: a refusal [WithQueueClassifier] calls
+// permanent, [ErrMessageExpired], or [ErrQueueFull] for an eviction. It
+// is called from internal goroutines, possibly concurrently, before the
+// message leaves the queue; it must not block.
 func WithDeadLetter(fn func(QueueEntry, error)) QueueOption {
-	return func(c *queueConfig) {
-		c.deadLetter = fn
-	}
+	return func(c *queueConfig) { c.deadLetter = fn }
 }
 
-// NewQueuePublisher wires a [QueuePublisher] over client + queue.
-// The drain goroutine starts immediately and runs until
-// [QueuePublisher.Close]. When [DropOldest] is requested,
-// queue.EvictHead is probed; [ErrEvictionNotSupported] aborts
-// construction rather than silently downgrading.
+// WithQueueClassifier decides which failed publishes are dead-lettered
+// rather than retried: fn reports whether err is permanent. The default,
+// [PermanentPublishError], treats the broker's refusals for the message
+// itself as permanent and everything else as passing.
+func WithQueueClassifier(fn func(err error) bool) QueueOption {
+	return func(c *queueConfig) { c.permanent = fn }
+}
+
+// WithQueueRetryBackoff spaces the attempts of a message whose publish
+// failed for a reason that may pass. Default
+// [DefaultQueueRetryBackoff].
+func WithQueueRetryBackoff(b Backoff) QueueOption {
+	return func(c *queueConfig) { c.backoff = b }
+}
+
+// WithQueueIdempotencyKey adds each message's [QueueEntry.ID] as the
+// [QueueIDProperty] user property, so consumers can recognise a message
+// published again after a session loss.
+func WithQueueIdempotencyKey() QueueOption {
+	return func(c *queueConfig) { c.idempotency = true }
+}
+
+// PermanentPublishError reports whether err means the broker will never
+// accept the message as it is: PUBACK/PUBREC 0x87 Not authorized, 0x90
+// Topic Name invalid, 0x95 Packet too large, 0x99 Payload format
+// invalid, 0x9A Retain not supported, 0x9B QoS not supported, or the
+// equivalent checks against the broker's CONNACK limits and MQTT's rules
+// before sending. 0x97 Quota exceeded and other failures may pass.
+func PermanentPublishError(err error) bool {
+	var rc *ReasonCodeError
+	if errors.As(err, &rc) {
+		switch rc.Code {
+		case wire.ReasonNotAuthorized, wire.ReasonTopicNameInvalid, wire.ReasonPacketTooLarge,
+			wire.ReasonPayloadFormatInvalid, wire.ReasonRetainNotSupported, wire.ReasonQoSNotSupported:
+			return true
+		}
+		return false
+	}
+	for _, e := range []error{ErrQoSNotSupported, ErrRetainNotSupported, ErrPacketTooLarge,
+		ErrInvalidTopic, ErrInvalidField, ErrFieldTooLong, ErrTopicAliasInvalid} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// NewQueuePublisher starts a QueuePublisher draining queue through
+// client. Entries already in the queue are published in order once the
+// client is connected; nothing is removed by construction.
 func NewQueuePublisher(client *Client, queue PublisherQueue, opts ...QueueOption) (*QueuePublisher, error) {
-	cfg := defaultQueueConfig()
+	cfg := queueConfig{window: DefaultQueueWindow, dropPolicy: DropNewest, permanent: PermanentPublishError, backoff: DefaultQueueRetryBackoff}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	if cfg.dropPolicy == DropOldest {
-		// Probe: a no-op evict on an empty queue should return
-		// (zero, false, nil). ErrEvictionNotSupported here means
-		// the backend cannot evict at all.
-		if _, _, err := queue.EvictHead(context.Background()); err != nil &&
-			errors.Is(err, ErrEvictionNotSupported) {
-			return nil, fmt.Errorf("mqttv5: WithQueueDropPolicy(DropOldest): %w", err)
-		}
+	switch {
+	case cfg.window < 1:
+		return nil, fmt.Errorf("mqttv5: WithQueueWindow(%d): must be at least 1", cfg.window)
+	case cfg.maxSize < 0:
+		return nil, fmt.Errorf("mqttv5: WithQueueMaxSize(%d): must not be negative", cfg.maxSize)
+	case cfg.ttl < 0:
+		return nil, fmt.Errorf("mqttv5: WithQueueTTL(%v): must not be negative", cfg.ttl)
+	case cfg.dropPolicy != DropNewest && cfg.dropPolicy != DropOldest:
+		return nil, fmt.Errorf("mqttv5: WithQueueDropPolicy(%d): unknown policy", cfg.dropPolicy)
+	case cfg.permanent == nil || cfg.backoff == nil:
+		return nil, errors.New("mqttv5: WithQueueClassifier and WithQueueRetryBackoff need a function")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &QueuePublisher{
 		client:  client,
 		queue:   queue,
 		cfg:     cfg,
 		logger:  client.cfg.Logger.With("component", "queue-publisher"),
+		clk:     client.cfg.clock,
+		pending: make(map[uint64]*queuedMessage),
 		notify:  make(chan struct{}, 1),
-		closeCh: make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		closing: make(chan struct{}),
+		done:    make(chan struct{}),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
-	// Prime notify so any entries already in a restored queue
-	// (file-backed) drain immediately on next connection.
-	p.signal()
-	go p.drain()
+	go p.run()
 	return p, nil
 }
 
-// Publish durably enqueues opts and returns once the queue has
-// stored it. The broker handshake happens asynchronously on the
-// drain goroutine. Rejects QoS 0 with [ErrQoS0NotQueueable].
-func (p *QueuePublisher) Publish(ctx context.Context, opts wire.PublishOpts) error {
+// Publish stores a copy of opts in the queue and returns; the drain
+// publishes it. The message must be valid to send (QoS 1 or 2, a topic
+// name, no Topic Alias): an invalid one is refused here rather than
+// dead-lettered later.
+func (p *QueuePublisher) Publish(ctx context.Context, opts PublishOptions) error {
+	select {
+	case <-p.closing:
+		return ErrQueueClosed
+	default:
+	}
 	if opts.QoS == 0 {
 		return ErrQoS0NotQueueable
 	}
-
-	// Detach Payload from the caller's buffer so they can reuse it.
-	pubCopy := opts
-	if len(opts.Payload) > 0 {
-		pubCopy.Payload = append([]byte(nil), opts.Payload...)
+	if opts.TopicAlias != 0 {
+		return fmt.Errorf("%w: a queued message carries its topic name, not an alias", ErrTopicAliasInvalid)
 	}
-	// PacketID and Dup are per-attempt — clear so the drain loop
-	// (via client.Publish) allocates fresh.
-	pubCopy.PacketID = 0
-	pubCopy.Dup = false
-
-	if p.cfg.ttl > 0 && pubCopy.MessageExpiryInterval == nil {
-		exp := uint32(p.cfg.ttl.Seconds())
-		pubCopy.MessageExpiryInterval = &exp
+	id, err := newQueueID()
+	if err != nil {
+		return err
 	}
-
-	entry := QueueEntry{
-		Publish:    pubCopy,
-		EnqueuedAt: time.Now(),
+	opts = opts.clone()
+	if p.cfg.idempotency {
+		opts.UserProperties = append(opts.UserProperties, UserProperty{Key: QueueIDProperty, Value: id})
 	}
-
-	if p.cfg.maxSize > 0 {
-		n, err := p.queue.Len(ctx)
-		if err == nil && n >= p.cfg.maxSize {
-			if p.cfg.dropPolicy == DropOldest {
-				evicted, ok, err := p.queue.EvictHead(ctx)
-				if err != nil {
-					return fmt.Errorf("mqttv5: queue evict: %w", err)
-				}
-				if ok && p.cfg.deadLetter != nil {
-					p.cfg.deadLetter(evicted, ErrQueueFull)
-				}
-				// fall through to Enqueue
-			} else {
-				return ErrQueueFull
-			}
-		}
+	if _, err = EncodePublish(opts, 1); err != nil {
+		return err
 	}
+	now := p.clk.Now()
+	e := QueueEntry{ID: id, EnqueuedAt: now}
+	if opts.MessageExpiryInterval != nil {
+		e.ExpiresAt = now.Add(time.Duration(*opts.MessageExpiryInterval) * time.Second)
+	}
+	if p.cfg.ttl > 0 && (e.ExpiresAt.IsZero() || now.Add(p.cfg.ttl).Before(e.ExpiresAt)) {
+		e.ExpiresAt = now.Add(p.cfg.ttl)
+	}
+	opts.MessageExpiryInterval = nil
+	e.Publish = opts
 
-	if err := p.queue.Enqueue(ctx, entry); err != nil {
+	p.claimMu.RLock()
+	_, evicted, err := p.queue.Enqueue(ctx, e, QueueLimit{Max: p.cfg.maxSize, Policy: p.cfg.dropPolicy, Keep: p.claimed})
+	p.claimMu.RUnlock()
+	for _, ev := range evicted {
+		p.deadLetter(ev, ErrQueueFull)
+	}
+	if err != nil {
 		return err
 	}
 	p.signal()
 	return nil
 }
 
-// Close stops the drain goroutine and closes the backing queue. ctx
-// bounds how long Close waits for the drain to settle.
+// Close stops publishing, waits until ctx for the exchanges in flight to
+// finish, and closes the queue. Messages whose exchange is still running
+// stay in the queue and in the session; the next QueuePublisher on them
+// continues those exchanges.
 func (p *QueuePublisher) Close(ctx context.Context) error {
-	p.closeOnce.Do(func() {
-		close(p.closeCh)
-	})
+	p.closeOnce.Do(func() { close(p.closing) })
 	select {
-	case <-p.doneCh:
+	case <-p.done:
 	case <-ctx.Done():
 		return fmt.Errorf("mqttv5: QueuePublisher.Close: %w", ctx.Err())
 	}
-	return p.queue.Close()
+	settled := make(chan struct{})
+	go func() {
+		p.settling.Wait()
+		close(settled)
+	}()
+	var err error
+	select {
+	case <-settled:
+	case <-ctx.Done():
+		err = fmt.Errorf("mqttv5: QueuePublisher.Close: messages still in flight: %w", ctx.Err())
+	}
+	p.cancel()
+	if cerr := p.queue.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
-// signal wakes the drain goroutine. Non-blocking — multiple
-// concurrent Enqueues collapse into a single wake.
 func (p *QueuePublisher) signal() {
 	select {
 	case p.notify <- struct{}{}:
@@ -321,201 +327,240 @@ func (p *QueuePublisher) signal() {
 	}
 }
 
-// drain is the long-running goroutine that publishes queued entries
-// in order. It wakes on Enqueue (via notify), every idleInterval (so
-// it picks up restored entries even when nothing is being enqueued),
-// or on Close.
-func (p *QueuePublisher) drain() {
-	defer close(p.doneCh)
-	t := time.NewTicker(p.cfg.idleInterval)
-	defer t.Stop()
-
+// run is the drain goroutine: while connected it starts messages whose
+// turn has come and claims new ones until the window is full, then
+// sleeps until something changes.
+func (p *QueuePublisher) run() {
+	defer close(p.done)
+	timer := p.clk.NewTimer(time.Hour)
+	timer.Stop()
 	for {
+		changed := p.client.connChanged()
+		var retry time.Time
+		if p.client.cur.Load() != nil {
+			retry = p.fill()
+		}
+		var wake <-chan time.Time
+		if !retry.IsZero() {
+			timer.Reset(max(retry.Sub(p.clk.Now()), 0))
+			wake = timer.C()
+		}
 		select {
-		case <-p.closeCh:
+		case <-p.closing:
+			timer.Stop()
 			return
 		case <-p.notify:
-		case <-t.C:
+		case <-changed:
+		case <-wake:
 		}
+		timer.Stop()
+	}
+}
 
-		for {
-			select {
-			case <-p.closeCh:
-				return
-			default:
-			}
-
-			if !p.client.Connected() {
-				break
-			}
-
-			more, err := p.drainOneBatch()
-			if err != nil {
-				p.logger.Warn("drain batch failed",
-					slog.Any("error", err),
-				)
-				break
-			}
-			if !more {
-				break
-			}
+// fill starts every pending message that is due and claims more from the
+// queue while the window has room, until the connection or the
+// QueuePublisher goes away. It returns when the next retry is due, or
+// zero.
+func (p *QueuePublisher) fill() time.Time {
+	for {
+		due, next, room := p.due()
+		for _, m := range due {
+			p.start(m)
+		}
+		if room <= 0 || p.client.cur.Load() == nil || p.ctx.Err() != nil {
+			return next
+		}
+		claimed := p.claim(room)
+		if len(claimed) == 0 {
+			return next
+		}
+		for _, m := range claimed {
+			p.start(m)
+		}
+		if p.client.cur.Load() == nil {
+			return next
 		}
 	}
 }
 
-// drainOneBatch peeks up to batchSize entries and tries to publish
-// each in order. Returns (more=true) if the queue may still hold
-// entries (so the caller loops again).
-func (p *QueuePublisher) drainOneBatch() (bool, error) {
-	ctx := context.Background()
-	entries, tokens, err := p.queue.PeekBatch(ctx, p.cfg.batchSize)
+// due returns the pending messages to start now, in queue order, when
+// the next one waiting for a retry is due, and the window's free room.
+func (p *QueuePublisher) due() (due []*queuedMessage, next time.Time, room int) {
+	now := p.clk.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, m := range p.pending {
+		switch {
+		case m.inFlight:
+		case !m.retryAt.After(now):
+			m.inFlight = true
+			due = append(due, m)
+		case next.IsZero() || m.retryAt.Before(next):
+			next = m.retryAt
+		}
+	}
+	slices.SortFunc(due, func(a, b *queuedMessage) int { return cmp.Compare(a.entry.Seq, b.entry.Seq) })
+	return due, next, p.cfg.window - len(p.pending)
+}
+
+// claim takes up to n entries after the last claimed one into pending.
+func (p *QueuePublisher) claim(n int) []*queuedMessage {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+	entries, err := p.queue.Peek(p.ctx, p.claimed, n)
 	if err != nil {
-		return false, err
+		if !errors.Is(err, ErrQueueClosed) && p.ctx.Err() == nil {
+			p.logger.Error("reading the queue failed", slog.Any("error", err))
+		}
+		return nil
 	}
-	if len(entries) == 0 {
-		return false, nil
-	}
-
+	out := make([]*queuedMessage, len(entries))
+	p.mu.Lock()
 	for i, e := range entries {
-		select {
-		case <-p.closeCh:
-			return false, nil
-		default:
+		m := &queuedMessage{entry: e, inFlight: true}
+		p.pending[e.Seq] = m
+		out[i] = m
+	}
+	p.mu.Unlock()
+	if len(entries) > 0 {
+		p.claimed = entries[len(entries)-1].Seq
+	}
+	return out
+}
+
+// start begins an exchange for m, which the caller has marked in
+// flight. When the session already holds one for m — from an earlier
+// process, from before the session store failed, or one whose outcome
+// could not be recorded yet — it continues that exchange; otherwise it
+// publishes m.
+func (p *QueuePublisher) start(m *queuedMessage) {
+	e := m.entry
+	p.mu.Lock()
+	m.attempts++
+	p.mu.Unlock()
+
+	p.settling.Add(1)
+	settle := func(_ context.Context, err error) error {
+		defer p.settling.Done()
+		return p.settled(m, err)
+	}
+	if p.client.engine.Adopt([]byte(e.ID), settle) {
+		return
+	}
+	now := p.clk.Now()
+	if !e.ExpiresAt.IsZero() && !now.Before(e.ExpiresAt) {
+		p.settling.Done()
+		_ = p.drop(m, ErrMessageExpired)
+		return
+	}
+	opts := e.Publish
+	if !e.ExpiresAt.IsZero() {
+		left := uint32((e.ExpiresAt.Sub(now) + time.Second - 1) / time.Second)
+		opts.MessageExpiryInterval = &left
+	}
+	if err := p.client.publishTracked(p.ctx, opts, []byte(e.ID), settle); err != nil {
+		p.settling.Done()
+		_ = p.failed(m, err)
+	}
+}
+
+// settled handles the outcome of m's exchange. It runs before the
+// session forgets the exchange, so the queue entry is removed first; an
+// error tells the session to keep the exchange because the removal
+// failed.
+func (p *QueuePublisher) settled(m *queuedMessage, err error) error {
+	switch {
+	case err == nil:
+		p.mu.Lock()
+		first := !m.accepted
+		m.accepted = true
+		p.mu.Unlock()
+		if first {
+			p.client.stats.addPublishSent()
 		}
-
-		// TTL drop at drain time — entries that aged out before
-		// the broker accepted them are dead-lettered.
-		if p.cfg.ttl > 0 && time.Since(e.EnqueuedAt) > p.cfg.ttl {
-			if dl := p.cfg.deadLetter; dl != nil {
-				dl(e, fmt.Errorf("ttl expired after %s", time.Since(e.EnqueuedAt)))
-			}
-			_ = p.queue.Ack(ctx, tokens[i])
-			continue
-		}
-
-		pubCtx, cancel := context.WithTimeout(ctx, p.cfg.publishTimeout)
-		err := p.client.Publish(pubCtx, e.Publish)
-		cancel()
-		if err != nil {
-			// Transient — leave the entry, retry on next wake.
-			p.logger.Debug("publish failed; will retry",
-				slog.String("topic", e.Publish.Topic),
-				slog.Any("error", err),
-			)
-			return false, nil
-		}
-		if err := p.queue.Ack(ctx, tokens[i]); err != nil {
-			p.logger.Warn("queue ack failed",
-				slog.String("topic", e.Publish.Topic),
-				slog.Any("error", err),
-			)
-		}
+		return p.remove(m)
+	case errors.Is(err, ErrSessionLost):
+		// The broker never confirmed it; publish it again as new.
+		p.retry(m, time.Time{})
+		return nil
+	default:
+		return p.failed(m, err)
 	}
-	return len(entries) == p.cfg.batchSize, nil
 }
 
-// ---------- MemoryPublisherQueue ----------
-
-// MemoryPublisherQueue is an in-memory PublisherQueue. It is the
-// default when no durable store is required. Crash semantics: all
-// queued entries are lost. For at-least-once across process restarts,
-// use the queue/file/ submodule instead.
-type MemoryPublisherQueue struct {
-	mu     sync.Mutex
-	closed bool
-	next   uint64
-	items  []memQueueItem
-}
-
-type memQueueItem struct {
-	token uint64
-	entry QueueEntry
-}
-
-// NewMemoryPublisherQueue constructs an empty in-memory queue.
-func NewMemoryPublisherQueue() *MemoryPublisherQueue {
-	return &MemoryPublisherQueue{}
-}
-
-// Enqueue implements PublisherQueue.
-func (q *MemoryPublisherQueue) Enqueue(_ context.Context, entry QueueEntry) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed {
-		return ErrQueueClosed
-	}
-	q.next++
-	q.items = append(q.items, memQueueItem{token: q.next, entry: entry})
-	return nil
-}
-
-// PeekBatch implements PublisherQueue.
-func (q *MemoryPublisherQueue) PeekBatch(_ context.Context, n int) ([]QueueEntry, []QueueToken, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed {
-		return nil, nil, ErrQueueClosed
-	}
-	if len(q.items) == 0 || n <= 0 {
-		return nil, nil, nil
-	}
-	if n > len(q.items) {
-		n = len(q.items)
-	}
-	entries := make([]QueueEntry, n)
-	tokens := make([]QueueToken, n)
-	for i := 0; i < n; i++ {
-		entries[i] = q.items[i].entry
-		tokens[i] = q.items[i].token
-	}
-	return entries, tokens, nil
-}
-
-// Ack implements PublisherQueue. Removes the entry identified by tok.
-// Acking an unknown token is a no-op.
-func (q *MemoryPublisherQueue) Ack(_ context.Context, tok QueueToken) error {
-	id, ok := tok.(uint64)
-	if !ok {
-		return fmt.Errorf("mqttv5: MemoryPublisherQueue: bad token type %T", tok)
-	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for i, it := range q.items {
-		if it.token == id {
-			q.items = append(q.items[:i], q.items[i+1:]...)
-			return nil
-		}
+// failed decides what a failed attempt for m leads to. It returns the
+// error of a removal that failed.
+func (p *QueuePublisher) failed(m *queuedMessage, err error) error {
+	switch {
+	case errors.Is(err, ErrMessageExpired) || p.cfg.permanent(err):
+		return p.drop(m, err)
+	case errors.Is(err, ErrNotConnected):
+		p.retry(m, time.Time{})
+	case errors.Is(err, ErrClosed) || p.ctx.Err() != nil:
+		p.retry(m, time.Time{})
+	default:
+		p.mu.Lock()
+		attempts := m.attempts
+		p.mu.Unlock()
+		p.logger.Warn("publishing a queued message failed; will retry",
+			slog.String("topic", m.entry.Publish.Topic), slog.Int("attempt", attempts), slog.Any("error", err))
+		p.retry(m, p.clk.Now().Add(p.cfg.backoff(attempts-1)))
 	}
 	return nil
 }
 
-// EvictHead implements PublisherQueue by popping the oldest in-memory
-// item.
-func (q *MemoryPublisherQueue) EvictHead(_ context.Context) (QueueEntry, bool, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed {
-		return QueueEntry{}, false, ErrQueueClosed
-	}
-	if len(q.items) == 0 {
-		return QueueEntry{}, false, nil
-	}
-	head := q.items[0]
-	q.items = q.items[1:]
-	return head.entry, true, nil
+func (p *QueuePublisher) retry(m *queuedMessage, at time.Time) {
+	p.mu.Lock()
+	m.inFlight, m.retryAt = false, at
+	p.mu.Unlock()
+	p.signal()
 }
 
-// Len implements PublisherQueue.
-func (q *MemoryPublisherQueue) Len(_ context.Context) (int, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.items), nil
+// drop dead-letters m, once, and removes it.
+func (p *QueuePublisher) drop(m *queuedMessage, reason error) error {
+	p.mu.Lock()
+	first := !m.deadLettered
+	m.deadLettered = true
+	p.mu.Unlock()
+	if first {
+		p.deadLetter(m.entry, reason)
+	}
+	return p.remove(m)
 }
 
-// Close implements PublisherQueue.
-func (q *MemoryPublisherQueue) Close() error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.closed = true
+func (p *QueuePublisher) deadLetter(e QueueEntry, reason error) {
+	p.logger.Warn("dropping a queued message", slog.String("topic", e.Publish.Topic),
+		slog.String("id", e.ID), slog.Any("reason", reason))
+	if p.cfg.deadLetter != nil {
+		p.cfg.deadLetter(e, reason)
+	}
+}
+
+// remove takes m out of the queue and frees its place in the window.
+// When the queue fails, m stays pending and the removal is retried with
+// the retry backoff; the error goes back to the session, which keeps
+// the exchange so the outcome is not lost.
+func (p *QueuePublisher) remove(m *queuedMessage) error {
+	if err := p.queue.Ack(context.Background(), m.entry.Seq); err != nil {
+		p.mu.Lock()
+		attempts := m.attempts
+		p.mu.Unlock()
+		p.logger.Error("removing a finished message from the queue failed; will retry",
+			slog.String("id", m.entry.ID), slog.Int("attempt", attempts), slog.Any("error", err))
+		p.retry(m, p.clk.Now().Add(p.cfg.backoff(attempts-1)))
+		return err
+	}
+	p.mu.Lock()
+	delete(p.pending, m.entry.Seq)
+	p.mu.Unlock()
+	p.signal()
 	return nil
+}
+
+func newQueueID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("mqttv5: message ID: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }

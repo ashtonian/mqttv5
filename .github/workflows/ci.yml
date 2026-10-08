@@ -14,8 +14,8 @@ permissions:
 
 env:
   GO_VERSION_FILE: go.mod
-  GOLANGCI_LINT_VERSION: v2.12.2
-  GOVULNCHECK_VERSION: v1.1.4
+  GOLANGCI_LINT_VERSION: v2.14.0
+  GOVULNCHECK_VERSION: v1.8.0
 
 jobs:
   lint:
@@ -30,14 +30,15 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -59,14 +60,15 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -95,14 +97,15 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -128,26 +131,38 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
+          - examples
+          - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: go test -race
-        run: go test -race -v -timeout 5m -count=1 ./...
+        run: go test -race -v -timeout 5m -count=1 -coverprofile=coverage.out ./...
+        working-directory: ${{ matrix.module }}
+
+      # Informational, not a gate.
+      - name: coverage summary
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            echo "### Coverage (${{ matrix.module }}): $(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')" >> "$GITHUB_STEP_SUMMARY"
+          fi
         working-directory: ${{ matrix.module }}
 
   build:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
 
@@ -170,14 +185,15 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache-dependency-path: ${{ matrix.module }}/go.sum

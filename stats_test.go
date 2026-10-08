@@ -61,7 +61,7 @@ func TestStatsCountersTickOnPublish(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		if err := cli.Publish(context.Background(), wire.PublishOpts{
+		if err := cli.Publish(context.Background(), PublishOptions{
 			Topic: "stats/test", QoS: 1, Payload: []byte("x"),
 		}); err != nil {
 			t.Fatalf("Publish[%d]: %v", i, err)
@@ -100,7 +100,7 @@ func TestStatsDisabledReturnsZero(t *testing.T) {
 	defer cli.Disconnect(context.Background())
 
 	for i := 0; i < 3; i++ {
-		if err := cli.Publish(context.Background(), wire.PublishOpts{
+		if err := cli.Publish(context.Background(), PublishOptions{
 			Topic: "stats/disabled", QoS: 1, Payload: []byte("x"),
 		}); err != nil {
 			t.Fatalf("Publish[%d]: %v", i, err)

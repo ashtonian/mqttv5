@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 // tokenSource models an OAuth provider. Real implementations would
@@ -50,7 +49,7 @@ func main() {
 		mqttv5.WithBroker(broker),
 		mqttv5.WithClientID("mqttv5-oauth"),
 		mqttv5.WithLogger(logger),
-		mqttv5.WithConnectPacketBuilder(func(_ context.Context, opts *wire.ConnectOpts) error {
+		mqttv5.WithConnectPacketBuilder(func(_ context.Context, opts *mqttv5.ConnectOptions) error {
 			opts.Username = "service-account"
 			opts.Password = []byte(tokens.Token())
 			return nil

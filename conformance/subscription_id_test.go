@@ -10,18 +10,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ashtonian/mqttv5"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
 // rawSub is a minimal MQTT v5 connection driven through the wire codec
-// directly (wire.WriteConnect / WriteSubscribe + wire.NewDecoder). It
-// exists because the public Subscribe path never puts a Subscription
-// Identifier on the SUBSCRIBE packet (the client-side nextSubID is an
-// internal activeSubs map key, not an on-wire property — subscribe.go
-// builds wire.SubscribeOpts{PacketID, Filters} and leaves
-// SubscriptionIdentifier nil), so it cannot exercise the §3.4.2.3
-// identifier echo. Speaking the wire format here lets the test set an
-// explicit identifier and assert the broker mirrors that exact value.
+// directly (wire.WriteConnect / WriteSubscribe + wire.NewDecoder). The
+// client allocates Subscription Identifiers itself; speaking the wire
+// format here lets the test choose an exact identifier and assert the
+// broker mirrors that value (§3.3.4).
 //
 // This mirrors the existing fake-broker tests, which already drive raw
 // connections via wire.NewDecoder(conn).ReadPacket() (see auth_test.go).
@@ -186,7 +183,7 @@ func TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery(t *testing.T) {
 
 	// First delivery: the requested identifier must come back verbatim.
 	want1 := []byte("subid-first")
-	if err := pub.Publish(t.Context(), wire.PublishOpts{
+	if err := pub.Publish(t.Context(), mqttv5.PublishOptions{
 		Topic: topic, Payload: want1, QoS: 1,
 	}); err != nil {
 		t.Fatalf("publish first: %v", err)
@@ -202,7 +199,7 @@ func TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery(t *testing.T) {
 
 	// Stability: a second matching PUBLISH carries the identical id.
 	want2 := []byte("subid-second")
-	if err := pub.Publish(t.Context(), wire.PublishOpts{
+	if err := pub.Publish(t.Context(), mqttv5.PublishOptions{
 		Topic: topic, Payload: want2, QoS: 1,
 	}); err != nil {
 		t.Fatalf("publish second: %v", err)
@@ -257,7 +254,7 @@ func TestSubscribe_SubscriptionIdentifier_RoutesByID(t *testing.T) {
 
 	// A publish to topicA must be tagged with idA only.
 	wantA := []byte("route-a")
-	if err := pub.Publish(t.Context(), wire.PublishOpts{
+	if err := pub.Publish(t.Context(), mqttv5.PublishOptions{
 		Topic: topicA, Payload: wantA, QoS: 1,
 	}); err != nil {
 		t.Fatalf("publish A: %v", err)
@@ -273,7 +270,7 @@ func TestSubscribe_SubscriptionIdentifier_RoutesByID(t *testing.T) {
 
 	// A publish to topicB must be tagged with idB only.
 	wantB := []byte("route-b")
-	if err := pub.Publish(t.Context(), wire.PublishOpts{
+	if err := pub.Publish(t.Context(), mqttv5.PublishOptions{
 		Topic: topicB, Payload: wantB, QoS: 1,
 	}); err != nil {
 		t.Fatalf("publish B: %v", err)

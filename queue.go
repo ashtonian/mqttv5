@@ -58,6 +58,40 @@ func (q *Queue[T]) Enqueue(item T) bool {
 	return true
 }
 
+// push appends item atomically against a bound of max items (0: none).
+// At the bound it refuses item, or with dropOldest removes the head and
+// returns it as evicted. accepted is false when item was refused or the
+// queue is closed.
+func (q *Queue[T]) push(item T, max int, dropOldest bool) (evicted T, wasEvicted, accepted bool) {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return evicted, false, false
+	}
+	if max > 0 && q.count >= max {
+		if !dropOldest {
+			q.mu.Unlock()
+			return evicted, false, false
+		}
+		evicted, wasEvicted = q.popLocked()
+	}
+	n := &queueNode[T]{value: item}
+	if q.tail == nil {
+		q.head = n
+	} else {
+		q.tail.next = n
+	}
+	q.tail = n
+	q.count++
+	q.mu.Unlock()
+
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+	return evicted, wasEvicted, true
+}
+
 // Dequeue blocks until an item is available, the queue is closed, or
 // ctx cancels. ok is false when no item could be retrieved.
 func (q *Queue[T]) Dequeue(ctx context.Context) (T, bool) {

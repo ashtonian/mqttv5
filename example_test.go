@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 // Example shows the minimal connect → subscribe → publish loop. The
@@ -43,7 +42,7 @@ func Example() {
 		}
 	}()
 
-	_ = cli.Publish(ctx, wire.PublishOpts{
+	_ = cli.Publish(ctx, mqttv5.PublishOptions{
 		Topic:   "demo/hello",
 		Payload: []byte("world"),
 		QoS:     1,
@@ -138,7 +137,7 @@ func ExampleClient_Publish() {
 	_ = cli.Connect(ctx)
 	defer cli.Disconnect(ctx)
 
-	err := cli.Publish(ctx, wire.PublishOpts{
+	err := cli.Publish(ctx, mqttv5.PublishOptions{
 		Topic:   "events/example",
 		Payload: []byte(`{"value":42}`),
 		QoS:     1,
@@ -160,9 +159,9 @@ func ExampleClient_SetBrokers() {
 			"mqtts://broker-b.example.com:8883",
 		),
 		mqttv5.WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13}),
-		mqttv5.WithOnServerDisconnect(func(d *wire.Disconnect) {
-			if ref, ok := d.Properties.String(wire.PropServerReference); ok {
-				_ = cli.SetBrokers(ref)
+		mqttv5.WithOnServerDisconnect(func(d mqttv5.DisconnectInfo) {
+			if d.ServerReference != "" {
+				_ = cli.SetBrokers(d.ServerReference)
 			}
 		}),
 	)
@@ -247,7 +246,7 @@ func ExampleNewTyped() {
 	typed := mqttv5.NewTyped[reading](cli, readingCodec{})
 
 	_ = typed.Publish(ctx,
-		wire.PublishOpts{Topic: "sensors/a1", QoS: 1},
+		mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
 		reading{Device: "a1", Temp: 22.5},
 	)
 
@@ -262,12 +261,13 @@ func ExampleNewTyped() {
 	}
 }
 
-// ExampleNewQueuePublisher durably enqueues publishes and drains them
-// to the broker in order from a background goroutine. Publish returns
+// ExampleNewQueuePublisher queues publishes and drains them to the
+// broker from a background goroutine, many at a time. Publish returns
 // once the queue has stored the entry, before the broker round-trip.
 //
-// For at-least-once across process restart, swap
-// [mqttv5.NewMemoryPublisherQueue] for the queue/file submodule.
+// To keep queued and in-flight messages across a process restart, swap
+// [mqttv5.NewMemoryPublisherQueue] for the queue/file submodule and give
+// the client a store/file session store with [mqttv5.WithStore].
 func ExampleNewQueuePublisher() {
 	cli, _ := mqttv5.New(mqttv5.WithBroker("mqtt://localhost:1883"))
 	ctx := context.Background()
@@ -275,7 +275,7 @@ func ExampleNewQueuePublisher() {
 	defer cli.Disconnect(ctx)
 
 	pub, err := mqttv5.NewQueuePublisher(cli, mqttv5.NewMemoryPublisherQueue(),
-		mqttv5.WithQueueBatchSize(32),
+		mqttv5.WithQueueWindow(32),
 		mqttv5.WithQueueTTL(24*time.Hour),
 		mqttv5.WithDeadLetter(func(e mqttv5.QueueEntry, err error) {
 			fmt.Println("dead letter", e.Publish.Topic, err)
@@ -286,7 +286,7 @@ func ExampleNewQueuePublisher() {
 	}
 	defer pub.Close(context.Background())
 
-	_ = pub.Publish(ctx, wire.PublishOpts{
+	_ = pub.Publish(ctx, mqttv5.PublishOptions{
 		Topic:   "events/durable",
 		Payload: []byte("at-least-once"),
 		QoS:     1,
@@ -313,7 +313,7 @@ func ExampleWithPublisherPool() {
 
 	// Round-robin / hashed across the 4 pool members under the hood.
 	for i := range 100 {
-		_ = cli.Publish(ctx, wire.PublishOpts{
+		_ = cli.Publish(ctx, mqttv5.PublishOptions{
 			Topic:   fmt.Sprintf("events/tick/%d", i%4),
 			Payload: fmt.Appendf(nil, `{"n":%d}`, i),
 			QoS:     1,

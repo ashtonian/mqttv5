@@ -110,7 +110,10 @@ func decodePubResp(frame *[]byte, pktType PacketType, flags byte) (*PubResp, err
 		buf = buf[1:]
 		// Per §3.4.2.2.2 properties are implied empty if absent.
 		if len(buf) > 0 {
-			p, _, err := readProperties(buf)
+			p, n, err := readProperties(buf)
+			if err == nil && n != len(buf) {
+				err = errTrailing
+			}
 			if err != nil {
 				releaseBuf(frame)
 				return nil, fmt.Errorf("%w: %s properties: %w", ErrInvalidPacket, pktType, err)
@@ -130,6 +133,9 @@ func decodePubResp(frame *[]byte, pktType PacketType, flags byte) (*PubResp, err
 
 // writePubResp is the shared encoder for the four ack-shape packets.
 func writePubResp(w io.Writer, pktType PacketType, flags byte, opts *PubRespOpts) (int64, error) {
+	if err := validatePubRespOpts(pktType, opts); err != nil {
+		return 0, err
+	}
 	propsLen := 0
 	if opts.ReasonString != "" {
 		propsLen += 1 + 2 + len(opts.ReasonString)
@@ -173,4 +179,19 @@ func writePubResp(w io.Writer, pktType PacketType, flags byte, opts *PubRespOpts
 
 	bufs := net.Buffers{fixedHdr[:1+vbiN], buf}
 	return bufs.WriteTo(w)
+}
+
+// AppendPubResp appends a property-less PUBACK, PUBREC, PUBREL or PUBCOMP
+// to dst and returns the extended slice. A Success reason code is omitted
+// (§3.4.2.2.1), giving the minimal 4-byte frame; any other code adds one
+// byte. It never allocates when dst has room.
+func AppendPubResp(dst []byte, t PacketType, id uint16, rc ReasonCode) []byte {
+	var flags byte
+	if t == PUBREL {
+		flags = 0x02
+	}
+	if rc == ReasonSuccess {
+		return append(dst, byte(t)<<4|flags, 2, byte(id>>8), byte(id))
+	}
+	return append(dst, byte(t)<<4|flags, 3, byte(id>>8), byte(id), byte(rc))
 }

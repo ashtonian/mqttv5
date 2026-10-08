@@ -1,0 +1,48 @@
+name: fuzz
+
+# Nightly fuzzing of the wire codec. Each target runs for FUZZ_TIME; a
+# crashing input is uploaded as an artifact (and lands in
+# wire/testdata/fuzz/<Target>/ locally when reproduced) so it can be added
+# as a regression seed.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FUZZ_TIME: 10m
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzReadPacket
+          - FuzzProperties
+          - FuzzDecodeVarint
+          - FuzzPublishRoundTrip
+          - FuzzValidUTF8
+          - FuzzScanTopicName
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: go test -fuzz
+        run: go test ./wire/ -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime ${{ env.FUZZ_TIME }}
+
+      - name: upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: wire/testdata/fuzz/

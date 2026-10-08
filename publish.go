@@ -3,12 +3,12 @@
 package mqttv5
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"time"
 
+	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -19,31 +19,47 @@ import (
 //   - QoS 1: returns after PUBACK.
 //   - QoS 2: returns after PUBCOMP.
 //
-// QoS 1/2 packets are stashed on the session entry so the supervisor
-// replays them with DUP=1 across reconnect; callers stay blocked on
-// the ack across the drop. With [WithPublisherPool] the call first
-// tries the pool per [PoolRoutingPolicy] and falls back to the main
-// connection if every pool member is unhealthy.
-func (c *Client) Publish(ctx context.Context, opts wire.PublishOpts) error {
-	if c.pubPool != nil {
-		if err := c.pubPool.publish(ctx, opts); err == nil {
-			return nil
-		} else if !errors.Is(err, ErrNoHealthyPublishers) {
-			// Pool member returned a non-pool-health error (e.g.,
-			// invalid QoS, encoding failure). Surface it.
+// QoS 1/2 messages belong to the session once registered: a dropped
+// connection resends them (DUP=1) when the session resumes, and callers
+// stay blocked on the acknowledgement across the drop. A refusal (reason
+// code 0x80 or above) is returned as a [*ReasonCodeError].
+//
+// A call that waits for its packet to be written — QoS 1/2, or QoS 0
+// with [PublishWaitForFlush] — writes it on the calling goroutine when
+// the connection is a TCP or Unix socket and nothing is queued for its
+// writer goroutine, saving the hand-off; otherwise the writer sends it
+// behind the queued packets. ctx bounds the call either way: a write it
+// interrupts is finished by the writer goroutine, so the packet may
+// still reach the broker after Publish returned ctx's error.
+//
+// With [WithPublisherPool] the call first tries the pool per
+// [PoolRoutingPolicy] and falls back to the main connection if every
+// pool member is unhealthy.
+func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
+	if po.QoS > 2 {
+		return fmt.Errorf("mqttv5: invalid QoS %d (must be 0, 1, or 2)", po.QoS)
+	}
+	if c.pool != nil {
+		err := c.pool.publish(ctx, po)
+		if !errors.Is(err, ErrNoHealthyPublishers) {
 			return err
 		}
-		// Fall through to main connection.
+		// No member could send it: use the main connection.
 		c.stats.addPoolFallback()
 	}
 
-	if !c.Connected() {
+	cs := c.cur.Load()
+	if cs == nil {
 		return ErrNotConnected
+	}
+	opts := po.wire()
+	if err := c.applyServerLimits(cs, &opts); err != nil {
+		return err
 	}
 
 	switch opts.QoS {
 	case 0:
-		err := c.publishQoS0(ctx, opts)
+		err := c.publishQoS0(ctx, cs, opts)
 		if err == nil {
 			c.stats.addPublishSent()
 		}
@@ -54,161 +70,221 @@ func (c *Client) Publish(ctx context.Context, opts wire.PublishOpts) error {
 			c.stats.addPublishSent()
 		}
 		return err
-	default:
-		return fmt.Errorf("mqttv5: invalid QoS %d (must be 0, 1, or 2)", opts.QoS)
 	}
+	return nil
 }
 
-// publishQoS0 dispatches per PublishMode. Topic alias auto-allocation
-// happens here (QoS 0 only — QoS 1/2 must carry the full topic for
-// replay across reconnect, since broker alias state resets per
-// §3.3.2.3.4).
-//
-// Both modes pre-encode the packet into a pooled []byte so the writer
-// goroutine just calls conn.Write — no closure-capturing-opts
-// allocation per call, and the writer can later batch multiple
-// pre-encoded packets into one writev.
-func (c *Client) publishQoS0(ctx context.Context, opts wire.PublishOpts) error {
-	c.applyOutboundAlias(&opts)
-	bp, err := wire.EncodePublish(opts)
-	if err != nil {
-		return err
+// publishTracked starts a QoS 1/2 exchange on the current connection
+// and returns without waiting for it: settle receives the outcome (see
+// [inflight.Message]) and ref is stored with the session record so the
+// exchange can be adopted after a restart. The publisher pool is not
+// used.
+func (c *Client) publishTracked(ctx context.Context, po PublishOptions, ref []byte, settle func(context.Context, error) error) error {
+	if po.QoS != 1 && po.QoS != 2 {
+		return fmt.Errorf("mqttv5: tracked publish needs QoS 1 or 2, not %d", po.QoS)
 	}
-
-	if c.cfg.PublishMode == PublishWaitForFlush {
-		err := c.enqueueAwaitPkt(ctx, bp)
-		// enqueueAwaitPkt owns the buffer once the send succeeds; on
-		// every error path (queue full / shutdown / not connected) it
-		// has already released.
-		return err
-	}
-
-	// PublishFireAndForget (default): hand to writer, return.
 	cs := c.cur.Load()
 	if cs == nil {
-		wire.ReleaseBuf(bp)
 		return ErrNotConnected
 	}
-
-	// WriteDropNewest: don't wait for queue room. The default branch
-	// fires only if none of the others are ready immediately, so
-	// shutdown/dying still take precedence.
-	if c.cfg.WriteOverflowPolicy == WriteDropNewest {
-		select {
-		case cs.writeQueue <- writeReq{pkt: bp}:
-			return nil
-		case <-cs.dying:
-			wire.ReleaseBuf(bp)
-			return ErrNotConnected
-		case <-c.shutdown:
-			wire.ReleaseBuf(bp)
-			return ErrClosed
-		default:
-			wire.ReleaseBuf(bp)
-			return ErrWriteQueueFull
-		}
+	opts := po.wire()
+	if err := c.applyServerLimits(cs, &opts); err != nil {
+		return err
 	}
-
-	// WriteBlock: wait for room, ctx, or teardown.
-	select {
-	case cs.writeQueue <- writeReq{pkt: bp}:
-		return nil
-	case <-ctx.Done():
-		wire.ReleaseBuf(bp)
-		return ctx.Err()
-	case <-cs.dying:
-		wire.ReleaseBuf(bp)
-		return ErrNotConnected
-	case <-c.shutdown:
-		wire.ReleaseBuf(bp)
-		return ErrClosed
-	}
+	_, err := c.startReliable(ctx, opts, ref, settle)
+	return err
 }
 
-// applyOutboundAlias mutates opts to use a topic alias when one is
-// available. No-op if the caller already set TopicAlias, or if the
-// broker's TopicAliasMaximum is 0, or if we're out of alias budget.
-func (c *Client) applyOutboundAlias(opts *wire.PublishOpts) {
-	if opts.TopicAlias != 0 {
-		return // caller explicitly set it
+// applyServerLimits checks opts against what the broker granted in
+// CONNACK, so a publish it would refuse — usually by dropping the
+// connection — fails here instead (§3.2.2.3). With [WithQoSDowngrade]
+// a QoS above the broker's maximum is lowered rather than refused.
+func (c *Client) applyServerLimits(cs *connState, opts *wire.PublishOpts) error {
+	if opts.QoS > cs.info.MaximumQoS {
+		if !c.cfg.QoSDowngrade {
+			return fmt.Errorf("%w: QoS %d, broker maximum %d", ErrQoSNotSupported, opts.QoS, cs.info.MaximumQoS)
+		}
+		opts.QoS = cs.info.MaximumQoS
 	}
-	cs := c.cur.Load()
-	if cs == nil || cs.outAliasMax == 0 || opts.Topic == "" {
-		return
+	if opts.Retain && !cs.info.RetainAvailable {
+		return ErrRetainNotSupported
 	}
-	cs.outAliasMu.Lock()
-	defer cs.outAliasMu.Unlock()
+	return nil
+}
 
+// checkPacketSize enforces the broker's Maximum Packet Size on an
+// encoded packet.
+func checkPacketSize(cs *connState, n int) error {
+	if max := cs.info.MaximumPacketSize; max > 0 && uint32(n) > max {
+		return fmt.Errorf("%w: %d bytes, broker maximum %d", ErrPacketTooLarge, n, max)
+	}
+	return nil
+}
+
+// publishQoS0 sends a QoS 0 PUBLISH per [PublishMode] and
+// [WriteOverflowPolicy]. With [PublishWaitForFlush] the caller writes
+// the packet itself when acquireIdle allows: one writev of the encoded
+// header and the caller's payload, which is not copied. Otherwise the
+// packet is encoded into a pooled buffer and queued; the writer writes
+// it without a closure allocation and may batch it.
+//
+// With [WithOutboundTopicAliases] a topic is replaced by an alias the
+// broker learned from an earlier PUBLISH on the same connection. The
+// alias is allocated and the packet written or queued under one lock,
+// so a PUBLISH that uses an alias can never be written before the one
+// that registers it, and a new alias is kept only once its
+// PUBLISH is admitted — written, or queued for the writer — so one the
+// broker never saw is never used.
+func (c *Client) publishQoS0(ctx context.Context, cs *connState, opts wire.PublishOpts) error {
+	if opts.TopicAlias != 0 && opts.TopicAlias > cs.info.TopicAliasMaximum {
+		return fmt.Errorf("%w: alias %d, broker maximum %d", ErrTopicAliasInvalid, opts.TopicAlias, cs.info.TopicAliasMaximum)
+	}
+	if c.cfg.OutboundTopicAliases && opts.TopicAlias == 0 && opts.Topic != "" && cs.info.TopicAliasMaximum > 0 {
+		cs.outAliasMu.Lock()
+		defer cs.outAliasMu.Unlock()
+		if topic, registered := assignOutboundAlias(cs, &opts); registered {
+			admitted, err := c.sendQoS0(ctx, cs, &opts)
+			if !admitted {
+				delete(cs.outAliasMap, topic)
+				cs.outAliasNext--
+			}
+			return err
+		}
+	}
+	_, err := c.sendQoS0(ctx, cs, &opts)
+	return err
+}
+
+// sendQoS0 writes or queues a QoS 0 PUBLISH. admitted reports whether
+// the packet entered the connection's write order: it was written, is
+// being finished by the writer, or is queued for it.
+func (c *Client) sendQoS0(ctx context.Context, cs *connState, opts *wire.PublishOpts) (admitted bool, err error) {
+	waitForFlush := c.cfg.PublishMode == PublishWaitForFlush
+	if waitForFlush && cs.acquireIdle() {
+		admitted, err = cs.writePublish(ctx, opts)
+		cs.wmu.Unlock()
+		return admitted, err
+	}
+
+	bp, err := wire.EncodePublish(*opts)
+	if err != nil {
+		return false, err
+	}
+	if err = checkPacketSize(cs, len(*bp)); err != nil {
+		wire.ReleaseBuf(bp)
+		return false, err
+	}
+
+	req := writeReq{pkt: bp}
+	var done chan error
+	if waitForFlush {
+		done = make(chan error, 1)
+		req.done = done
+	}
+	// WriteDropNewest fails at once when the queue is full; WriteBlock
+	// waits for room, ctx or teardown.
+	if err = cs.queue(ctx, req, c.cfg.WriteOverflowPolicy != WriteDropNewest); err != nil {
+		wire.ReleaseBuf(bp)
+		return false, err
+	}
+	// The writer owns bp now; it releases it after the write.
+	if !waitForFlush {
+		return true, nil
+	}
+	return true, awaitWrite(ctx, cs, done)
+}
+
+// assignOutboundAlias replaces opts.Topic with an alias registered on cs,
+// or registers a new one while the broker's budget lasts, reporting the
+// topic it registered. The caller holds cs.outAliasMu until the packet
+// is queued, and undoes a registration whose packet was not.
+func assignOutboundAlias(cs *connState, opts *wire.PublishOpts) (topic string, registered bool) {
 	if alias, ok := cs.outAliasMap[opts.Topic]; ok {
-		// Re-use: send alias + empty topic (broker substitutes from
-		// its cache).
 		opts.TopicAlias = alias
 		opts.Topic = ""
-		return
+		return "", false
 	}
-	if cs.outAliasNext >= cs.outAliasMax {
-		return // no budget for a new alias
+	if cs.outAliasNext >= cs.info.TopicAliasMaximum {
+		return "", false
 	}
 	cs.outAliasNext++
 	cs.outAliasMap[opts.Topic] = cs.outAliasNext
-	// Registration: keep Topic, attach Alias. Broker caches it for
-	// future use.
 	opts.TopicAlias = cs.outAliasNext
+	return opts.Topic, true
 }
 
-// publishQoSReliable handles QoS 1 and 2: allocate packet ID,
-// serialise once, register on the session, send, wait on the ack
-// handshake. A write error doesn't fail the publish — the session
-// entry stays and the supervisor replays on reconnect.
+// publishQoSReliable starts a QoS 1/2 exchange and waits for the
+// broker's answer. If ctx ends before the PUBLISH was ever handed to a
+// connection the message is withdrawn; after that it may still be
+// delivered.
 func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) error {
-	id, err := c.session.AllocateID(ctx)
+	flow, err := c.startReliable(ctx, opts, nil, nil)
 	if err != nil {
-		return fmt.Errorf("mqttv5: allocate packet id: %w", err)
+		return err
+	}
+	life := c.life.Load()
+	select {
+	case <-flow.Done():
+		return flow.Err()
+	case <-ctx.Done():
+		c.engine.Withdraw(flow)
+		return ctx.Err()
+	case <-life.shutdown:
+		return life.closedErr()
+	}
+}
+
+// startReliable allocates a packet identifier, encodes the PUBLISH
+// once, registers the flow with the session engine (which stores it
+// first when a Store is configured) and queues an ordered marker so the
+// writer sends it behind earlier writes. The flow belongs to the session
+// from registration on: a dropped connection resends it, and a session
+// loss applies the [SessionLossPolicy].
+func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref []byte, settle func(context.Context, error) error) (*inflight.Out, error) {
+	// A QoS 1/2 message may be resent on a later connection, where the
+	// broker no longer knows any alias, so it always carries its topic.
+	if opts.TopicAlias != 0 {
+		if opts.Topic == "" {
+			return nil, fmt.Errorf("%w: QoS %d needs a topic name, not only an alias", ErrTopicAliasInvalid, opts.QoS)
+		}
+		opts.TopicAlias = 0
+	}
+	id, err := c.engine.AllocateID(ctx, inflight.OwnerPublish, c.done())
+	if errors.Is(err, inflight.ErrStopped) {
+		return nil, ErrClosed
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5: allocate packet id: %w", err)
 	}
 	opts.PacketID = id
+	opts.Dup = false
 
-	var buf bytes.Buffer
-	if _, werr := wire.WritePublish(&buf, opts); werr != nil {
-		c.session.ReleaseID(id)
-		return fmt.Errorf("mqttv5: encode PUBLISH: %w", werr)
-	}
-	packet := buf.Bytes()
-
-	entry, err := c.session.Outbound.Register(id, opts.QoS, packet)
+	packet, err := wire.MarshalPublish(opts)
 	if err != nil {
-		c.session.ReleaseID(id)
-		return fmt.Errorf("mqttv5: register outbound: %w", err)
+		c.engine.ReleaseID(id, inflight.OwnerPublish)
+		return nil, fmt.Errorf("mqttv5: encode PUBLISH: %w", err)
 	}
-
-	// Send the first attempt. A failure here doesn't fail the publish
-	// outright — the supervisor will replay on reconnect. We still
-	// surface non-transport errors (e.g., invalid opts) immediately.
-	if err := c.enqueueAwait(ctx, func(w io.Writer) (int64, error) {
-		n, err := w.Write(packet)
-		return int64(n), err
-	}); err != nil {
-		if errors.Is(err, ErrNotConnected) || errors.Is(err, ErrClosed) {
-			// Connection dropped before/during write. Replay will
-			// pick it up. Continue to wait below.
-			c.cfg.Logger.Debug("mqttv5: publish write deferred to replay",
-				"packet_id", id, "error", err)
-		} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			// Transport-level failures look like ErrNotConnected /
-			// ErrClosed; anything else is more serious.
-			c.cfg.Logger.Warn("mqttv5: publish write error",
-				"packet_id", id, "error", err)
+	if cs := c.cur.Load(); cs != nil {
+		if err = checkPacketSize(cs, len(packet)); err != nil {
+			c.engine.ReleaseID(id, inflight.OwnerPublish)
+			return nil, err
 		}
 	}
-
-	select {
-	case <-entry.Done:
-		if entry.Err != nil {
-			return entry.Err
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.shutdown:
-		return ErrClosed
+	var expiresAt time.Time
+	if opts.MessageExpiryInterval != nil {
+		expiresAt = c.cfg.clock.Now().Add(time.Duration(*opts.MessageExpiryInterval) * time.Second)
 	}
+
+	flow, link, err := c.engine.Register(ctx, inflight.Message{
+		ID: id, QoS: opts.QoS, Packet: packet, ExpiresAt: expiresAt, Ref: ref, Settle: settle,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5: store outbound publish: %w", err)
+	}
+	if link != nil {
+		// A failed marker is harmless: the next connection sends every
+		// registered flow.
+		_ = link.SendOrdered(ctx, flow.Seq())
+	}
+	return flow, nil
 }
