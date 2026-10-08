@@ -6,6 +6,7 @@ package benchmarks
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"runtime/pprof"
 	"strings"
@@ -63,49 +64,87 @@ func TestAdapterConsumersEndWithTheBenchmark(t *testing.T) {
 	}
 }
 
-// Stopping a real adapter's subscription while its callback still holds
-// a duplicate waits for that delivery, so the check counts it.
+// Stopping a real adapter's subscription while a duplicate is still
+// being delivered waits for that delivery, so the check counts it. The
+// delivery is held inside the subscription's gate, which waits for it,
+// or before it, where only the library's own stop can: a library whose
+// stop returned with its callback still running would let the
+// duplicate reach a closed gate after the check.
 func TestAdapterStopWaitsForADeliveryInProgress(t *testing.T) {
-	for _, l := range append(libs, floorLib) {
-		t.Run("lib="+l.name, func(t *testing.T) {
-			var checked error
-			res := testing.Benchmark(func(b *testing.B) {
-				srv := newRawServer(b, l.v5)
-				s := newSink(64, 1)
-				entered, release := make(chan struct{}), make(chan struct{})
-				var calls atomic.Int64
-				sub := subscribe(b, l, clientConfig{id: uniqueID("adapter-stop"), addr: srv.addr(), receiveMaximum: receiveWindow},
-					"adapter/t", 0, modeCallback, 1, func(p []byte) {
-						if calls.Add(1) == 2 {
-							close(entered)
-							<-release
+	for _, held := range []string{"inside-gate", "before-gate"} {
+		for _, l := range append(libs, floorLib) {
+			t.Run(fmt.Sprintf("held=%s/lib=%s", held, l.name), func(t *testing.T) {
+				var checked error
+				res := testing.Benchmark(func(b *testing.B) {
+					entered, release := make(chan struct{}), make(chan struct{})
+					var calls atomic.Int64
+					hold := func(onMsg func([]byte)) func([]byte) {
+						return func(p []byte) {
+							if calls.Add(1) == 2 {
+								close(entered)
+								<-release
+							}
+							onMsg(p)
 						}
-						s.onMsg(p)
-					})
-				srv.awaitSubscribed(b)
-				for range 2 {
-					if err := srv.publish("adapter/t", 0, Payload(64), 1); err != nil {
-						b.Fatal(err)
 					}
+					s := newSink(64, 1)
+					onMsg := s.onMsg
+					if held == "inside-gate" {
+						onMsg = hold(onMsg)
+					} else {
+						adapter := l.subscribe
+						l.subscribe = func(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) subscriber {
+							return adapter(b, cfg, filter, qos, m, consumers, hold(onMsg))
+						}
+					}
+					srv := newRawServer(b, l.v5)
+					sub := subscribe(b, l, clientConfig{id: uniqueID("adapter-stop"), addr: srv.addr(), receiveMaximum: receiveWindow},
+						"adapter/t", 0, modeCallback, 1, onMsg)
+					srv.awaitSubscribed(b)
+					for range 2 {
+						if err := srv.publish("adapter/t", 0, Payload(64), 1); err != nil {
+							b.Fatal(err)
+						}
+					}
+					await(b, entered, 5*time.Second, s.String)
+					// Held past paho3's default 250 ms quiesce.
+					go func() {
+						time.Sleep(time.Second)
+						close(release)
+					}()
+					checked = s.finish(sub, stopBound)
+				})
+				if res.N == 0 {
+					t.Fatal("the benchmark failed")
 				}
-				await(b, entered, 5*time.Second, s.String)
-				// Held past paho3's 250 ms quiesce, after which its
-				// Disconnect returns whatever its router is doing.
-				go func() {
-					time.Sleep(time.Second)
-					close(release)
-				}()
-				checked = s.finish(sub, stopBound)
+				if checked == nil || !strings.Contains(checked.Error(), "1 duplicates") {
+					t.Fatalf("check = %v, want the duplicate counted", checked)
+				}
 			})
-			if res.N == 0 {
-				t.Fatal("the benchmark failed")
-			}
-			if checked == nil {
-				t.Fatal("the check passed with a duplicate still being delivered")
-			}
-			if !strings.Contains(checked.Error(), "1 duplicates") {
-				t.Fatalf("the check failed for another reason: %v", checked)
-			}
+		}
+	}
+}
+
+// A client cleanup that does not return within its bound fails the
+// benchmark rather than holding it up.
+func TestCleanupIsBounded(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	ended := make(chan testing.BenchmarkResult, 1)
+	go func() {
+		ended <- testing.Benchmark(func(b *testing.B) {
+			cleanupWithin(b, "stuck", 50*time.Millisecond, func(context.Context) error {
+				<-release
+				return nil
+			})
 		})
+	}()
+	select {
+	case res := <-ended:
+		if res.N != 0 {
+			t.Fatal("a cleanup that did not return passed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the benchmark waited for a stuck cleanup")
 	}
 }

@@ -425,15 +425,21 @@ func TestAliasWaitEndsWithContext(t *testing.T) {
 // request is refused at once instead of waiting for an answer that no
 // writer would give.
 func TestClosedWriteQueueAdmitsNothing(t *testing.T) {
+	held := make(chan struct{})
+	drop := sync.OnceFunc(func() { close(held) })
 	b := testbroker.New(t, func(c *testbroker.Conn) {
 		c.AcceptConnect(wire.ConnackOpts{})
+		<-held
 		c.Close()
 	})
+	t.Cleanup(drop)
 	cli := tbClient(t, b, WithOnConnectionDown(func() bool { return false }))
+	// Taken while the broker holds the connection open.
 	cs := cli.cur.Load()
 	if cs == nil {
 		t.Fatal("not connected")
 	}
+	drop()
 	<-cs.writerDone
 	done := make(chan error, 1)
 	if err := cs.queue(context.Background(), writeReq{fn: writeBytes(nil), done: done}, true); !errors.Is(err, ErrNotConnected) {

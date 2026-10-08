@@ -424,15 +424,24 @@ func TestStoreFailureDuringActivation(t *testing.T) {
 	connected := make(chan error, 1)
 	go func() { connected <- cli.Connect(context.Background()) }()
 	<-log.entered
-	select {
-	case <-failures:
-	case <-time.After(5 * time.Second):
-		close(log.release)
-		t.Fatal("the failed write did not stop the client")
+	// The write fails while Connect is held before activating the
+	// connection; the client stops once Connect gives up.
+	deadline := time.Now().Add(5 * time.Second)
+	for cli.engine.Failure() == nil {
+		if time.Now().After(deadline) {
+			close(log.release)
+			t.Fatal("the session-loss rewrite did not fail")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	close(log.release)
 	if err := <-connected; !errors.Is(err, ErrStoreFailed) {
 		t.Fatalf("Connect returned %v after the client stopped", err)
+	}
+	select {
+	case <-failures:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the failed write did not stop the client")
 	}
 	select {
 	case <-up:
@@ -497,7 +506,7 @@ func TestStoreFailureWhilePoolConnects(t *testing.T) {
 	// No supervisor of the ended span may be left running.
 	done := make(chan struct{})
 	go func() {
-		cli.life.Load().supervisor.Wait()
+		cli.life.Load().running.Wait()
 		close(done)
 	}()
 	select {

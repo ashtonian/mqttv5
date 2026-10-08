@@ -6,7 +6,6 @@ package benchmarks
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"slices"
 	"sync"
@@ -26,38 +25,46 @@ func BenchmarkE2E_RoundTrip(b *testing.B) {
 			for _, sz := range []size{size64B, size1KiB, size1MiB} {
 				b.Run(fmt.Sprintf("lib=%s/qos=%d/size=%s", l.name, qos, sz.name), func(b *testing.B) {
 					topic := "bench/roundtrip/" + uniqueID("")
-					arrived := make(chan int, 1)
-					ready := make(chan struct{})
-					var once sync.Once
-					subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
-						if len(p) == 0 {
-							once.Do(func() { close(ready) })
-							return
+					s := newSink(sz.bytes, b.N)
+					arrived := make(chan uint64, 1)
+					sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
+						if len(p) > 0 {
+							// Torn stamps are the sink's to report, and so is
+							// a delivery the loop is not waiting for.
+							seq, _ := readSeq(p)
+							select {
+							case arrived <- seq:
+							default:
+							}
 						}
-						arrived <- len(p)
+						s.onMsg(p)
 					})
 					p := l.connect(b, clientConfig{id: uniqueID(l.name + "-pub")})
 					ctx := context.Background()
-					probe := &sink{ready: ready}
-					waitLive(b, probe, func() error { return p.publish(ctx, topic, 0, nil) })
+					waitLive(b, s, func() error { return p.publish(ctx, topic, 0, nil) })
+					// One buffer, stamped for each message: the previous one
+					// has arrived, so no library still holds it.
 					payload := Payload(sz.bytes)
 
 					b.SetBytes(int64(sz.bytes))
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := range b.N {
+						stampSeq(payload, uint64(i))
 						if err := p.publish(ctx, topic, qos, payload); err != nil {
 							b.Fatalf("publish %d: %v", i, err)
 						}
 						select {
-						case n := <-arrived:
-							if n != sz.bytes {
-								b.Fatalf("message %d arrived with %d bytes, want %d", i, n, sz.bytes)
+						case seq := <-arrived:
+							if seq != uint64(i) {
+								b.Fatalf("waiting for message %d, message %d arrived; %s", i, seq, s)
 							}
 						case <-time.After(10 * time.Second):
 							b.Fatalf("message %d never arrived", i)
 						}
 					}
+					b.StopTimer()
+					s.check(b, sub)
 				})
 			}
 		}
@@ -93,52 +100,44 @@ func runLatency(b *testing.B, l lib, qos byte, rate, size int) {
 	topic := "bench/latency/" + uniqueID("")
 	interval := time.Second / time.Duration(rate)
 	n := b.N
+	s := newSink(size, n)
+	// Written by the subscriber's one callback goroutine, read once the
+	// subscription has stopped.
 	latency := make([]time.Duration, n)
 	var start atomic.Pointer[time.Time]
-	var got atomic.Int64
-	done := make(chan struct{})
-	ready := make(chan struct{})
-	var once sync.Once
-	subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
-		if len(p) == 0 {
-			once.Do(func() { close(ready) })
-			return
+	sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-sub")}, topic, qos, modeCallback, 1, func(p []byte) {
+		if t0 := start.Load(); t0 != nil && len(p) > 0 {
+			// The first delivery of each message counts; the sink fails
+			// the run on any other.
+			if seq, ok := readSeq(p); ok && seq < uint64(n) && latency[seq] == 0 {
+				latency[seq] = time.Since(t0.Add(time.Duration(seq) * interval))
+			}
 		}
-		seq := binary.BigEndian.Uint64(p)
-		t0 := start.Load()
-		if t0 == nil || seq >= uint64(n) || latency[seq] != 0 {
-			return // a probe or a QoS 1 duplicate
-		}
-		latency[seq] = time.Since(t0.Add(time.Duration(seq) * interval))
-		if got.Add(1) == int64(n) {
-			close(done)
-		}
+		s.onMsg(p)
 	})
 	p := l.connect(b, clientConfig{id: uniqueID(l.name + "-pub")})
 	ctx := context.Background()
-	waitLive(b, &sink{ready: ready}, func() error { return p.publish(ctx, topic, 0, nil) })
+	waitLive(b, s, func() error { return p.publish(ctx, topic, 0, nil) })
 
 	payloads := make([][]byte, n)
 	slab := make([]byte, n*size)
 	for i := range payloads {
 		payloads[i] = slab[i*size : (i+1)*size : (i+1)*size]
 		copy(payloads[i], Payload(size))
-		binary.BigEndian.PutUint64(payloads[i], uint64(i))
+		stampSeq(payloads[i], uint64(i))
 	}
 
 	jobs := make(chan int, n)
 	var failed atomic.Pointer[error]
 	var wg sync.WaitGroup
 	for range latencyWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range jobs {
 				if err := p.publish(ctx, topic, qos, payloads[i]); err != nil {
 					failed.CompareAndSwap(nil, &err)
 				}
 			}
-		}()
+		})
 	}
 
 	b.ResetTimer()
@@ -149,12 +148,13 @@ func runLatency(b *testing.B, l lib, qos byte, rate, size int) {
 		jobs <- i
 	}
 	close(jobs)
-	await(b, done, time.Minute, func() string { return fmt.Sprintf("received %d of %d", got.Load(), n) })
+	await(b, s.done, time.Minute, s.String)
 	b.StopTimer()
 	wg.Wait()
 	if err := failed.Load(); err != nil {
 		b.Fatalf("publish: %v", *err)
 	}
+	s.check(b, sub)
 
 	slices.Sort(latency)
 	at := func(q float64) float64 { return float64(latency[int(q*float64(n-1))].Nanoseconds()) }

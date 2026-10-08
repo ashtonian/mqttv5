@@ -4,6 +4,7 @@ package mqttv5
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,37 +24,81 @@ import (
 // and Connect returns nil; see [Client.AwaitConnection]. Returns
 // [ErrAlreadyConnected] when called twice without an intervening
 // Disconnect; while a Disconnect, or a supervisor told to stop
-// reconnecting, is still tearing down, Connect waits for it.
+// reconnecting, is still tearing down, Connect waits for it. A
+// Disconnect during Connect cancels it, and Connect returns
+// [ErrClosed].
 func (c *Client) Connect(ctx context.Context) error {
-	var life *lifecycle
+	life, err := c.newSpan(ctx)
+	if err != nil {
+		return err
+	}
+	err = c.start(ctx, life)
+	life.running.Done()
+	if err == nil {
+		return nil
+	}
+	if life.claimStop() {
+		// Nothing else is ending the span: end it here, so the next
+		// Connect starts from a finished one. The teardown runs even
+		// when ctx has ended, within the connect timeout.
+		opts := wire.DisconnectOpts{ReasonCode: wire.ReasonNormalDisconnection}
+		if errors.Is(err, ErrStoreFailed) {
+			opts.ReasonCode = wire.ReasonUnspecifiedError
+		}
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.ConnectTimeout)
+		_ = c.teardown(tctx, life, opts, err)
+		cancel()
+		return err
+	}
+	select {
+	case <-life.finished:
+	case <-ctx.Done():
+	}
+	return err
+}
+
+// newSpan begins a Connect…Disconnect span, first waiting for the
+// previous one's teardown to finish. The span counts the calling
+// Connect as running.
+func (c *Client) newSpan(ctx context.Context) (*lifecycle, error) {
 	for {
 		c.startMu.Lock()
 		prev := c.life.Load()
 		if !c.started {
 			c.started = true
-			life = newLifecycle()
+			life := newLifecycle()
+			// Counted before any teardown can see the span.
+			life.running.Add(1)
 			c.life.Store(life)
 			c.startMu.Unlock()
-			break
+			return life, nil
 		}
 		c.startMu.Unlock()
 		select {
 		case <-prev.shutdown:
 		default:
-			return ErrAlreadyConnected
+			return nil, ErrAlreadyConnected
 		}
 		select {
 		case <-prev.finished:
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
+}
+
+// start brings span life up: it loads the session, makes the first
+// connection attempt, connects the publisher pool and starts the
+// supervisor. The span's teardown cancels it and waits for it.
+func (c *Client) start(ctx context.Context, life *lifecycle) error {
+	ctx, cancel := life.context(ctx)
+	defer cancel()
 
 	if !c.restored.Load() {
 		if err := c.engine.Restore(ctx); err != nil {
-			c.startMu.Lock()
-			c.started = false
-			c.startMu.Unlock()
+			if ended := life.endedErr(); ended != nil {
+				return ended
+			}
 			return fmt.Errorf("mqttv5: load session store: %w", err)
 		}
 		c.restored.Store(true)
@@ -71,36 +116,31 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.cfg.Logger.Info("mqttv5: WithCleanStart(true) discards the stored session",
 			slog.Int("outbound", c.engine.OutboundLen()))
 		if err := c.engine.Discard(ctx); err != nil {
-			c.startMu.Lock()
-			c.started = false
-			c.startMu.Unlock()
+			if ended := life.endedErr(); ended != nil {
+				return ended
+			}
 			return fmt.Errorf("mqttv5: reset session store: %w", err)
 		}
 	}
 
 	brokerURL := c.nextBrokerURL()
 	result, err := c.connectOnce(ctx, brokerURL, cleanStart)
-	if err == nil {
+	connected := err == nil
+	if connected {
 		if err = c.runConnection(life, result); err != nil {
-			// The span is ending; its teardown is under way.
-			select {
-			case <-life.finished:
-			case <-ctx.Done():
-			}
 			return err
 		}
-	}
-	connected := err == nil
-	if err != nil {
+	} else {
+		if ended := life.endedErr(); ended != nil {
+			// The teardown cut the attempt short.
+			return ended
+		}
 		c.stats.addConnectFailure()
 		c.redirectFrom(err)
 		if c.cfg.OnConnectError != nil {
 			c.cfg.OnConnectError(err)
 		}
 		if !c.cfg.RetryInitialConnect || ctx.Err() != nil {
-			c.startMu.Lock()
-			c.started = false
-			c.startMu.Unlock()
 			return err
 		}
 		c.cfg.Logger.Warn("mqttv5: initial connect failed; retrying in the background",
@@ -113,25 +153,16 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
-	// The supervisor starts only while the span is not ending: the
+	// The supervisor starts only while the span is not ending: a
 	// teardown waits for a supervisor that started before it, and none
 	// may start after it.
 	life.mu.Lock()
+	defer life.mu.Unlock()
 	if err := c.activationErr(life); err != nil {
-		life.mu.Unlock()
-		if c.pool != nil {
-			// Members the teardown missed while they were connecting.
-			_ = c.pool.disconnect(ctx)
-		}
-		select {
-		case <-life.finished:
-		case <-ctx.Done():
-		}
 		return err
 	}
-	life.supervisor.Add(1)
+	life.running.Add(1)
 	go c.supervisor(life, cleanStart, connected)
-	life.mu.Unlock()
 	return nil
 }
 
@@ -175,7 +206,7 @@ func (c *Client) Disconnect(ctx context.Context) error {
 // goroutine.
 func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) error {
 	c.startMu.Lock()
-	started := c.started
+	started, life := c.started, c.life.Load()
 	c.startMu.Unlock()
 	if !started {
 		return nil
@@ -185,7 +216,7 @@ func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) err
 		return fmt.Errorf("%w: CONNECT sent 0, DISCONNECT asks for %d", ErrInvalidSessionExpiry, *opts.SessionExpiryInterval)
 	}
 
-	return c.stop(ctx, c.life.Load(), opts.wire(), nil)
+	return c.stop(ctx, life, opts.wire(), nil)
 }
 
 // stop ends span life with a DISCONNECT carrying opts and tears it
@@ -193,9 +224,15 @@ func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) err
 // installed in the span and no supervisor started, so the teardown sees
 // whatever was.
 func (c *Client) stop(ctx context.Context, life *lifecycle, opts wire.DisconnectOpts, cause error) error {
-	life.mu.Lock()
-	life.stopping = true
-	life.mu.Unlock()
+	life.claimStop()
+	return c.teardown(ctx, life, opts, cause)
+}
+
+// teardown ends span life, which is stopping: it sends the DISCONNECT,
+// ends the span, which cancels what the span is still starting, waits
+// for what runs in it and finishes it. Every caller returns once the
+// span is finished.
+func (c *Client) teardown(ctx context.Context, life *lifecycle, opts wire.DisconnectOpts, cause error) error {
 	life.disconnOnce.Do(func() {
 		c.sendDisconnectWith(ctx, opts)
 		life.endWith(cause)
@@ -203,7 +240,7 @@ func (c *Client) stop(ctx context.Context, life *lifecycle, opts wire.Disconnect
 			cs.signalDown()
 		}
 	})
-	life.supervisor.Wait()
+	life.running.Wait()
 	return c.finish(ctx, life)
 }
 
@@ -214,9 +251,17 @@ func (c *Client) stop(ctx context.Context, life *lifecycle, opts wire.Disconnect
 func (c *Client) finish(ctx context.Context, life *lifecycle) error {
 	var poolErr error
 	life.finishOnce.Do(func() {
+		cs := c.cur.Load()
+		if cs != nil {
+			// Its workers have exited, or are exiting: the supervisor
+			// joins them, but a connection activated by a Connect whose
+			// span ended before the supervisor started has no supervisor.
+			cs.signalDown()
+			<-cs.done
+		}
 		// The read loop has exited, so nothing dispatches any more.
 		c.closeAllSubs()
-		if cs := c.cur.Load(); cs != nil {
+		if cs != nil {
 			c.engine.Disconnected(cs)
 		}
 		c.setCur(nil)
@@ -535,15 +580,13 @@ func (c *Client) activationErr(life *lifecycle) error {
 	if err := c.engine.Failure(); err != nil {
 		return err
 	}
+	if err := life.endedErr(); err != nil {
+		return err
+	}
 	if life.stopping {
 		return ErrClosed
 	}
-	select {
-	case <-life.shutdown:
-		return life.closedErr()
-	default:
-		return nil
-	}
+	return nil
 }
 
 // storeFailed is the session engine's OnFailure: a store write failed,
@@ -577,7 +620,7 @@ func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 // healthy endpoints; a successful connect leaves the index parked on
 // whichever URL accepted us.
 func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
-	defer life.supervisor.Done()
+	defer life.running.Done()
 	// attempts counts reconnect attempts since the last connection that
 	// lasted; it carries the backoff across connections that do not.
 	attempts := 0
@@ -669,7 +712,7 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			c.cfg.OnReconnectAttempt(attempt, brokerURL)
 		}
 
-		ctx, cancel := life.attemptContext(c.cfg.ConnectTimeout)
+		ctx, cancel := life.context(context.Background())
 		result, err := c.connectOnce(ctx, brokerURL, cleanStart)
 		cancel()
 		if err != nil {

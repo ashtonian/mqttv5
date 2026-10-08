@@ -181,6 +181,11 @@ func TestAdoptRestoredFlows(t *testing.T) {
 	if err := recvSettle(t, finished); err != nil {
 		t.Fatalf("finished flow settled with %v", err)
 	}
+	// The settle callback reports before its job deletes the record and
+	// forgets the flow.
+	if err := h2.e.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if h2.e.Adopt([]byte("early"), func(context.Context, error) error { return nil }) {
 		t.Fatal("a finished flow was adopted twice")
 	}

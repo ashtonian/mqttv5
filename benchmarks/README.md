@@ -73,24 +73,31 @@ The rules that make the comparison fair:
    counts each sequence number once and fails the run on a duplicate, a
    wrong size, a payload whose two stamps disagree (pieces of two
    messages), a sequence number never sent, or one missing at the end.
-   The check runs once the subscriber has stopped: the library's own
-   stop, then a gate in front of the sink that waits for the deliveries
-   in progress and refuses later ones, so a duplicate still in a
-   consumer's hands is counted; a delivery after the library's stop
-   returned, or a stop that takes over 10 s, fails the run.
+   Every scenario that receives checks this way, the round-trip and
+   latency ones included. The check runs once the subscriber has
+   stopped. Each adapter's stop returns only when its library will
+   deliver nothing more: mqttv5's and autopaho's `Disconnect` wait for
+   the goroutines that run callbacks, and paho3's counts as a stop only
+   when it returns before its quiesce period ends, which it does once
+   its router has exited. A gate in front of the sink then waits for
+   deliveries in progress and refuses later ones, so a duplicate still
+   in a consumer's hands is counted, and a delivery reaching the closed
+   gate fails the run, as does a stop that takes over 10 s.
    A run with drops measures nothing, and the broker is configured never
    to drop queued messages ([`broker/mosquitto.conf`](broker/mosquitto.conf)).
 5. **Recorded, not typed.** [`scripts/run.sh`](scripts/run.sh) records
    the commit (with a hash of any uncommitted changes, which it records
    only when asked), toolchain, host, CPU, GOMAXPROCS, broker image and
    the load average before, during (per run, in a side file) and after,
-   and repeats the whole sweep `RUNS` times, so each library is measured
-   at several points of the recording rather than in one stretch: a
-   change in load is spread across libraries, not cancelled, and the
-   load record shows when it happened. With `LOAD_MAX` set each run
-   starts only on a quiet host, and a recording whose host never
-   quietens is marked invalid rather than kept; load that rises during
-   a run is not controlled, only recorded at the start of the next.
+   and repeats the whole sweep `RUNS` times, so each library's runs are
+   spread across the recording instead of taken back to back. That can
+   reduce the bias of a fixed order, but it does not balance exposure to
+   load: a short spike can still fall on one library, and the load
+   record, sampled as each run starts, can miss it. With `LOAD_MAX` set
+   each run starts only on a quiet host, and a recording whose host
+   never quietens is marked invalid rather than kept; load that rises
+   during a run is not controlled, only recorded at the start of the
+   next.
    `benchtab` renders each table from a recording: the
    median of the runs with a 95% confidence interval, and, where
    libraries are compared, the change with its Mann-Whitney U p-value.
@@ -730,8 +737,9 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 A library is a `lib` value in [`e2e_libs_test.go`](e2e_libs_test.go):
 `connect` returns a `publisher`; `subscribe` delivers payloads to a
 callback through a delivery `mode` and returns a `subscriber`, whose
-`stop` disconnects it and reports an error when the library fails to
-stop. Add it to `libs` and every scenario runs it. A scenario is a
+`stop` disconnects it, returns only once the library will deliver
+nothing more, and reports an error when it cannot confirm that within
+its ctx. Add it to `libs` and every scenario runs it. A scenario is a
 benchmark in an `e2e_*_test.go` file that loops over `libs` and
 subscribes through the package's `subscribe`, which puts the gate in
 front of the callback; name sub-benchmarks with `key=value` pairs and

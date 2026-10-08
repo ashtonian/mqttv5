@@ -317,12 +317,14 @@ func (c *Conn) ExpectNone(pt wire.PacketType, d time.Duration) {
 	}
 }
 
-// AcceptConnect reads CONNECT and replies with CONNACK opts.
+// AcceptConnect reads CONNECT and replies with CONNACK opts. It returns
+// nil when the client leaves without sending CONNECT, as one whose
+// attempt was cancelled does; a client that stays and sends none, or
+// sends something else first, fails the test.
 func (c *Conn) AcceptConnect(opts wire.ConnackOpts) *ConnectInfo {
 	c.T.Helper()
-	p, ok := c.Await(wire.CONNECT, 0)
+	p, ok := c.awaitConnect()
 	if !ok {
-		c.T.Errorf("testbroker conn %d: no CONNECT", c.Index)
 		return nil
 	}
 	// A client gone before the CONNACK fails the script's next step.
@@ -334,15 +336,30 @@ func (c *Conn) AcceptConnect(opts wire.ConnackOpts) *ConnectInfo {
 // Session Present is set unless the CONNECT asked for a clean start.
 func (c *Conn) AcceptResume(opts wire.ConnackOpts) *ConnectInfo {
 	c.T.Helper()
-	p, ok := c.Await(wire.CONNECT, 0)
+	p, ok := c.awaitConnect()
 	if !ok {
-		c.T.Errorf("testbroker conn %d: no CONNECT", c.Index)
 		return nil
 	}
 	opts.SessionPresent = !p.Connect.CleanStart
 	// A client gone before the CONNACK fails the script's next step.
 	_ = c.Write(func(w io.Writer) (int64, error) { return wire.WriteConnack(w, opts) })
 	return p.Connect
+}
+
+// awaitConnect reads the connection's first packet, which must be
+// CONNECT. ok is false when the client left first.
+func (c *Conn) awaitConnect() (Packet, bool) {
+	c.T.Helper()
+	p, ok, err := c.Next(0)
+	switch {
+	case ok && p.Type == wire.CONNECT:
+		return p, true
+	case ok:
+		c.T.Errorf("testbroker conn %d: first packet %s, want CONNECT", c.Index, p.Type)
+	case errors.Is(err, ErrTimeout):
+		c.T.Errorf("testbroker conn %d: no CONNECT within %v", c.Index, DefaultWait)
+	}
+	return Packet{}, false
 }
 
 // ServeSubscribe answers one SUBSCRIBE: each filter gets reason rc, or its

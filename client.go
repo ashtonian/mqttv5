@@ -7,7 +7,6 @@ import (
 	mathrand "math/rand/v2"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/internal/trie"
@@ -170,9 +169,10 @@ type lifecycle struct {
 	// happen under it only while stopping is unset.
 	mu       sync.Mutex
 	stopping bool
-	// supervisor counts the span's supervisor, which its teardown waits
-	// for.
-	supervisor sync.WaitGroup
+	// running counts what may still install a connection in the span:
+	// the Connect starting it, and its supervisor. The teardown waits
+	// for both.
+	running sync.WaitGroup
 }
 
 func newLifecycle() *lifecycle {
@@ -188,10 +188,32 @@ func (l *lifecycle) isStopping() bool {
 	return l.stopping
 }
 
-// attemptContext bounds a reconnect attempt: it ends after d, or when
-// the span ends.
-func (l *lifecycle) attemptContext(d time.Duration) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), d)
+// endedErr is why the span ended once it has, and nil before.
+func (l *lifecycle) endedErr() error {
+	select {
+	case <-l.shutdown:
+		return l.closedErr()
+	default:
+		return nil
+	}
+}
+
+// claimStop marks the span stopping and reports whether this call did,
+// in which case the caller owns its teardown.
+func (l *lifecycle) claimStop() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stopping {
+		return false
+	}
+	l.stopping = true
+	return true
+}
+
+// context returns a context that ends with parent, or when the span
+// ends.
+func (l *lifecycle) context(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
 	go func() {
 		select {
 		case <-l.shutdown:

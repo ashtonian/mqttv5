@@ -83,8 +83,9 @@ type lib struct {
 type subscriber struct {
 	// dropped counts messages the library discarded for want of room.
 	dropped func() int64
-	// stop disconnects the subscriber and waits, within ctx, for what
-	// the library waits for; it reports how that went.
+	// stop disconnects the subscriber and returns once the library will
+	// deliver nothing more, or with an error when it cannot confirm that
+	// within ctx.
 	stop func(ctx context.Context) error
 }
 
@@ -98,16 +99,43 @@ func subscribe(b *testing.B, l lib, cfg clientConfig, filter string, qos byte, m
 	s := newSubscription()
 	s.subscriber = l.subscribe(b, cfg, filter, qos, m, consumers, s.through(onMsg))
 	b.Cleanup(func() {
-		if err := s.Stop(stopBound); err != nil && !b.Failed() {
+		if b.Failed() {
+			_ = s.Stop(stopBound)
+			return
+		}
+		if err := s.Stop(stopBound); err != nil {
 			b.Errorf("stop the %s subscriber: %v", l.name, err)
+		} else if n := s.late.Load(); n > 0 {
+			b.Errorf("the %s subscriber delivered %d messages after its library stopped", l.name, n)
 		}
 	})
 	return s
 }
 
+// cleanupWithin registers stop as cleanup, giving it bound: a library
+// that does not stop in time fails the benchmark instead of holding up
+// the run.
+func cleanupWithin(b *testing.B, what string, bound time.Duration, stop func(ctx context.Context) error) {
+	b.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), bound)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- stop(ctx) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			err = fmt.Errorf("did not return within %v", bound)
+		}
+		if err != nil && !b.Failed() {
+			b.Errorf("%s: %v", what, err)
+		}
+	})
+}
+
 // subscription is a subscriber under test. Its deliveries reach onMsg
-// through a gate, so Stop ends them however little the library's own
-// stop waits for.
+// through a gate, which Stop closes after the library's stop: it waits
+// for the deliveries in progress and counts any that arrive later.
 type subscription struct {
 	subscriber
 	gate *gate
@@ -263,11 +291,7 @@ func newMqttv5(b *testing.B, cfg clientConfig) *mqttv5.Client {
 	if err := cli.Connect(ctx); err != nil {
 		b.Fatalf("mqttv5 Connect: %v", err)
 	}
-	b.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = cli.Disconnect(ctx)
-	})
+	cleanupWithin(b, "mqttv5 Disconnect", stopBound, cli.Disconnect)
 	return cli
 }
 
@@ -382,11 +406,9 @@ func newAutopaho(b *testing.B, cfg clientConfig, onPublish func(paho.PublishRece
 		cancel()
 		b.Fatalf("autopaho AwaitConnection: %v", err)
 	}
-	b.Cleanup(func() {
-		ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
-		defer done()
-		_ = cm.Disconnect(ctx)
-		cancel()
+	cleanupWithin(b, "autopaho Disconnect", stopBound, func(ctx context.Context) error {
+		defer cancel()
+		return cm.Disconnect(ctx)
 	})
 	return cm
 }
@@ -510,8 +532,25 @@ func newPaho3(b *testing.B, cfg clientConfig) paho3.Client {
 	if t := c.Connect(); !t.WaitTimeout(10*time.Second) || t.Error() != nil {
 		b.Fatalf("paho3 Connect: %v", t.Error())
 	}
-	b.Cleanup(func() { c.Disconnect(250) })
+	cleanupWithin(b, "paho3 Disconnect", stopBound, func(ctx context.Context) error { return disconnectPaho3(ctx, c) })
 	return c
+}
+
+// disconnectPaho3 disconnects c within ctx. Disconnect returns once the
+// client's workers, its router and so its callbacks included, have
+// exited, or when its quiesce period ends: only a return before the
+// period ends confirms the client stopped.
+func disconnectPaho3(ctx context.Context, c paho3.Client) error {
+	quiesce := 250 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		quiesce = time.Until(deadline).Truncate(time.Millisecond)
+	}
+	begin := time.Now()
+	c.Disconnect(uint(quiesce.Milliseconds()))
+	if time.Since(begin) >= quiesce {
+		return fmt.Errorf("paho3: Disconnect gave up after %v with its router still running", quiesce)
+	}
+	return nil
 }
 
 func connectPaho3(b *testing.B, cfg clientConfig) publisher {
@@ -528,13 +567,7 @@ func subscribePaho3(b *testing.B, cfg clientConfig, filter string, qos byte, m m
 	if !t.WaitTimeout(5*time.Second) || t.Error() != nil {
 		b.Fatalf("paho3 Subscribe: %v", t.Error())
 	}
-	// Disconnect returns after the quiesce period whether or not the
-	// router that runs the callbacks has stopped; the subscription's gate
-	// ends delivery.
-	return subscriber{dropped: noDrops, stop: func(context.Context) error {
-		c.Disconnect(250)
-		return nil
-	}}
+	return subscriber{dropped: noDrops, stop: func(ctx context.Context) error { return disconnectPaho3(ctx, c) }}
 }
 
 // sink checks what a subscriber receives against what the raw sources

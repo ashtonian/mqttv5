@@ -223,10 +223,11 @@ Other changes:
   `OnConnectionDown` returning false now tears down like `Disconnect`:
   subscriptions close.
 - Cancelling `Connect`'s ctx ends the handshake at once with ctx's
-  error, rather than at the connect timeout. `Disconnect` ends a
-  reconnect attempt in progress instead of waiting for it, without
-  `OnConnectionDown` or `OnConnectError` firing for it. `Connect`
-  returns `ErrClosed` when a `Disconnect` overlapping it wins.
+  error, rather than at the connect timeout. A `Disconnect` during
+  `Connect` cancels it and waits for it; `Connect` returns `ErrClosed`.
+  `Disconnect` likewise ends a reconnect attempt in progress, without
+  `OnConnectionDown` or `OnConnectError` firing for it, and returns
+  only once the connection's goroutines have exited.
 - `Disconnect` waits for the goroutines that run the lifecycle
   callbacks and `SubscribeCallback` handlers: call it from one of them
   on a new goroutine, or it deadlocks.
