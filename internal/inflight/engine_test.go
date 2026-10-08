@@ -193,7 +193,7 @@ func TestQoS1PublishAndAck(t *testing.T) {
 	o := h.publish(1, "a")
 	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", o.PacketID()))
 	notDone(t, o)
-	h.e.HandlePuback(o.PacketID(), nil)
+	h.e.HandlePuback(o.PacketID(), 0, nil)
 	if err := done(t, o); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestPublishRefusedReturnsError(t *testing.T) {
 	o := h.publish(1, "a")
 	h.collect()
 	refused := errors.New("not authorized")
-	h.e.HandlePuback(o.PacketID(), refused)
+	h.e.HandlePuback(o.PacketID(), wire.ReasonQuotaExceeded, refused)
 	if err := done(t, o); err != refused {
 		t.Fatalf("err = %v", err)
 	}
@@ -258,7 +258,7 @@ func TestResumeResendsInOriginalOrderWithDup(t *testing.T) {
 		flows = append(flows, h.publish(1, fmt.Sprint(i)))
 	}
 	first := h.collect()
-	h.e.HandlePuback(flows[2].PacketID(), nil)
+	h.e.HandlePuback(flows[2].PacketID(), 0, nil)
 	h.disconnect()
 	late := h.publish(1, "late") // registered while disconnected: never sent
 	h.connect(true, 0)
@@ -279,13 +279,13 @@ func TestQoS2PubrelAfterPubrecAndOnResume(t *testing.T) {
 	o := h.publish(2, "x")
 	id := o.PacketID()
 	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", id))
-	h.e.HandlePubrec(id, nil)
+	h.e.HandlePubrec(id, 0, nil)
 	want(t, h.collect(), fmt.Sprintf("PUBREL#%d", id))
 	h.disconnect()
 	h.connect(true, 0)
 	// §4.4: after PUBREC the resend is PUBREL, never PUBLISH.
 	want(t, h.collect(), fmt.Sprintf("PUBREL#%d", id))
-	h.e.HandlePubrec(id, nil) // duplicate PUBREC: answer again
+	h.e.HandlePubrec(id, 0, nil) // duplicate PUBREC: answer again
 	want(t, h.collect(), fmt.Sprintf("PUBREL#%d", id))
 	h.e.HandlePubcomp(id)
 	if err := done(t, o); err != nil {
@@ -298,8 +298,8 @@ func TestPubrelOrderFollowsPubrecOrder(t *testing.T) {
 	h.connect(false, 0)
 	a, b := h.publish(2, "a"), h.publish(2, "b")
 	h.collect()
-	h.e.HandlePubrec(b.PacketID(), nil)
-	h.e.HandlePubrec(a.PacketID(), nil)
+	h.e.HandlePubrec(b.PacketID(), 0, nil)
+	h.e.HandlePubrec(a.PacketID(), 0, nil)
 	h.collect()
 	h.disconnect()
 	h.connect(true, 0)
@@ -309,7 +309,7 @@ func TestPubrelOrderFollowsPubrecOrder(t *testing.T) {
 func TestUnknownPubrecGetsPubrel92(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.connect(false, 0)
-	h.e.HandlePubrec(4242, nil)
+	h.e.HandlePubrec(4242, 0, nil)
 	want(t, h.collect(), "PUBREL#4242(0x92)")
 }
 
@@ -321,7 +321,7 @@ func TestStrayAckNeverFreesAnotherOwnersID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.e.HandlePuback(sub, nil)
+	h.e.HandlePuback(sub, 0, nil)
 	h.e.HandlePubcomp(sub)
 	if h.e.ids.owner[sub] != OwnerSubscribe {
 		t.Fatal("stray ack freed a SUBSCRIBE identifier")
@@ -342,9 +342,9 @@ func TestSendQuotaFollowsServerReceiveMaximum(t *testing.T) {
 	h.connect(false, 2)
 	a, b, c := h.publish(1, "a"), h.publish(2, "b"), h.publish(1, "c")
 	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", a.PacketID()), fmt.Sprintf("PUBLISH#%d", b.PacketID()))
-	h.e.HandlePubrec(b.PacketID(), nil) // QoS 2 keeps its quota until PUBCOMP
+	h.e.HandlePubrec(b.PacketID(), 0, nil) // QoS 2 keeps its quota until PUBCOMP
 	want(t, h.collect(), fmt.Sprintf("PUBREL#%d", b.PacketID()))
-	h.e.HandlePuback(a.PacketID(), nil)
+	h.e.HandlePuback(a.PacketID(), 0, nil)
 	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", c.PacketID()))
 	// Quota never exceeds the maximum, even after a reconnect resends a
 	// PUBREL whose PUBCOMP then arrives.
@@ -362,7 +362,7 @@ func TestSessionLossRepublishesInOrderAsNew(t *testing.T) {
 	h.connect(false, 0)
 	a, b, c := h.publish(2, "a"), h.publish(1, "b"), h.publish(2, "c")
 	h.collect()
-	h.e.HandlePubrec(a.PacketID(), nil) // a reaches AwaitPubcomp
+	h.e.HandlePubrec(a.PacketID(), 0, nil) // a reaches AwaitPubcomp
 	h.collect()
 	h.disconnect()
 	if !h.connect(false, 0) {
@@ -375,7 +375,7 @@ func TestSessionLossRepublishesInOrderAsNew(t *testing.T) {
 	for _, o := range []*Out{a, b, c} {
 		notDone(t, o)
 	}
-	h.e.HandlePubrec(a.PacketID(), nil)
+	h.e.HandlePubrec(a.PacketID(), 0, nil)
 	want(t, h.collect(), fmt.Sprintf("PUBREL#%d", a.PacketID()))
 }
 
@@ -606,7 +606,7 @@ func TestPacketsWaitForTheirRecords(t *testing.T) {
 	o := <-registered
 	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", o.PacketID()))
 
-	h.e.HandlePubrec(o.PacketID(), nil)
+	h.e.HandlePubrec(o.PacketID(), 0, nil)
 	want(t, h.collect()) // PUBREL waits for the AwaitPubcomp record
 	st.gate <- struct{}{}
 	waitFor(t, h.headCtrlReady)
@@ -659,7 +659,7 @@ func TestRestoreResumesStoredFlows(t *testing.T) {
 	q1 := h.publish(1, "one")
 	q2 := h.publish(2, "two")
 	h.collect()
-	h.e.HandlePubrec(q2.PacketID(), nil)
+	h.e.HandlePubrec(q2.PacketID(), 0, nil)
 	h.collect()
 	in, _, _ := h.e.Receive(11, 2)
 	h.e.Ack(in)
@@ -727,7 +727,7 @@ func TestConcurrentUse(t *testing.T) {
 	acker := sync.WaitGroup{}
 	acker.Go(func() {
 		for i := 0; i < n; i++ {
-			h.e.HandlePuback(<-ids, nil)
+			h.e.HandlePuback(<-ids, 0, nil)
 		}
 	})
 	for w := 0; w < 8; w++ {
@@ -814,7 +814,7 @@ func TestConnectedEnforcesBrokerLimits(t *testing.T) {
 			if downgrade {
 				notDone(t, q2)
 				want(t, got, fmt.Sprintf("PUBLISH#%d", q2.PacketID()), fmt.Sprintf("PUBLISH#%d", ok.PacketID()))
-				h.e.HandlePuback(q2.PacketID(), nil)
+				h.e.HandlePuback(q2.PacketID(), 0, nil)
 				if err := done(t, q2); err != nil {
 					t.Errorf("downgraded QoS 2 after PUBACK: %v", err)
 				}

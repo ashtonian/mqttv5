@@ -31,6 +31,10 @@ type Out struct {
 	// when Adopt replaced settle meanwhile, so the new one gets it too.
 	settling bool
 	adopted  bool
+	// reason is the reason code of the broker's refusal, when err is one;
+	// outcome is the stored form of the outcome once the flow is Completed.
+	reason  wire.ReasonCode
+	outcome byte
 
 	ref    []byte
 	settle func(context.Context, error) error
@@ -140,6 +144,10 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 				delete(e.out, o.id)
 				if len(o.ref) > 0 {
 					delete(e.refs, string(o.ref))
+					// A session loss may have ended it meanwhile.
+					if e.orphans[string(o.ref)] == o {
+						delete(e.orphans, string(o.ref))
+					}
 				}
 				o.finished = true
 				e.releaseLocked(o.id, OwnerPublish)
@@ -211,9 +219,9 @@ func (e *Engine) Adopt(ref []byte, settle func(context.Context, error) error) bo
 	return true
 }
 
-// HandlePuback applies a PUBACK. refused is non-nil when its reason code
-// is 0x80 or above and becomes the publish's error.
-func (e *Engine) HandlePuback(id uint16, refused error) {
+// HandlePuback applies a PUBACK with reason code rc. refused is non-nil
+// when rc is 0x80 or above and becomes the publish's error.
+func (e *Engine) HandlePuback(id uint16, rc wire.ReasonCode, refused error) {
 	e.mu.Lock()
 	if e.failure != nil {
 		e.mu.Unlock()
@@ -226,6 +234,9 @@ func (e *Engine) HandlePuback(id uint16, refused error) {
 		return
 	}
 	e.unlinkLocked(o)
+	if refused != nil {
+		o.reason = rc
+	}
 	e.finishLocked(o, refused)
 	e.creditLocked(o)
 	j := e.retireLocked(o)
@@ -234,12 +245,12 @@ func (e *Engine) HandlePuback(id uint16, refused error) {
 	e.wake()
 }
 
-// HandlePubrec applies a PUBREC. A refusal completes the flow; success
-// moves it to AwaitPubcomp and queues the PUBREL, which waits until that
-// phase is stored. A PUBREC for a flow already at AwaitPubcomp is
-// answered with another PUBREL, and one for an unknown identifier with
-// PUBREL 0x92.
-func (e *Engine) HandlePubrec(id uint16, refused error) {
+// HandlePubrec applies a PUBREC with reason code rc. A refusal (refused
+// non-nil, rc 0x80 or above) completes the flow; success moves it to
+// AwaitPubcomp and queues the PUBREL, which waits until that phase is
+// stored. A PUBREC for a flow already at AwaitPubcomp is answered with
+// another PUBREL, and one for an unknown identifier with PUBREL 0x92.
+func (e *Engine) HandlePubrec(id uint16, rc wire.ReasonCode, refused error) {
 	var j *job
 	e.mu.Lock()
 	if e.failure != nil {
@@ -258,6 +269,7 @@ func (e *Engine) HandlePubrec(id uint16, refused error) {
 		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonSuccess, true, nil)
 	case refused != nil:
 		e.unlinkLocked(o)
+		o.reason = rc
 		e.finishLocked(o, refused)
 		e.creditLocked(o)
 		j = e.retireLocked(o)
@@ -316,19 +328,88 @@ func (e *Engine) finishLocked(o *Out, err error) {
 // released, so it is never reused while a stale record could still name
 // it. A flow with a Ref is an orphan from now until its record is gone,
 // so Adopt can always find it; one whose outcome nobody has recorded
-// keeps its record and identifier until Adopt settles it. It returns the
-// job to start, or nil.
+// keeps its record, Completed, and identifier until Adopt settles it.
+// It returns the job to start, or nil.
 func (e *Engine) retireLocked(o *Out) *job {
 	if len(o.ref) > 0 {
 		e.orphans[string(o.ref)] = o
 		if o.settle == nil {
-			return nil
+			return e.completeLocked(o)
 		}
 	} else if e.store == nil && o.settle == nil {
 		e.releaseLocked(o.id, OwnerPublish)
 		return nil
 	}
 	return e.settleLocked(o)
+}
+
+// completeLocked stores the outcome of finished o as a Completed record
+// in place of the phase before it, so a restart never runs the ended
+// exchange again (a refused PUBLISH, too, must never be sent again,
+// [MQTT-4.4.0-2]); Restore gives the outcome back to Adopt. It returns
+// the job to start, or nil: without a store, for a record already
+// Completed, and for an outcome without a stored form.
+func (e *Engine) completeLocked(o *Out) *job {
+	if e.store == nil || o.phase == session.Completed {
+		return nil
+	}
+	outcome, ok := encodeOutcome(o)
+	if !ok {
+		return nil
+	}
+	o.phase, o.outcome = session.Completed, outcome
+	return e.putOutLocked(o)
+}
+
+// encodeOutcome is the stored form of finished o's outcome.
+func encodeOutcome(o *Out) (byte, bool) {
+	switch {
+	case o.err == nil:
+		return session.OutcomeAccepted, true
+	case o.reason.IsError():
+		return byte(o.reason), true
+	case errors.Is(o.err, ErrSessionLost):
+		return session.OutcomeSessionLost, true
+	case errors.Is(o.err, ErrMessageExpired):
+		return session.OutcomeExpired, true
+	case errors.Is(o.err, ErrPacketTooLarge):
+		return session.OutcomePacketTooLarge, true
+	case errors.Is(o.err, ErrRetainNotSupported):
+		return session.OutcomeRetainNotSupported, true
+	case errors.Is(o.err, ErrQoSNotSupported):
+		return session.OutcomeQoSNotSupported, true
+	}
+	return 0, false
+}
+
+// decodeOutcomeLocked gives restored o the outcome its Completed record
+// holds, as the error its producer gets. It reports false for a value
+// this version does not know.
+func (e *Engine) decodeOutcomeLocked(o *Out) bool {
+	switch b := o.outcome; {
+	case b == session.OutcomeAccepted:
+		o.err = nil
+	case wire.ReasonCode(b).IsError():
+		t := wire.PUBACK
+		if o.qos == 2 {
+			t = wire.PUBREC
+		}
+		o.reason = wire.ReasonCode(b)
+		o.err = e.cfg.Refusal(t, o.reason)
+	case b == session.OutcomeSessionLost:
+		o.err = ErrSessionLost
+	case b == session.OutcomeExpired:
+		o.err = ErrMessageExpired
+	case b == session.OutcomePacketTooLarge:
+		o.err = ErrPacketTooLarge
+	case b == session.OutcomeRetainNotSupported:
+		o.err = ErrRetainNotSupported
+	case b == session.OutcomeQoSNotSupported:
+		o.err = ErrQoSNotSupported
+	default:
+		return false
+	}
+	return true
 }
 
 // settleLocked queues the job that gives o's outcome to its Settle and
@@ -360,12 +441,9 @@ func (e *Engine) settleLocked(o *Out) *job {
 			if err != nil && !failed {
 				return &StoreError{Op: "delete outbound", Err: err}
 			}
-			if failed && outcome == nil && e.store != nil && o.phase != session.Completed {
-				// The broker accepted it: store that in place of the phase
-				// before, so a restart never sends it again. Queued behind
-				// this job, which starts it.
-				o.phase = session.Completed
-				e.putOutLocked(o)
+			if failed {
+				// Queued behind this job, which starts it.
+				e.completeLocked(o)
 			}
 			switch {
 			case o.adopted:
@@ -422,6 +500,7 @@ func (o *Out) record() session.Record {
 		r.PubrecSeq = o.seq
 	case session.Completed:
 		r.Packet = nil
+		r.Outcome = o.outcome
 	}
 	return r
 }

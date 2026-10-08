@@ -151,8 +151,8 @@ goroutine, which writes the queued ones together (`WithWriteBatch(n)`
 coalesces them into one `writev`) instead of every publisher taking a
 turn on the socket. Fire-and-forget QoS 0 always goes through the
 writer, so `Publish` returns before the write. `WithPublisherPool(N)`
-runs N connections, each with its own writer, to spread write load
-across cores ([measurements](benchmarks/README.md)).
+runs N connections, each with its own writer goroutine and socket, so
+publishing is not limited to one connection's writer.
 
 **Backpressure as a first-class concept.**
 Per-subscription `DropNewest` / `DropOldest`, with the dropped message
@@ -244,12 +244,12 @@ Three distinct shapes, each its own API:
 |---|---|---|
 | **Failover** — one logical client across interchangeable brokers (same data) | `WithBrokers(urls...)` | 1 at a time, supervisor rotates on drop |
 | **Parallel sessions to N independent brokers** | `NewClientGroup(members, opts...)` | N (one per broker), all live |
-| **Publish throughput** — saturate one broker | `WithPublisherPool(N)` | N publish-only to the *same* broker |
+| **Publish across connections** — more than one connection's writer | `WithPublisherPool(N)` | N publish-only to the *same* broker |
 
 These compose:
 
 - `WithBrokers` inside a `GroupMember.Opts` gives HA-per-region fan-out.
-- `WithPublisherPool` alongside `WithBrokers` gives throughput against an HA pair.
+- `WithPublisherPool` alongside `WithBrokers` spreads publishing across connections to an HA pair.
 
 Publisher pool members are configured from the parent: brokers, dialing,
 TLS, credentials, authenticator, CONNECT properties, timeouts, buffer
@@ -1071,8 +1071,9 @@ Allocations per delivered message, counted across the benchmark
 process; the raw publisher in it allocates nothing per message, so they
 are the subscriber's. `callback` is a handler the library calls; `chan`
 is mqttv5's channel and, for autopaho, the channel an application
-forwards into from its handler. A QoS 1 message is acknowledged when a
-consumer takes it.
+forwards into from its handler. A QoS 1 message is acknowledged when
+the callback returns, or, in `chan` and `queue` mode, when a consumer
+takes it.
 
 <!-- benchtab file=benchmarks/results/2026-10-08-e2e/e2e.txt filter=".name:E2E_Receive /consumers:1" rows=mode,qos,size cols=lib unit=allocs/op -->
 

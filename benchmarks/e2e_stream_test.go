@@ -49,7 +49,7 @@ func BenchmarkE2E_ReceiveStream(b *testing.B) {
 					srv := newRawServer(b, l.v5)
 					topic := "bench/stream/" + uniqueID("")
 					s := newSink(sz.bytes, b.N)
-					dropped := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-stream"), addr: srv.addr(), receiveMaximum: receiveWindow},
+					sub := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-stream"), addr: srv.addr(), receiveMaximum: receiveWindow},
 						topic, v.qos, v.mode, 1, s.onMsg)
 					srv.awaitSubscribed(b)
 					waitLive(b, s, func() error { return srv.publish(topic, 0, nil, 1) })
@@ -66,7 +66,7 @@ func BenchmarkE2E_ReceiveStream(b *testing.B) {
 					if err := published(); err != nil {
 						b.Fatalf("raw server: %v", err)
 					}
-					s.check(b, dropped)
+					s.check(b, sub)
 				})
 			}
 		}
@@ -362,7 +362,7 @@ func rawRemaining(frame []byte) uint32 {
 // subscriber.
 var floorLib = lib{name: "floor", v5: true, modes: []mode{modeCallback}, subscribe: subscribeFloor}
 
-func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ mode, _ int, onMsg func([]byte)) func() int64 {
+func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ mode, _ int, onMsg func([]byte)) *subscription {
 	b.Helper()
 	conn, err := net.DialTimeout("tcp", cfg.host(b), 5*time.Second)
 	if err != nil {
@@ -410,11 +410,10 @@ func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ m
 			}
 		}
 	}()
-	b.Cleanup(func() {
+	return newSubscription(b, func() int64 { return 0 }, func() {
 		_ = conn.Close()
 		<-done
 	})
-	return func() int64 { return 0 }
 }
 
 // floorPublish returns an MQTT 5 PUBLISH frame's payload and, for QoS 1

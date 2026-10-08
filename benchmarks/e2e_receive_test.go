@@ -49,7 +49,7 @@ func BenchmarkE2E_Receive(b *testing.B) {
 				b.Run(name, func(b *testing.B) {
 					topic := "bench/receive/" + uniqueID("")
 					s := newSink(sz.bytes, b.N)
-					dropped := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-sub"), receiveMaximum: receiveWindow},
+					sub := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-sub"), receiveMaximum: receiveWindow},
 						topic, v.qos, v.mode, v.consumers, s.onMsg)
 					pub := dialRaw(b, uniqueID("raw-pub"))
 					waitLive(b, s, func() error { return pub.publish(topic, 0, nil, 1) })
@@ -66,7 +66,7 @@ func BenchmarkE2E_Receive(b *testing.B) {
 					if err := published(); err != nil {
 						b.Fatalf("raw publisher: %v", err)
 					}
-					s.check(b, dropped)
+					s.check(b, sub)
 				})
 			}
 		}

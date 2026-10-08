@@ -134,6 +134,9 @@ func New(opts ...Option) (*Client, error) {
 		OnFailure:      c.storeFailed,
 		OnStrayAck:     func(wire.PacketType, uint16) { c.stats.addAckIgnored() },
 		OnReplay:       c.stats.addPublishReplayed,
+		Refusal: func(t wire.PacketType, rc wire.ReasonCode) error {
+			return newReasonCodeError(t, rc, wire.Properties{})
+		},
 	})
 	urls := append([]string(nil), cfg.BrokerURLs...)
 	c.brokerURLs.Store(&urls)
@@ -161,9 +164,9 @@ type lifecycle struct {
 	// err is why the span ended when it was not Disconnect, written
 	// before shutdown is closed.
 	err error
-	// mu orders a connection's activation against a store failure's
-	// teardown of the span: stopping is set under it, and a connection is
-	// installed under it only while stopping is unset.
+	// mu orders a connection's activation, and the supervisor's start,
+	// against a store failure's teardown of the span: stopping is set
+	// under it, and both happen under it only while stopping is unset.
 	mu       sync.Mutex
 	stopping bool
 }

@@ -253,10 +253,10 @@ func (c *Client) handlePubResp(p *wire.PubResp) {
 	}
 	switch p.Type() {
 	case wire.PUBACK:
-		c.engine.HandlePuback(p.PacketID, refused)
+		c.engine.HandlePuback(p.PacketID, p.ReasonCode, refused)
 		c.stats.addPublishAcked()
 	case wire.PUBREC:
-		c.engine.HandlePubrec(p.PacketID, refused)
+		c.engine.HandlePubrec(p.PacketID, p.ReasonCode, refused)
 	case wire.PUBREL:
 		c.engine.HandlePubrel(p.PacketID)
 	case wire.PUBCOMP:

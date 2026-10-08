@@ -40,7 +40,7 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	var delivered atomic.Int64
 	ready := make(chan struct{})
 	var once sync.Once
-	dropped := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-slow")}, topic, 0, m, 1, func(p []byte) {
+	sub := l.subscribe(b, clientConfig{id: uniqueID(l.name + "-slow")}, topic, 0, m, 1, func(p []byte) {
 		if len(p) == 0 {
 			once.Do(func() { close(ready) })
 			return
@@ -59,7 +59,7 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	}
 	// The client has stopped taking in data once neither its heap nor
 	// its drop count has grown for a while.
-	settled := func() (uint64, int64) { return sampler.current(), dropped() }
+	settled := func() (uint64, int64) { return sampler.current(), sub.dropped() }
 	h, d := settled()
 	for still := 0; still < 5; {
 		time.Sleep(100 * time.Millisecond)
@@ -73,9 +73,9 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	}
 	close(release)
 	deadline := time.Now().Add(2 * time.Minute)
-	for delivered.Load()+dropped() < int64(b.N) {
+	for delivered.Load()+sub.dropped() < int64(b.N) {
 		if time.Now().After(deadline) {
-			b.Fatalf("delivered %d and dropped %d of %d", delivered.Load(), dropped(), b.N)
+			b.Fatalf("delivered %d and dropped %d of %d", delivered.Load(), sub.dropped(), b.N)
 		}
 		time.Sleep(time.Millisecond)
 	}

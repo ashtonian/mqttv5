@@ -4,15 +4,20 @@
 
 package benchmarks
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func stamped(seq uint64) []byte {
+	p := Payload(64)
+	stampSeq(p, seq)
+	return p
+}
 
 // The sink accepts each message once, intact, and nothing else.
 func TestSinkChecksEveryDelivery(t *testing.T) {
-	msg := func(seq uint64) []byte {
-		p := Payload(64)
-		stampSeq(p, seq)
-		return p
-	}
+	msg := stamped
 	for _, tc := range []struct {
 		name    string
 		deliver func(s *sink)
@@ -43,5 +48,27 @@ func TestSinkChecksEveryDelivery(t *testing.T) {
 				t.Fatalf("verify: %v, want ok %v", err, tc.ok)
 			}
 		})
+	}
+}
+
+// The check counts what a consumer still delivers before the subscriber
+// stops: a duplicate in a consumer's hands when the last expected message
+// arrived fails the run.
+func TestSinkCheckWaitsForTheSubscriberToStop(t *testing.T) {
+	s := newSink(64, 1)
+	s.onMsg(stamped(0))
+	delivered := make(chan struct{})
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s.onMsg(stamped(0))
+		close(delivered)
+	}()
+	sub := &subscription{dropped: func() int64 { return 0 }, stop: func() { <-delivered }}
+	if err := s.finish(sub, time.Second); err == nil {
+		t.Fatal("a duplicate delivered before the subscriber stopped passed the check")
+	}
+	stuck := &subscription{dropped: func() int64 { return 0 }, stop: func() { select {} }}
+	if err := newSink(64, 0).finish(stuck, 10*time.Millisecond); err == nil {
+		t.Fatal("a subscriber that never stops passed the check")
 	}
 }

@@ -57,11 +57,13 @@ The rules that make the comparison fair:
    20, the window mosquitto uses for MQTT 3.1.1 subscribers. A QoS 0
    publish returns once the packet is written to the connection in every
    library (mqttv5 with `PublishWaitForFlush`; the others always do).
-   Every subscriber acknowledges a QoS 1/2 message when a consumer takes
-   it, before processing it: mqttv5's consumers call `Ack` on receipt,
-   and autopaho's channel adapter hands each QoS 1/2 message to a
-   consumer before its handler returns, since autopaho acknowledges on
-   return (its manual acknowledgement batches on a 50 ms ticker, which
+   A subscriber acknowledges a QoS 1/2 message at the same point in
+   every library: in callback mode when the callback returns; in channel
+   and queue mode when a consumer takes it, before processing it —
+   mqttv5's consumers call `Ack` on receipt, and autopaho's channel
+   adapter hands each QoS 1/2 message to a consumer before its handler
+   returns, since autopaho acknowledges on return (its manual
+   acknowledgement batches on a 50 ms ticker, which
    would measure the ticker). Every client connects with Clean Start and
    Session Expiry 0, so its session ends with the connection; only the
    reconnect scenario keeps a 300-second session, in both MQTT 5
@@ -78,9 +80,10 @@ The rules that make the comparison fair:
    only when asked), toolchain, host, CPU, GOMAXPROCS, broker image and
    the load average before, during (per run, in a side file) and after,
    and repeats the whole sweep `RUNS` times so a load spike lands on
-   every library in turn. With `LOAD_MAX` set each run waits for a quiet
-   host, and a recording whose host never quietens is marked invalid
-   rather than kept. `benchtab` renders each table from a recording: the
+   every library in turn. With `LOAD_MAX` set each run starts only on a
+   quiet host, and a recording whose host never quietens is marked
+   invalid rather than kept; load that rises during a run is not
+   controlled, only recorded at the start of the next. `benchtab` renders each table from a recording: the
    median of the runs with a 95% confidence interval, and, where
    libraries are compared, the change with its Mann-Whitney U p-value.
    The recordings themselves stay out of the repository; each table
@@ -97,11 +100,11 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 | `BenchmarkE2E_Publish` | `Publish` in a loop, `lib × qos (0,1,2) × size (64B,1KiB,1MiB)` | one call; at QoS 1/2 including the broker's acknowledgements |
 | `BenchmarkE2E_PublishConcurrent` | `workers` goroutines (8, 64) publishing QoS 1 on one client | elapsed time per acknowledged message across all workers |
 | `BenchmarkE2E_Receive` | a subscriber fed by `rawClient` at the rate the broker sustains; `mode` callback/chan/queue, `consumers` goroutines for chan/queue | time per delivered message |
-| `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed, a reference point for the harness's own cost | time per delivered message: at QoS 0 how fast the client consumes, at QoS 1 the round trip of a 20-message window between client and source |
+| `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed, a reference point for the harness's own cost | time per delivered message through the whole pipeline — source, socket, subscriber and sink — at QoS 1 set by the round trip of a 20-message window between client and source |
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
 | `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule interval; read the `p50-ns` … `max-ns` metrics |
 | `BenchmarkE2E_Reconnect` | 20 QoS 1 publishes vanish in a proxy, the connection is cut; time until a subscriber has all 20 after the client reconnects with its session and resends them | one cut-and-recover cycle |
-| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the client's largest heap growth, `delivered-%` how much reached the consumer | not meaningful |
+| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the largest growth of the process's heap, sampled every millisecond, `delivered-%` how much reached the consumer | not meaningful |
 | `BenchmarkDecodePublish`, `BenchmarkDecodePublishRead`, `BenchmarkEncodePublish` | the codecs alone, no network (`props=none` or a content type and five user properties) | one packet |
 | `BenchmarkReceive`, `BenchmarkReceiveWindow`, `BenchmarkReceiveFilters` (core package) | mqttv5's inbound path against an in-process feed: decode, route, deliver, ack | one delivered message |
 
@@ -256,10 +259,11 @@ handler):
 Here the subscriber is fed by `rawServer` instead of the broker: it
 writes pre-encoded PUBLISH packets over loopback TCP as fast as the
 client reads them, keeping the client's window of 20 QoS 1 messages
-unacknowledged. At QoS 0 the source writes as fast as the socket takes
-data, so the time per message is mostly how fast the client consumes,
-together with what the source and the sink cost in the same process.
-At QoS 1 the source waits for acknowledgements, so the time is the
+unacknowledged. The time per message is that of the whole pipeline —
+source, loopback socket, subscriber and sink, all but the socket in one
+process — with no broker in it. At QoS 0 the source writes as fast as
+the socket takes data; no experiment here shows which stage limits the
+rate. At QoS 1 the source waits for acknowledgements, so the time is the
 round trip of that window between client and source: how the client
 batches its acknowledgements and how often the source wakes for them
 both set it. `lib=floor` is the cheapest subscriber the harness can
@@ -462,9 +466,10 @@ What each library does with the backlog:
   `Stats().InboundDropped` (`SubOnDrop` sees each one). A full queue
   holds about as much memory as autopaho's channel.
 
-`peak-heap-B` counts heap objects the garbage collector has not freed
-yet as well as live ones, so it runs up to about twice the memory the
-backlog itself holds.
+`peak-heap-B` is the whole process's heap, sampled every millisecond: it
+counts objects the garbage collector has not freed yet as well as live
+ones, and whatever else the process allocates, so it is an upper bound
+on the backlog's memory rather than a measure of it.
 
 ### Codec
 
@@ -607,12 +612,11 @@ With 10,000 subscriptions that do not match the message:
   tables show as lower CPU per QoS 1 message than the Paho clients'.
 - **Receiving through the broker measures the broker too.** At QoS 0
   mosquitto — one thread, in a VM on the same machine — can be the
-  slowest stage, and it runs faster when the machine is busier, so a
-  client that keeps the host less busy can get a slower broker (on this
-  host, mqttv5's 1 KiB QoS 0 receive ran faster with unrelated busy
-  processes on the machine). How fast a client consumes QoS 0 is the
-  [stream table](#receiving-without-a-broker); through the broker,
-  compare `cpu-ns/op`.
+  slowest stage, and on this host its pace changed with how busy the
+  machine was (mqttv5's 1 KiB QoS 0 receive ran faster with unrelated
+  busy processes on the machine; the cause was not isolated). The
+  [stream table](#receiving-without-a-broker) takes the broker out of
+  the pipeline; through the broker, compare `cpu-ns/op`.
 - **MQTT 3.1.1 is a different protocol.** `paho3` has no Receive
   Maximum or properties; it is here as the most widely used Go client.
   With 64 concurrent publishers it is not held to the broker's window
@@ -632,10 +636,9 @@ docker compose -f benchmarks/docker-compose.yml down -v
 
 Recording results for publication, from `benchmarks/` on a committed
 tree (each command writes `results/<date>-<name>/`, which git ignores).
-On a shared machine set `LOAD_MAX`: each run then waits until the
-1-minute load average is below it, so another job does not land in the
-middle of a recording, and `DATE` keeps recordings that belong together
-in one set of directories:
+On a shared machine set `LOAD_MAX`: each run then starts only once the
+1-minute load average is below it, and `DATE` keeps recordings that
+belong together in one set of directories:
 
 ```bash
 export LOAD_MAX=8 DATE=$(date +%Y-%m-%d)

@@ -1,7 +1,7 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
-// Package mqttv5 is an MQTT v5 client for Go with a low cost per message
-// and an ergonomic API. The supervisor (reconnect, replay-in-flight,
+// Package mqttv5 is an MQTT v5 client for Go that allocates little per
+// message, with an ergonomic API. The supervisor (reconnect, replay-in-flight,
 // auto-resubscribe) is baked into every [Client]; there is no separate
 // "auto-reconnect" wrapper.
 //
@@ -125,9 +125,9 @@
 // overlap, and on TLS and WebSocket connections, a second goroutine
 // drains a many-producer-single-consumer write channel and coalesces
 // the queued packets, so they do not take turns on a write lock around
-// [net.Conn.Write]. Cross-core write scaling comes from
-// [WithPublisherPool], which runs N such connections, each with its own
-// writer goroutine.
+// [net.Conn.Write]. [WithPublisherPool] runs N such connections, each
+// with its own writer goroutine, so publishing is not limited to one
+// connection's writer.
 //
 // Packets and frame buffers up to 64 KiB come from sync.Pools. An
 // inbound [Message] owns a copy of its topic, payload and properties,

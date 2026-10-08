@@ -73,12 +73,33 @@ type lib struct {
 	// subscribe connects a subscriber to filter and passes each
 	// message's payload to onMsg through mode — from consumers
 	// goroutines for chan and queue. onMsg may block. A QoS 1/2 message
-	// is acknowledged when a consumer takes it, before onMsg, in every
-	// library and mode. The returned function counts messages the
-	// library discarded for want of room. The consumers end with the
-	// benchmark.
-	subscribe func(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) (dropped func() int64)
+	// is acknowledged when onMsg returns in callback mode, and when a
+	// consumer takes it, before onMsg, in chan and queue mode, in every
+	// library. The subscription ends with the benchmark, or earlier with
+	// its stop.
+	subscribe func(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) *subscription
 }
+
+// subscription is a subscriber an adapter started.
+type subscription struct {
+	// dropped counts messages the library discarded for want of room.
+	dropped func() int64
+	stop    func()
+	once    sync.Once
+}
+
+// newSubscription returns a subscription whose Stop runs stop once, and
+// registers it with the benchmark's cleanup.
+func newSubscription(b *testing.B, dropped func() int64, stop func()) *subscription {
+	s := &subscription{dropped: dropped, stop: stop}
+	b.Cleanup(s.Stop)
+	return s
+}
+
+// Stop ends delivery: it disconnects the subscriber and returns once no
+// consumer will call onMsg again, so a check after it sees every
+// delivery of the run.
+func (s *subscription) Stop() { s.once.Do(s.stop) }
 
 var libs = []lib{
 	{name: "mqttv5", v5: true, modes: []mode{modeCallback, modeChan, modeQueue}, connect: connectMqttv5, subscribe: subscribeMqttv5},
@@ -147,12 +168,9 @@ func connectMqttv5(b *testing.B, cfg clientConfig) publisher {
 	return mqttv5Publisher{newMqttv5(b, cfg)}
 }
 
-func subscribeMqttv5(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) func() int64 {
+func subscribeMqttv5(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) *subscription {
 	b.Helper()
-	// Registered first, so it runs after the client's Disconnect, which
-	// ends the consumers.
 	var wg sync.WaitGroup
-	b.Cleanup(wg.Wait)
 	cli := newMqttv5(b, cfg)
 	var dropped atomic.Int64
 	filters := []mqttv5.TopicFilter{{Topic: filter, QoS: qos}}
@@ -196,7 +214,14 @@ func subscribeMqttv5(b *testing.B, cfg clientConfig, filter string, qos byte, m 
 	default:
 		b.Fatalf("mqttv5: no mode %q", m)
 	}
-	return dropped.Load
+	// Disconnect closes the channel or queue the consumers drain and
+	// returns once the read loop, which runs callbacks, has exited.
+	return newSubscription(b, dropped.Load, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = cli.Disconnect(ctx)
+		wg.Wait()
+	})
 }
 
 // ---------------- eclipse/paho.golang autopaho ----------------
@@ -264,10 +289,10 @@ func connectAutopaho(b *testing.B, cfg clientConfig) publisher {
 	return autopahoPublisher{newAutopaho(b, cfg, nil)}
 }
 
-func subscribeAutopaho(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) func() int64 {
+func subscribeAutopaho(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) *subscription {
 	b.Helper()
 	var handler func(paho.PublishReceived) (bool, error)
-	var stop func()
+	var stopConsumers func()
 	switch m {
 	case modeCallback:
 		handler = func(pr paho.PublishReceived) (bool, error) {
@@ -304,12 +329,20 @@ func subscribeAutopaho(b *testing.B, cfg clientConfig, filter string, qos byte, 
 					case p := <-ch:
 						onMsg(p.Payload)
 					case <-done:
-						return
+						// What the library handed over before it stopped.
+						for {
+							select {
+							case p := <-ch:
+								onMsg(p.Payload)
+							default:
+								return
+							}
+						}
 					}
 				}
 			})
 		}
-		stop = func() {
+		stopConsumers = func() {
 			close(done)
 			wg.Wait()
 		}
@@ -317,11 +350,6 @@ func subscribeAutopaho(b *testing.B, cfg clientConfig, filter string, qos byte, 
 		b.Fatalf("autopaho: no mode %q", m)
 	}
 	cm := newAutopaho(b, cfg, handler)
-	if stop != nil {
-		// Runs before the connection's Disconnect, so a handler blocked
-		// on the channel lets it finish.
-		b.Cleanup(stop)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := cm.Subscribe(ctx, &paho.Subscribe{
@@ -329,7 +357,16 @@ func subscribeAutopaho(b *testing.B, cfg clientConfig, filter string, qos byte, 
 	}); err != nil {
 		b.Fatalf("autopaho Subscribe: %v", err)
 	}
-	return func() int64 { return 0 }
+	// Disconnect first: consumers keep taking what a handler is blocked
+	// handing over, so it returns and the client can stop.
+	return newSubscription(b, func() int64 { return 0 }, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = cm.Disconnect(ctx)
+		if stopConsumers != nil {
+			stopConsumers()
+		}
+	})
 }
 
 // ---------------- eclipse/paho.mqtt.golang (MQTT 3.1.1) ----------------
@@ -372,7 +409,7 @@ func connectPaho3(b *testing.B, cfg clientConfig) publisher {
 	return paho3Publisher{newPaho3(b, cfg)}
 }
 
-func subscribePaho3(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, _ int, onMsg func([]byte)) func() int64 {
+func subscribePaho3(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, _ int, onMsg func([]byte)) *subscription {
 	b.Helper()
 	if m != modeCallback {
 		b.Fatalf("paho3: no mode %q", m)
@@ -382,7 +419,8 @@ func subscribePaho3(b *testing.B, cfg clientConfig, filter string, qos byte, m m
 	if !t.WaitTimeout(5*time.Second) || t.Error() != nil {
 		b.Fatalf("paho3 Subscribe: %v", t.Error())
 	}
-	return func() int64 { return 0 }
+	// Disconnect stops the router that runs the callbacks.
+	return newSubscription(b, func() int64 { return 0 }, func() { c.Disconnect(250) })
 }
 
 // sink checks what a subscriber receives against what the raw sources
@@ -400,7 +438,6 @@ type sink struct {
 	got     atomic.Int64    // distinct messages
 	dup     atomic.Int64
 	wrong   atomic.Int64 // wrong size or content, unknown or torn sequence numbers
-	all     atomic.Int64 // every delivery but probes
 	ready   chan struct{}
 	once    sync.Once
 	done    chan struct{}
@@ -422,7 +459,6 @@ func (s *sink) onMsg(p []byte) {
 		s.once.Do(func() { close(s.ready) })
 		return
 	}
-	s.all.Add(1)
 	seq, ok := readSeq(p)
 	if len(p) != s.size || !ok || seq >= uint64(s.target) || !bytes.Equal(p[seqBytes:len(p)-seqBytes], s.pattern) {
 		s.wrong.Add(1)
@@ -443,27 +479,38 @@ func (s *sink) String() string {
 		s.got.Load(), s.target, s.dup.Load(), s.wrong.Load())
 }
 
-// check fails the benchmark unless every message arrived exactly once
-// and intact (see verify).
-func (s *sink) check(b *testing.B, dropped func() int64) {
+// check stops sub, so no delivery can follow, and fails the benchmark
+// unless every message arrived exactly once and intact. Stopping it
+// within stopBound is part of the check: a subscriber that cannot be
+// stopped cannot be shown to have finished.
+func (s *sink) check(b *testing.B, sub *subscription) {
 	b.Helper()
-	if err := s.verify(dropped); err != nil {
+	if err := s.finish(sub, stopBound); err != nil {
 		b.Fatal(err)
 	}
 }
 
-// verify waits until deliveries have stopped — no new one for 50 ms,
-// within a second — so one that trails the last expected message is
-// counted too, then reports anything but every message once and intact.
-func (s *sink) verify(dropped func() int64) error {
-	last := s.all.Load()
-	quiet := time.Now()
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline) && time.Since(quiet) < 50*time.Millisecond; {
-		time.Sleep(5 * time.Millisecond)
-		if n := s.all.Load(); n != last {
-			last, quiet = n, time.Now()
-		}
+// finish stops sub, waiting up to bound, and verifies what arrived.
+func (s *sink) finish(sub *subscription, bound time.Duration) error {
+	stopped := make(chan struct{})
+	go func() {
+		sub.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(bound):
+		return fmt.Errorf("the subscriber did not stop within %v; %s", bound, s)
 	}
+	return s.verify(sub.dropped)
+}
+
+// stopBound is how long check waits for a subscriber to stop.
+const stopBound = 10 * time.Second
+
+// verify reports anything but every message once and intact. Call it
+// once delivery has ended.
+func (s *sink) verify(dropped func() int64) error {
 	if n := dropped(); n > 0 {
 		return fmt.Errorf("subscriber dropped %d messages; a run with drops measures nothing", n)
 	}

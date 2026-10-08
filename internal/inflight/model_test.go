@@ -433,9 +433,9 @@ func (m *model) brokerToClient(lossy bool) error {
 		m.logf("client <- %s id=%d dup=%v msg=%d", p.typ, p.id, p.dup, p.msg)
 		switch p.typ {
 		case wire.PUBACK:
-			m.e.HandlePuback(p.id, nil)
+			m.e.HandlePuback(p.id, 0, nil)
 		case wire.PUBREC:
-			m.e.HandlePubrec(p.id, nil)
+			m.e.HandlePubrec(p.id, 0, nil)
 		case wire.PUBREL:
 			m.e.HandlePubrel(p.id)
 		case wire.PUBCOMP:

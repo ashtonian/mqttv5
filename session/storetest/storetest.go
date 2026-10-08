@@ -102,7 +102,7 @@ func put(t *testing.T, s session.Store, r session.Record) {
 }
 
 func equal(a, b session.Record) bool {
-	return a.Key == b.Key && a.Seq == b.Seq && a.PubrecSeq == b.PubrecSeq && a.QoS == b.QoS && a.Phase == b.Phase &&
+	return a.Key == b.Key && a.Seq == b.Seq && a.PubrecSeq == b.PubrecSeq && a.Outcome == b.Outcome && a.QoS == b.QoS && a.Phase == b.Phase &&
 		bytes.Equal(a.Packet, b.Packet) && a.ExpiresAt.Equal(b.ExpiresAt) &&
 		bytes.Equal(a.Ref, b.Ref) && (a.Ref == nil) == (b.Ref == nil)
 }
@@ -137,7 +137,7 @@ func testRoundTrip(t *testing.T, s session.Store) {
 		func() session.Record { r := outRec(5, 13, session.AwaitPuback, "d"); r.Ref = []byte{}; return r }(),
 		func() session.Record {
 			r := outRec(8, 16, session.Completed, "")
-			r.QoS, r.Packet, r.Ref = 1, nil, []byte("entry-8")
+			r.QoS, r.Packet, r.Ref, r.Outcome = 1, nil, []byte("entry-8"), 0x87
 			return r
 		}(),
 		inRec(4),

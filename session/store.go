@@ -15,9 +15,9 @@
 //
 //   - outbound PUBLISH: Put (phase [AwaitPuback] or [AwaitPubrec]), then send;
 //   - PUBREC received: Put (phase [AwaitPubcomp]), then send PUBREL;
-//   - PUBACK / PUBCOMP received: Delete — or, when the message's
-//     producer could not yet record that the broker accepted it, Put
-//     (phase [Completed]) until it has;
+//   - PUBACK / PUBCOMP received, or a refusal: Delete — or, when the
+//     message's producer could not yet record the outcome, Put (phase
+//     [Completed], with the [Record.Outcome]) until it has;
 //   - inbound QoS 2 acknowledged by the application: Put (phase
 //     [AwaitPubrel]), then send PUBREC;
 //   - PUBREL received: Delete, then send PUBCOMP.
@@ -72,11 +72,33 @@ const (
 	// AwaitPubrel is an inbound QoS 2 PUBLISH whose PUBREC was sent,
 	// waiting for PUBREL.
 	AwaitPubrel Phase = 4
-	// Completed is an outbound message the broker accepted whose producer
-	// (a QueuePublisher, by its [Record.Ref]) has not yet recorded that.
-	// It is never sent again; the record is deleted once the producer has
-	// the outcome. Its Packet is empty.
+	// Completed is an outbound message whose exchange has ended — the
+	// broker accepted or refused it, or the client ended it — and whose
+	// producer (a QueuePublisher, by its [Record.Ref]) has not yet
+	// recorded the outcome, which [Record.Outcome] holds. It is never sent
+	// again; the record is deleted once the producer has the outcome. Its
+	// Packet is empty.
 	Completed Phase = 5
+)
+
+// Outcomes of a [Completed] record other than a broker's refusal, which
+// is its reason code (0x80 or above).
+const (
+	// OutcomeAccepted: the broker accepted the message.
+	OutcomeAccepted byte = 0x00
+	// OutcomeSessionLost: the broker lost the session and the client's
+	// session-loss policy failed the message.
+	OutcomeSessionLost byte = 0x01
+	// OutcomeExpired: its Message Expiry Interval ran out before it was
+	// sent.
+	OutcomeExpired byte = 0x02
+	// OutcomePacketTooLarge: it is above the broker's Maximum Packet Size.
+	OutcomePacketTooLarge byte = 0x03
+	// OutcomeRetainNotSupported: it is retained and the broker has no
+	// retain.
+	OutcomeRetainNotSupported byte = 0x04
+	// OutcomeQoSNotSupported: its QoS is above the broker's Maximum QoS.
+	OutcomeQoSNotSupported byte = 0x05
 )
 
 // Valid reports whether p is a defined phase for direction d.
@@ -111,6 +133,11 @@ type Record struct {
 	// arrived in, which is the order their PUBRELs are resent in (§4.6).
 	// Zero in any other phase. It counts on the same sequence as Seq.
 	PubrecSeq uint64
+
+	// Outcome is how a [Completed] record's exchange ended: one of the
+	// Outcome* values, or the reason code of the broker's refusing PUBACK
+	// or PUBREC (0x80 or above). Zero in any other phase.
+	Outcome byte
 
 	// QoS is 1 or 2.
 	QoS byte

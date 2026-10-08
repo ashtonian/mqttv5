@@ -260,9 +260,11 @@ func idKey(id uint16) []byte { return binary.BigEndian.AppendUint16(nil, id) }
 //	version    1 byte  (1)
 //	qos        1 byte
 //	phase      1 byte
-//	flags      1 byte  (bit 0: ExpiresAt, bit 1: Ref, bit 2: PubrecSeq present)
+//	flags      1 byte  (bit 0: ExpiresAt, bit 1: Ref, bit 2: PubrecSeq,
+//	                   bit 3: Outcome present)
 //	seq        8 bytes
 //	pubrec seq 8 bytes, only when flag bit 2 is set
+//	outcome    1 byte, only when flag bit 3 is set
 //	expires    8 bytes Unix nanoseconds, only when flag bit 0 is set
 //	ref        1 byte length + bytes, only when flag bit 1 is set
 //	packet     remaining bytes before the checksum
@@ -273,6 +275,7 @@ const (
 	flagExpires = 1 << iota
 	flagRef
 	flagPubrecSeq
+	flagOutcome
 )
 
 func encodeRecord(r session.Record) []byte {
@@ -287,10 +290,16 @@ func encodeRecord(r session.Record) []byte {
 	if r.PubrecSeq != 0 {
 		flags |= flagPubrecSeq
 	}
+	if r.Outcome != 0 {
+		flags |= flagOutcome
+	}
 	b = append(b, recordVersion, r.QoS, byte(r.Phase), flags)
 	b = binary.BigEndian.AppendUint64(b, r.Seq)
 	if flags&flagPubrecSeq != 0 {
 		b = binary.BigEndian.AppendUint64(b, r.PubrecSeq)
+	}
+	if flags&flagOutcome != 0 {
+		b = append(b, r.Outcome)
 	}
 	if flags&flagExpires != 0 {
 		b = binary.BigEndian.AppendUint64(b, uint64(r.ExpiresAt.UnixNano()))
@@ -318,6 +327,13 @@ func decodeRecord(v []byte) (session.Record, error) {
 		}
 		r.PubrecSeq = binary.BigEndian.Uint64(rest)
 		rest = rest[8:]
+	}
+	if flags&flagOutcome != 0 {
+		if len(rest) < 1 {
+			return session.Record{}, errors.New("truncated outcome")
+		}
+		r.Outcome = rest[0]
+		rest = rest[1:]
 	}
 	if flags&flagExpires != 0 {
 		if len(rest) < 8 {

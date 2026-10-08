@@ -28,6 +28,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -110,6 +111,10 @@ type Config struct {
 	OnStrayAck func(t wire.PacketType, id uint16)
 	// OnReplay observes each PUBLISH resent with DUP=1.
 	OnReplay func()
+	// Refusal builds the error a broker's refusing PUBACK or PUBREC with
+	// reason code rc becomes, for an outcome restored from the store.
+	// Nil gives a plain error naming the reason code.
+	Refusal func(t wire.PacketType, rc wire.ReasonCode) error
 }
 
 // ConnInfo describes a connection that has just completed CONNACK.
@@ -224,6 +229,11 @@ func New(cfg Config) *Engine {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Refusal == nil {
+		cfg.Refusal = func(t wire.PacketType, rc wire.ReasonCode) error {
+			return fmt.Errorf("mqttv5: %s refused with reason code %#x", t, byte(rc))
+		}
+	}
 	_, mem := cfg.Store.(*session.MemoryStore)
 	bg, cancel := context.WithCancel(context.Background())
 	idle := make(chan struct{})
@@ -284,15 +294,16 @@ func (e *Engine) Restore(ctx context.Context) error {
 		}
 		switch {
 		case r.Key.Dir == session.Outbound && r.Phase == session.Completed:
-			// Accepted by the broker; its producer has yet to record that.
-			if len(r.Ref) == 0 || !e.ids.claim(r.Key.PacketID, OwnerPublish) {
-				e.cfg.Logger.Warn("mqttv5: skipping unusable stored outbound record",
-					slog.Int("packet_id", int(r.Key.PacketID)))
-				continue
-			}
+			// Ended; its producer has yet to record the outcome.
 			o := &Out{
 				id: r.Key.PacketID, qos: r.QoS, phase: r.Phase, seq: r.Seq, pubSeq: r.Seq,
-				expiresAt: r.ExpiresAt, ref: r.Ref, finished: true, done: make(chan struct{}),
+				expiresAt: r.ExpiresAt, ref: r.Ref, outcome: r.Outcome,
+				finished: true, done: make(chan struct{}),
+			}
+			if !e.decodeOutcomeLocked(o) || len(r.Ref) == 0 || !e.ids.claim(r.Key.PacketID, OwnerPublish) {
+				e.cfg.Logger.Warn("mqttv5: skipping unusable stored outbound record",
+					slog.Int("packet_id", int(r.Key.PacketID)), slog.Int("outcome", int(r.Outcome)))
+				continue
 			}
 			close(o.done)
 			e.orphans[string(o.ref)] = o

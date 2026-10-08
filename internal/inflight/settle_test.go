@@ -85,9 +85,9 @@ func TestSettleRunsBeforeTheRecordIsDeleted(t *testing.T) {
 	ok, okSettled := h.register(st, 1, "a")
 	refused, refusedSettled := h.register(st, 2, "b")
 	h.collect()
-	h.e.HandlePuback(ok.PacketID(), nil)
+	h.e.HandlePuback(ok.PacketID(), 0, nil)
 	no := errors.New("refused")
-	h.e.HandlePubrec(refused.PacketID(), no)
+	h.e.HandlePubrec(refused.PacketID(), wire.ReasonNotAuthorized, no)
 	if err := recvSettle(t, okSettled); err != nil {
 		t.Fatalf("accepted message settled with %v", err)
 	}
@@ -122,7 +122,7 @@ func TestSettleNeverBlocksTheAck(t *testing.T) {
 	o, _, _ := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("r"),
 		Settle: func(context.Context, error) error { <-release; close(done); return nil }})
 	h.collect()
-	h.e.HandlePuback(o.PacketID(), nil) // returns although Settle is blocked
+	h.e.HandlePuback(o.PacketID(), 0, nil) // returns although Settle is blocked
 	close(release)
 	<-done
 }
@@ -169,7 +169,7 @@ func TestAdoptRestoredFlows(t *testing.T) {
 	}
 	h2.connect(true, 0)
 	h2.collect()
-	h2.e.HandlePuback(early.PacketID(), nil)
+	h2.e.HandlePuback(early.PacketID(), 0, nil)
 
 	if h2.e.Adopt([]byte("unknown"), func(context.Context, error) error { t.Error("settled an unknown ref"); return nil }) {
 		t.Fatal("adopted an unknown ref")
@@ -188,7 +188,7 @@ func TestAdoptRestoredFlows(t *testing.T) {
 	if !h2.e.Adopt([]byte("running"), func(_ context.Context, err error) error { live <- err; return nil }) {
 		t.Fatal("restored flow not found by its ref")
 	}
-	h2.e.HandlePuback(running.PacketID(), nil)
+	h2.e.HandlePuback(running.PacketID(), 0, nil)
 	if err := recvSettle(t, live); err != nil {
 		t.Fatalf("adopted flow settled with %v", err)
 	}

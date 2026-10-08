@@ -114,7 +114,7 @@ func TestFailedPhaseWriteEndsTheSession(t *testing.T) {
 	h.collect()
 
 	st.failPut = phaseIs(session.AwaitPubcomp)
-	h.e.HandlePubrec(o.PacketID(), nil)
+	h.e.HandlePubrec(o.PacketID(), 0, nil)
 	h.drain()
 	want(t, h.collect())
 
@@ -156,7 +156,7 @@ func TestEveryFailedWriteEndsTheSession(t *testing.T) {
 			o := h.publish(1, "a")
 			h.collect()
 			st.failDelete.Store(true)
-			h.e.HandlePuback(o.PacketID(), nil)
+			h.e.HandlePuback(o.PacketID(), 0, nil)
 		}},
 		{"put inbound", func(h *harness, st *faultStore) {
 			st.failPut = phaseIs(session.AwaitPubrel)
@@ -225,7 +225,7 @@ func TestResumeWaitsForPendingPhaseWrite(t *testing.T) {
 	h.connect(false, 10)
 	o := h.publish(2, "durable")
 	h.collect()
-	h.e.HandlePubrec(o.PacketID(), nil)
+	h.e.HandlePubrec(o.PacketID(), 0, nil)
 	<-st.held
 	h.disconnect()
 	h.connect(true, 10)
@@ -244,7 +244,7 @@ func TestSessionLossWriteWaitsForEarlierWrite(t *testing.T) {
 	h.connect(false, 10)
 	o := h.publish(2, "old session")
 	h.collect()
-	h.e.HandlePubrec(o.PacketID(), nil)
+	h.e.HandlePubrec(o.PacketID(), 0, nil)
 	<-st.held
 	h.disconnect()
 	h.connect(false, 10)
@@ -269,8 +269,8 @@ func TestRestartKeepsPublishOrder(t *testing.T) {
 	third := h.publish(2, "third")
 	h.collect()
 	// PUBRECs arrive out of order.
-	h.e.HandlePubrec(third.PacketID(), nil)
-	h.e.HandlePubrec(first.PacketID(), nil)
+	h.e.HandlePubrec(third.PacketID(), 0, nil)
+	h.e.HandlePubrec(first.PacketID(), 0, nil)
 	h.collect()
 
 	resumed := newHarness(t, Config{Store: st})
@@ -318,7 +318,7 @@ func TestUnsentMessageExpiresWhileWaiting(t *testing.T) {
 			stale := h.publish(1, "stale", expiry(1))
 			fresh := h.publish(1, "fresh", expiry(10))
 			h.now = h.now.Add(3 * time.Second)
-			h.e.HandlePuback(holder.PacketID(), nil)
+			h.e.HandlePuback(holder.PacketID(), 0, nil)
 			wakes := h.link.wakes.Load()
 			got := h.collect()
 			if store {
@@ -370,7 +370,7 @@ func TestFailedSettleKeepsTheRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.collect()
-	h.e.HandlePuback(o.PacketID(), nil)
+	h.e.HandlePuback(o.PacketID(), 0, nil)
 	if err := recvSettle(t, attempts); err != nil {
 		t.Fatalf("outcome %v", err)
 	}
@@ -413,7 +413,7 @@ func TestOrphanKeepsRecordUntilAdopted(t *testing.T) {
 	}
 	restarted.connect(true, 10)
 	restarted.collect()
-	restarted.e.HandlePuback(o.PacketID(), nil)
+	restarted.e.HandlePuback(o.PacketID(), 0, nil)
 	restarted.drain()
 	if recs := records(t, st); len(recs) != 1 {
 		t.Fatalf("finished orphan lost its record before adoption: %+v", recs)
@@ -474,7 +474,7 @@ func TestAdoptWhileSettling(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.collect()
-	h.e.HandlePuback(o.PacketID(), nil)
+	h.e.HandlePuback(o.PacketID(), 0, nil)
 	if err := recvSettle(t, retried); err != nil {
 		t.Fatalf("outcome %v", err)
 	}
@@ -551,9 +551,9 @@ func TestAcceptedOutcomeSurvivesRestart(t *testing.T) {
 			}
 			h.collect()
 			if tc.qos == 1 {
-				h.e.HandlePuback(id, nil)
+				h.e.HandlePuback(id, 0, nil)
 			} else {
-				h.e.HandlePubrec(id, nil)
+				h.e.HandlePubrec(id, 0, nil)
 				h.collect()
 				h.e.HandlePubcomp(id)
 			}
@@ -665,4 +665,148 @@ func TestFailedFirstPutCancelsLaterWrites(t *testing.T) {
 		t.Fatalf("a message never accepted left a record: %+v", recs)
 	}
 	want(t, h.collect())
+}
+
+// refusalErr is a test Config.Refusal that keeps the reason code.
+type refusalErr struct {
+	t  wire.PacketType
+	rc wire.ReasonCode
+}
+
+func (e refusalErr) Error() string { return fmt.Sprintf("%s %#x", e.t, byte(e.rc)) }
+
+// Every way a tracked message's exchange can end is kept as a Completed
+// record while its producer cannot record it: after a restart nothing is
+// sent again — a refused PUBLISH must never be ([MQTT-4.4.0-2]) — and
+// Adopt gives the producer the same outcome.
+func TestEveryOutcomeSurvivesRestart(t *testing.T) {
+	notAuthorized := errors.New("refused")
+	for _, tc := range []struct {
+		name string
+		qos  byte
+		end  func(h *harness, id uint16)
+		want func(t *testing.T, err error)
+	}{
+		{"accepted QoS 1", 1, func(h *harness, id uint16) { h.e.HandlePuback(id, 0, nil) },
+			func(t *testing.T, err error) {
+				if err != nil {
+					t.Fatalf("outcome %v, want accepted", err)
+				}
+			}},
+		{"refused QoS 1", 1, func(h *harness, id uint16) { h.e.HandlePuback(id, wire.ReasonNotAuthorized, notAuthorized) },
+			func(t *testing.T, err error) {
+				if r, ok := err.(refusalErr); !ok || r.t != wire.PUBACK || r.rc != wire.ReasonNotAuthorized {
+					t.Fatalf("outcome %v, want the PUBACK refusal 0x87", err)
+				}
+			}},
+		{"refused QoS 2", 2, func(h *harness, id uint16) { h.e.HandlePubrec(id, wire.ReasonQuotaExceeded, notAuthorized) },
+			func(t *testing.T, err error) {
+				if r, ok := err.(refusalErr); !ok || r.t != wire.PUBREC || r.rc != wire.ReasonQuotaExceeded {
+					t.Fatalf("outcome %v, want the PUBREC refusal 0x97", err)
+				}
+			}},
+	} {
+		for _, present := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/session-present=%v", tc.name, present), func(t *testing.T) {
+				st := session.NewMemoryStore()
+				cfg := Config{Store: st, Refusal: func(t wire.PacketType, rc wire.ReasonCode) error { return refusalErr{t, rc} }}
+				h := newHarness(t, cfg)
+				h.connect(false, 10)
+				id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+				pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: id})
+				if _, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
+					Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}); err != nil {
+					t.Fatal(err)
+				}
+				h.collect()
+				tc.end(h, id)
+				h.drain()
+
+				restarted := newHarness(t, cfg)
+				if err := restarted.e.Restore(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				restarted.connect(present, 10)
+				want(t, restarted.collect())
+				settled := make(chan error, 1)
+				if !restarted.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+					t.Fatal("the ended exchange was not adoptable after the restart")
+				}
+				tc.want(t, recvSettle(t, settled))
+				restarted.drain()
+				if recs := records(t, st); len(recs) != 0 {
+					t.Fatalf("records after the producer recorded the outcome: %+v", recs)
+				}
+			})
+		}
+	}
+}
+
+// A restored message that ends before its producer adopts it keeps its
+// outcome through another restart, instead of its phase from before.
+func TestRestoredOutcomeKeptUntilAdopted(t *testing.T) {
+	st := session.NewMemoryStore()
+	h := newHarness(t, Config{Store: st})
+	h.connect(false, 10)
+	o, _ := h.register(nil, 1, "entry")
+	h.collect()
+
+	second := newHarness(t, Config{Store: st})
+	if err := second.e.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second.connect(true, 10)
+	second.collect()
+	second.e.HandlePuback(o.PacketID(), 0, nil) // before anyone adopts it
+	second.drain()
+
+	third := newHarness(t, Config{Store: st})
+	if err := third.e.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	third.connect(true, 10)
+	want(t, third.collect())
+	settled := make(chan error, 1)
+	if !third.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+		t.Fatal("not adoptable")
+	}
+	if err := recvSettle(t, settled); err != nil {
+		t.Fatalf("outcome %v, want accepted", err)
+	}
+}
+
+// A registration rejected because its record could not be written leaves
+// nothing to adopt, also when a session loss ended it meanwhile.
+func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
+	st := &putGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
+	h := newHarness(t, Config{Store: st, SessionLoss: Fail})
+	h.connect(false, 10)
+	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	settled := make(chan error, 2)
+	returned := make(chan error, 1)
+	go func() {
+		_, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("entry"),
+			Settle: func(_ context.Context, err error) error { settled <- err; return nil }})
+		returned <- err
+	}()
+	<-st.held
+	h.disconnect()
+	h.connect(false, 10) // the Fail policy ends the flow while its Put runs
+	close(st.release)
+	if err := <-returned; err == nil {
+		t.Fatal("Register accepted a message whose record was never written")
+	}
+	h.drain()
+	if h.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+		t.Fatal("a rejected registration is adoptable")
+	}
+	select {
+	case err := <-settled:
+		t.Fatalf("a rejected registration settled with %v", err)
+	default:
+	}
+	if h.e.HasState() || h.e.ids.owner[id] != OwnerNone {
+		t.Fatal("a rejected registration left state behind")
+	}
 }

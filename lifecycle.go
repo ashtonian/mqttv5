@@ -113,8 +113,25 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
+	// The supervisor starts only while the span is not ending: a store
+	// failure's teardown waits for a supervisor that started before it,
+	// and none may start after it.
+	life.mu.Lock()
+	if err := c.activationErr(life); err != nil {
+		life.mu.Unlock()
+		if c.pool != nil {
+			// Members the teardown missed while they were connecting.
+			_ = c.pool.disconnect(ctx)
+		}
+		select {
+		case <-life.finished:
+		case <-ctx.Done():
+		}
+		return err
+	}
 	c.supWg.Add(1)
 	go c.supervisor(life, cleanStart, connected)
+	life.mu.Unlock()
 	return nil
 }
 

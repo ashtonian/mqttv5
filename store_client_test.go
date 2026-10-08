@@ -5,6 +5,7 @@ package mqttv5
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -440,5 +441,68 @@ func TestStoreFailureDuringActivation(t *testing.T) {
 	}
 	if cli.Connected() {
 		t.Fatal("a stopped client is connected")
+	}
+}
+
+// failDeleteStore fails every Delete.
+type failDeleteStore struct{ *session.MemoryStore }
+
+func (s *failDeleteStore) Delete(context.Context, session.RecordKey) error {
+	return errors.New("disk full")
+}
+
+// A store failure while Connect is still connecting the publisher pool
+// stops the client for good: Connect returns the failure and starts no
+// supervisor for the ended span.
+func TestStoreFailureWhilePoolConnects(t *testing.T) {
+	st := &failDeleteStore{session.NewMemoryStore()}
+	storedPublish(t, st.MemoryStore, 1, 1, "replayed")
+	poolConnecting, stopped := make(chan struct{}), make(chan struct{})
+	b := testbroker.New(t,
+		func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{SessionPresent: true})
+			p := c.Expect(wire.PUBLISH, 0)
+			select {
+			case <-poolConnecting:
+			case <-c.Gone():
+				return
+			}
+			c.Puback(p.PacketID, wire.ReasonSuccess) // its record's delete fails
+			c.ServeAuto()
+		},
+		func(c *testbroker.Conn) { // the pool member
+			c.Expect(wire.CONNECT, 0)
+			close(poolConnecting)
+			select {
+			case <-stopped:
+			case <-c.Gone():
+				return
+			}
+			_ = c.Write(func(w io.Writer) (int64, error) { return wire.WriteConnack(w, wire.ConnackOpts{}) })
+			c.ServeAuto()
+		})
+	cli, err := New(WithBroker(b.URL()), WithClientID("pool-failure"), WithPublisherPool(2), WithStore(st),
+		WithoutKeepAlive(), WithLogger(quietLogger()), WithOnStoreFailure(func(error) { close(stopped) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cli.Connect(ctx); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("Connect returned %v after the client stopped", err)
+	}
+	if cli.Connected() {
+		t.Fatal("a stopped client is connected")
+	}
+	// No supervisor of the ended span may be left running.
+	done := make(chan struct{})
+	go func() {
+		cli.supWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a supervisor runs after the client stopped")
 	}
 }
