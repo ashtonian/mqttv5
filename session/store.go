@@ -15,7 +15,9 @@
 //
 //   - outbound PUBLISH: Put (phase [AwaitPuback] or [AwaitPubrec]), then send;
 //   - PUBREC received: Put (phase [AwaitPubcomp]), then send PUBREL;
-//   - PUBACK / PUBCOMP received: Delete;
+//   - PUBACK / PUBCOMP received: Delete — or, when the message's
+//     producer could not yet record that the broker accepted it, Put
+//     (phase [Completed]) until it has;
 //   - inbound QoS 2 acknowledged by the application: Put (phase
 //     [AwaitPubrel]), then send PUBREC;
 //   - PUBREL received: Delete, then send PUBCOMP.
@@ -70,13 +72,18 @@ const (
 	// AwaitPubrel is an inbound QoS 2 PUBLISH whose PUBREC was sent,
 	// waiting for PUBREL.
 	AwaitPubrel Phase = 4
+	// Completed is an outbound message the broker accepted whose producer
+	// (a QueuePublisher, by its [Record.Ref]) has not yet recorded that.
+	// It is never sent again; the record is deleted once the producer has
+	// the outcome. Its Packet is empty.
+	Completed Phase = 5
 )
 
 // Valid reports whether p is a defined phase for direction d.
 func (p Phase) Valid(d Direction) bool {
 	switch d {
 	case Outbound:
-		return p == AwaitPuback || p == AwaitPubrec || p == AwaitPubcomp
+		return p == AwaitPuback || p == AwaitPubrec || p == AwaitPubcomp || p == Completed
 	case Inbound:
 		return p == AwaitPubrel
 	}

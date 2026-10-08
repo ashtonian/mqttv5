@@ -161,6 +161,11 @@ type lifecycle struct {
 	// err is why the span ended when it was not Disconnect, written
 	// before shutdown is closed.
 	err error
+	// mu orders a connection's activation against a store failure's
+	// teardown of the span: stopping is set under it, and a connection is
+	// installed under it only while stopping is unset.
+	mu       sync.Mutex
+	stopping bool
 }
 
 func newLifecycle() *lifecycle {

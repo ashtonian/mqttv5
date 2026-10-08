@@ -24,10 +24,6 @@ type Out struct {
 	expiresAt time.Time
 	expiry    uint32 // Message Expiry Interval in packet, when expiresAt is set
 
-	// writes holds the flow's store writes; it may be sent only once
-	// they have finished.
-	writes writeQueue
-
 	attempted bool // handed to a connection at least once
 	counted   bool // its PUBLISH holds one unit of this connection's send quota
 	finished  bool
@@ -85,9 +81,12 @@ type Message struct {
 
 // Register adds an outbound flow for m. The record is stored before the
 // flow can be sent; if that fails the flow is removed, the identifier
-// released, and a [*StoreError] returned. The returned Link, when
-// non-nil, is the live connection: the caller passes out.Seq() to its
-// SendOrdered so the PUBLISH keeps its place relative to other writes.
+// released, and a [*StoreError] returned. An error means the flow does
+// not exist and m.Settle is never called; otherwise the flow completes
+// through Done and Settle, also when the session fails meanwhile. The
+// returned Link, when non-nil, is the live connection: the caller passes
+// out.Seq() to its SendOrdered so the PUBLISH keeps its place relative
+// to other writes.
 func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 	o := &Out{
 		id: m.ID, qos: m.QoS, packet: m.Packet, expiresAt: m.ExpiresAt,
@@ -126,15 +125,17 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 		r := o.record()
 		// A fresh flow has no earlier write, so this Put is first in line
 		// and runs below on the caller's goroutine, under its ctx.
-		put = e.queueLocked(&o.writes, &job{
+		put = e.queueLocked(outKey(o.id), o, &job{
 			op: "put outbound",
 			do: func(context.Context) error { return e.store.Put(ctx, r) },
 			after: func(err error) error {
 				if err == nil {
 					return nil
 				}
-				// Never stored: the caller learns it was not accepted.
+				// Never stored: the caller learns it was not accepted, and
+				// writes queued for it since (a reconnect's) never run.
 				putErr = &StoreError{Op: "put outbound", Err: err}
+				e.cancelLocked(outKey(o.id), o)
 				e.unlinkLocked(o)
 				delete(e.out, o.id)
 				if len(o.ref) > 0 {
@@ -157,8 +158,9 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 	case putErr != nil:
 		return nil, nil, putErr
 	case e.epoch != epoch:
-		// The session failed while the record was written.
-		return nil, nil, o.err
+		// The session failed while the record was written. o was part of
+		// it, so it has completed, and its Settle run, with the failure.
+		return o, nil, nil
 	}
 	return o, e.link, nil
 }
@@ -247,13 +249,13 @@ func (e *Engine) HandlePubrec(id uint16, refused error) {
 	o := e.out[id]
 	switch {
 	case o == nil:
-		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonPacketIdentifierNotFound, nil, nil)
+		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonPacketIdentifierNotFound, false, nil)
 	case o.qos != 2 || !o.attempted:
 		e.mu.Unlock()
 		e.stray(wire.PUBREC, id)
 		return
 	case o.phase == session.AwaitPubcomp:
-		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonSuccess, o, nil)
+		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonSuccess, true, nil)
 	case refused != nil:
 		e.unlinkLocked(o)
 		e.finishLocked(o, refused)
@@ -265,7 +267,7 @@ func (e *Engine) HandlePubrec(id uint16, refused error) {
 		o.seq = e.nextSeq
 		e.nextSeq++
 		e.rel.push(o)
-		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonSuccess, o, nil)
+		e.pushCtrlLocked(wire.PUBREL, id, wire.ReasonSuccess, true, nil)
 		j = e.putOutLocked(o)
 	}
 	e.mu.Unlock()
@@ -337,8 +339,8 @@ func (e *Engine) retireLocked(o *Out) *job {
 func (e *Engine) settleLocked(o *Out) *job {
 	o.settling = true
 	settle, outcome, ref := o.settle, o.err, o.ref
-	k := session.RecordKey{Dir: session.Outbound, PacketID: o.id}
-	return e.queueLocked(&o.writes, &job{
+	k := outKey(o.id)
+	return e.queueLocked(k, o, &job{
 		op: "delete outbound",
 		do: func(ctx context.Context) error {
 			if settle != nil {
@@ -354,14 +356,23 @@ func (e *Engine) settleLocked(o *Out) *job {
 		after: func(err error) error {
 			o.settling = false
 			var se *settleError
-			switch {
-			case err != nil && !errors.As(err, &se):
+			failed := errors.As(err, &se)
+			if err != nil && !failed {
 				return &StoreError{Op: "delete outbound", Err: err}
+			}
+			if failed && outcome == nil && e.store != nil && o.phase != session.Completed {
+				// The broker accepted it: store that in place of the phase
+				// before, so a restart never sends it again. Queued behind
+				// this job, which starts it.
+				o.phase = session.Completed
+				e.putOutLocked(o)
+			}
+			switch {
 			case o.adopted:
 				o.adopted = false
 				// Queued behind this job, which starts it.
 				e.settleLocked(o)
-			case err != nil:
+			case failed:
 				o.settle = nil
 			default:
 				if len(o.ref) > 0 && e.orphans[string(o.ref)] == o {
@@ -406,8 +417,11 @@ func (o *Out) record() session.Record {
 		ExpiresAt: o.expiresAt,
 		Ref:       o.ref,
 	}
-	if o.phase == session.AwaitPubcomp {
+	switch o.phase {
+	case session.AwaitPubcomp:
 		r.PubrecSeq = o.seq
+	case session.Completed:
+		r.Packet = nil
 	}
 	return r
 }
@@ -419,7 +433,7 @@ func (e *Engine) putOutLocked(o *Out) *job {
 		return nil
 	}
 	r := o.record()
-	return e.queueLocked(&o.writes, &job{op: "put outbound", do: func(ctx context.Context) error { return e.store.Put(ctx, r) }})
+	return e.queueLocked(outKey(o.id), o, &job{op: "put outbound", do: func(ctx context.Context) error { return e.store.Put(ctx, r) }})
 }
 
 func sortByPubSeq(flows []*Out) {

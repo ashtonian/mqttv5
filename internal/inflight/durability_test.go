@@ -486,3 +486,183 @@ func TestAdoptWhileSettling(t *testing.T) {
 		t.Fatal("identifier or orphan kept after the outcome was recorded")
 	}
 }
+
+// deleteGate holds the first Delete until release is closed.
+type deleteGate struct {
+	*session.MemoryStore
+	held, release chan struct{}
+	once          sync.Once
+}
+
+func (s *deleteGate) Delete(ctx context.Context, k session.RecordKey) error {
+	s.once.Do(func() {
+		close(s.held)
+		<-s.release
+	})
+	return s.MemoryStore.Delete(ctx, k)
+}
+
+// A new inbound flow that reuses a packet identifier stores its record
+// only after the old session's delete of that record: the old write can
+// never erase the new one.
+func TestReusedInboundIDWaitsForOldDelete(t *testing.T) {
+	st := &deleteGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
+	h := newHarness(t, Config{Store: st})
+	h.connect(false, 10)
+	in, _, _ := h.e.Receive(5, 2)
+	h.e.Ack(in)
+	h.drain()
+	want(t, h.collect(), "PUBREC#5")
+
+	h.disconnect()
+	h.connect(false, 10) // the session is lost; its record is deleted
+	<-st.held
+	next, deliver, err := h.e.Receive(5, 2)
+	if !deliver || err != nil {
+		t.Fatalf("Receive: deliver %v, err %v", deliver, err)
+	}
+	h.e.Ack(next)
+	want(t, h.collect()) // its PUBREC waits for its record, behind the delete
+	close(st.release)
+	h.drain()
+	want(t, h.collect(), "PUBREC#5")
+	if recs := records(t, st); len(recs) != 1 {
+		t.Fatalf("records: %+v, want the new flow's", recs)
+	}
+}
+
+// A message the broker accepted but whose producer could not record it is
+// stored as Completed: a restart, with or without the session, never
+// sends it again, and the producer still gets the outcome.
+func TestAcceptedOutcomeSurvivesRestart(t *testing.T) {
+	for _, tc := range []struct {
+		qos     byte
+		present bool
+	}{{1, true}, {1, false}, {2, true}, {2, false}} {
+		t.Run(fmt.Sprintf("qos=%d/session-present=%v", tc.qos, tc.present), func(t *testing.T) {
+			st := session.NewMemoryStore()
+			h := newHarness(t, Config{Store: st})
+			h.connect(false, 10)
+			id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+			pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: id})
+			if _, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
+				Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}); err != nil {
+				t.Fatal(err)
+			}
+			h.collect()
+			if tc.qos == 1 {
+				h.e.HandlePuback(id, nil)
+			} else {
+				h.e.HandlePubrec(id, nil)
+				h.collect()
+				h.e.HandlePubcomp(id)
+			}
+			h.drain()
+			recs := records(t, st)
+			if len(recs) != 1 || recs[0].Phase != session.Completed {
+				t.Fatalf("records after a failed settle: %+v", recs)
+			}
+
+			restarted := newHarness(t, Config{Store: st})
+			if err := restarted.e.Restore(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			restarted.connect(tc.present, 10)
+			want(t, restarted.collect())
+			settled := make(chan error, 1)
+			if !restarted.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+				t.Fatal("the completed message was not adoptable after the restart")
+			}
+			if err := recvSettle(t, settled); err != nil {
+				t.Fatalf("outcome %v, want accepted", err)
+			}
+			restarted.drain()
+			if recs := records(t, st); len(recs) != 0 {
+				t.Fatalf("records after the producer recorded the outcome: %+v", recs)
+			}
+		})
+	}
+}
+
+// A session that fails while a message's record is written completes the
+// message once, through its Settle; Register does not also fail it.
+func TestFailureDuringRegisterCompletesOnce(t *testing.T) {
+	st := newFaultStore()
+	st.hold = phaseIs(session.AwaitPuback)
+	st.failMeta.Store(true)
+	h := newHarness(t, Config{Store: st, OnFailure: func(error) {}})
+	h.connect(false, 10)
+	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	settles := make(chan error, 2)
+	registered := make(chan error, 1)
+	go func() {
+		_, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("entry"),
+			Settle: func(_ context.Context, err error) error { settles <- err; return nil }})
+		registered <- err
+	}()
+	<-st.held
+	if err := h.e.SetMeta(context.Background(), session.Meta{ClientID: "x"}); err == nil {
+		t.Fatal("SetMeta succeeded although the store failed")
+	}
+	if err := recvSettle(t, settles); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("settled with %v", err)
+	}
+	close(st.release)
+	if err := <-registered; err != nil {
+		t.Fatalf("Register returned %v after the flow had settled", err)
+	}
+	h.drain()
+	select {
+	case err := <-settles:
+		t.Fatalf("settled twice, the second time with %v", err)
+	default:
+	}
+}
+
+// putGate fails the first Put after holding it until release is closed.
+type putGate struct {
+	*session.MemoryStore
+	held, release chan struct{}
+	first         sync.Once
+}
+
+func (s *putGate) Put(ctx context.Context, r session.Record) error {
+	failed := false
+	s.first.Do(func() {
+		close(s.held)
+		<-s.release
+		failed = true
+	})
+	if failed {
+		return errDiskFull
+	}
+	return s.MemoryStore.Put(ctx, r)
+}
+
+// A message whose first record write fails leaves nothing behind, also
+// when a reconnect queued another write for it meanwhile.
+func TestFailedFirstPutCancelsLaterWrites(t *testing.T) {
+	st := &putGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
+	h := newHarness(t, Config{Store: st})
+	h.connect(false, 10)
+	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	returned := make(chan error, 1)
+	go func() {
+		_, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt})
+		returned <- err
+	}()
+	<-st.held
+	h.disconnect()
+	h.connect(false, 10) // queues a rewrite of the flow's record
+	close(st.release)
+	if err := <-returned; !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("Register: %v", err)
+	}
+	h.drain()
+	if recs := records(t, st); len(recs) != 0 {
+		t.Fatalf("a message never accepted left a record: %+v", recs)
+	}
+	want(t, h.collect())
+}

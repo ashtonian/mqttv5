@@ -10,12 +10,15 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/url"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ashtonian/mqttv5/internal/testbroker"
+	"github.com/ashtonian/mqttv5/transport"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -350,5 +353,93 @@ func TestTeardownAnswersEveryQueuedRequest(t *testing.T) {
 	}
 	if len(dead) < 5 {
 		t.Fatalf("only %d connections in 2s; the broker should drop them every 20ms", len(dead))
+	}
+}
+
+// writeWatch reports the first write after it is armed.
+type writeWatch struct {
+	net.Conn
+	armed   atomic.Bool
+	writing chan struct{}
+	once    sync.Once
+}
+
+func (c *writeWatch) Write(p []byte) (int, error) {
+	if c.armed.Load() {
+		c.once.Do(func() { close(c.writing) })
+	}
+	return c.Conn.Write(p)
+}
+
+// A publish waiting its turn for the topic-alias table stops waiting
+// when its ctx ends, even while an earlier publish is stuck writing.
+func TestAliasWaitEndsWithContext(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	conn := &writeWatch{Conn: client, writing: make(chan struct{})}
+	go func() {
+		p, err := wire.NewDecoder(server).ReadPacket()
+		if err != nil {
+			return
+		}
+		p.Release()
+		_, _ = wire.WriteConnack(server, wire.ConnackOpts{TopicAliasMaximum: 10})
+		// Then stop reading.
+	}()
+	cli, err := New(WithBroker("mqtt://pipe"), WithoutKeepAlive(), WithPublishMode(PublishWaitForFlush),
+		WithOutboundTopicAliases(), WithLogger(quietLogger()),
+		WithDialFunc(func(context.Context, *url.URL) (transport.Conn, error) { return conn, nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = cli.Disconnect(ctx)
+	})
+	conn.armed.Store(true)
+	first := make(chan error, 1)
+	go func() { first <- cli.Publish(context.Background(), PublishOptions{Topic: "first"}) }()
+	<-conn.writing
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	second := make(chan error, 1)
+	go func() { second <- cli.Publish(ctx, PublishOptions{Topic: "second"}) }()
+	select {
+	case err := <-second:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("second publish: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the second publish ignored its ctx while waiting for the alias table")
+	}
+	_ = server.Close()
+	<-first
+}
+
+// Once a connection's writer has exited, its queue admits nothing: a
+// request is refused at once instead of waiting for an answer that no
+// writer would give.
+func TestClosedWriteQueueAdmitsNothing(t *testing.T) {
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.Close()
+	})
+	cli := tbClient(t, b, WithOnConnectionDown(func() bool { return false }))
+	cs := cli.cur.Load()
+	if cs == nil {
+		t.Fatal("not connected")
+	}
+	<-cs.writerDone
+	done := make(chan error, 1)
+	if err := cs.queue(context.Background(), writeReq{fn: writeBytes(nil), done: done}, true); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("queue after the writer exited: %v", err)
+	}
+	if n := cs.queued.Load(); n != 0 {
+		t.Fatalf("queued count %d after the writer exited", n)
 	}
 }

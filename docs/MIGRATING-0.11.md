@@ -251,7 +251,9 @@ type Store interface {
 Custom stores implement it and run `session/storetest`, keeping every
 field of `Record` — `Seq` (the order PUBLISHes were sent in) and
 `PubrecSeq` (the order PUBRECs arrived in, for AwaitPubcomp records)
-both. The client treats any error from a write as final (see below):
+both — and every phase `Record.Validate` accepts, including
+`Completed` (an outbound message the broker accepted whose
+`QueuePublisher` has not yet recorded it; no packet). The client treats any error from a write as final (see below):
 a store over a backend with transient failures retries them itself.
 `store/file` is a new bbolt-backed implementation with a sync policy
 (group commit by default) and an exclusive lock (`ErrLocked`); delete

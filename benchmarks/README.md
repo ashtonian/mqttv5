@@ -97,7 +97,7 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 | `BenchmarkE2E_Publish` | `Publish` in a loop, `lib × qos (0,1,2) × size (64B,1KiB,1MiB)` | one call; at QoS 1/2 including the broker's acknowledgements |
 | `BenchmarkE2E_PublishConcurrent` | `workers` goroutines (8, 64) publishing QoS 1 on one client | elapsed time per acknowledged message across all workers |
 | `BenchmarkE2E_Receive` | a subscriber fed by `rawClient` at the rate the broker sustains; `mode` callback/chan/queue, `consumers` goroutines for chan/queue | time per delivered message |
-| `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed | time per delivered message: at QoS 0 how fast the client consumes, at QoS 1 the round trip of a 20-message window between client and source |
+| `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed, a reference point for the harness's own cost | time per delivered message: at QoS 0 how fast the client consumes, at QoS 1 the round trip of a 20-message window between client and source |
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
 | `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule interval; read the `p50-ns` … `max-ns` metrics |
 | `BenchmarkE2E_Reconnect` | 20 QoS 1 publishes vanish in a proxy, the connection is cut; time until a subscriber has all 20 after the client reconnects with its session and resends them | one cut-and-recover cycle |
@@ -256,13 +256,18 @@ handler):
 Here the subscriber is fed by `rawServer` instead of the broker: it
 writes pre-encoded PUBLISH packets over loopback TCP as fast as the
 client reads them, keeping the client's window of 20 QoS 1 messages
-unacknowledged. At QoS 0 nothing holds the source back, so the time per
-message is how fast the client consumes. At QoS 1 the source waits for
-acknowledgements, so the time is the round trip of that window between
-client and source: how the client batches its acknowledgements and how
-often the source wakes for them both set it. `rawServer` runs in the
-benchmark process; `lib=floor`, the cheapest subscriber the harness can
-feed, measures it and the sink on their own.
+unacknowledged. At QoS 0 the source writes as fast as the socket takes
+data, so the time per message is mostly how fast the client consumes,
+together with what the source and the sink cost in the same process.
+At QoS 1 the source waits for acknowledgements, so the time is the
+round trip of that window between client and source: how the client
+batches its acknowledgements and how often the source wakes for them
+both set it. `lib=floor` is the cheapest subscriber the harness can
+feed — it decodes nothing it does not need — so its column shows what
+the harness costs with almost no subscriber. It is not the harness's
+share of another column: how often the source wakes depends on the
+subscriber, so the difference between two columns is an estimate, not a
+measurement, of a library's own cost.
 
 Time per delivered message:
 

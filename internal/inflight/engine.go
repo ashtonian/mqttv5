@@ -19,8 +19,8 @@
 //     Maximum allows.
 //
 // Store writes that gate a packet run on their own goroutine when the
-// store may block, so the read loop never waits on disk. One flow's
-// writes run in the order they were decided (see writeQueue). A write
+// store may block, so the read loop never waits on disk. One record's
+// writes run in the order they were decided (see queueLocked). A write
 // that fails ends the session: see [Config.OnFailure].
 package inflight
 
@@ -173,8 +173,10 @@ type Engine struct {
 	// producer publishing the message again.
 	orphans map[string]*Out
 
-	// writes counts store writes queued or running; writesIdle is closed
-	// while it is zero.
+	// queues holds each record's store writes, queued and running (the
+	// head); writes counts them all and writesIdle is closed while it is
+	// zero.
+	queues     map[session.RecordKey][]*job
 	writes     int
 	writesIdle chan struct{}
 	// epoch changes when the session fails; a write from an earlier
@@ -187,24 +189,31 @@ type Engine struct {
 }
 
 // ctrlFrame is an acknowledgement or PUBREL waiting to be written.
-// Frames leave in order; one whose flow still has store writes pending
-// holds back the frames behind it.
+// Frames leave in order; one whose record still has store writes
+// pending holds back the frames behind it.
 type ctrlFrame struct {
 	typ wire.PacketType
 	id  uint16
 	rc  wire.ReasonCode
-	// out is the outbound flow a PUBREL waits for: it goes out once the
-	// flow's AwaitPubcomp record is stored.
-	out *Out
-	// in is the inbound flow the frame answers. A PUBREC waits for its
-	// AwaitPubrel record and a PUBCOMP for that record's deletion. The
-	// flow stays registered until its PUBACK or PUBCOMP is written, so a
-	// retransmission that arrives first is recognised as a duplicate.
+	// gated frames wait until their record is stored: a PUBREL for the
+	// outbound AwaitPubcomp record, a PUBREC for the inbound AwaitPubrel
+	// record and a PUBCOMP for its deletion.
+	gated bool
+	// in is the inbound flow a PUBACK or PUBCOMP completes. The flow
+	// stays registered until that frame is written, so a retransmission
+	// that arrives first is recognised as a duplicate.
 	in *In
 }
 
-func (f *ctrlFrame) ready() bool {
-	return (f.out == nil || f.out.writes.idle()) && (f.in == nil || f.in.writes.idle())
+// readyLocked reports whether f may be written.
+func (e *Engine) readyLocked(f *ctrlFrame) bool {
+	if !f.gated {
+		return true
+	}
+	if f.typ == wire.PUBREL {
+		return e.storedLocked(outKey(f.id))
+	}
+	return e.storedLocked(inKey(f.id))
 }
 
 // New returns an engine with no state.
@@ -228,6 +237,7 @@ func New(cfg Config) *Engine {
 		in:         make(map[uint16]*In),
 		refs:       make(map[string]*Out),
 		orphans:    make(map[string]*Out),
+		queues:     make(map[session.RecordKey][]*job),
 		writesIdle: idle,
 		nextSeq:    1,
 		quota:      65535,
@@ -272,8 +282,22 @@ func (e *Engine) Restore(ctx context.Context) error {
 				slog.Int("dir", int(r.Key.Dir)), slog.Int("packet_id", int(r.Key.PacketID)), slog.Int("phase", int(r.Phase)))
 			continue
 		}
-		switch r.Key.Dir {
-		case session.Outbound:
+		switch {
+		case r.Key.Dir == session.Outbound && r.Phase == session.Completed:
+			// Accepted by the broker; its producer has yet to record that.
+			if len(r.Ref) == 0 || !e.ids.claim(r.Key.PacketID, OwnerPublish) {
+				e.cfg.Logger.Warn("mqttv5: skipping unusable stored outbound record",
+					slog.Int("packet_id", int(r.Key.PacketID)))
+				continue
+			}
+			o := &Out{
+				id: r.Key.PacketID, qos: r.QoS, phase: r.Phase, seq: r.Seq, pubSeq: r.Seq,
+				expiresAt: r.ExpiresAt, ref: r.Ref, finished: true, done: make(chan struct{}),
+			}
+			close(o.done)
+			e.orphans[string(o.ref)] = o
+			e.nextSeq = max(e.nextSeq, r.Seq+1)
+		case r.Key.Dir == session.Outbound:
 			if len(r.Packet) == 0 || !e.ids.claim(r.Key.PacketID, OwnerPublish) {
 				e.cfg.Logger.Warn("mqttv5: skipping unusable stored outbound record",
 					slog.Int("packet_id", int(r.Key.PacketID)))
@@ -295,7 +319,7 @@ func (e *Engine) Restore(ctx context.Context) error {
 				e.pub.push(o)
 			}
 			e.nextSeq = max(e.nextSeq, r.Seq+1, r.PubrecSeq+1)
-		case session.Inbound:
+		case r.Key.Dir == session.Inbound:
 			e.in[r.Key.PacketID] = &In{id: r.Key.PacketID, qos: 2, state: inAwaitPubrel}
 		}
 	}
@@ -430,7 +454,7 @@ func (e *Engine) resumeLocked() {
 	clear(e.ctrl[len(kept):])
 	e.ctrl = kept
 	for o := e.rel.head; o != nil; o = o.next {
-		e.pushCtrlLocked(wire.PUBREL, o.id, wire.ReasonSuccess, o, nil)
+		e.pushCtrlLocked(wire.PUBREL, o.id, wire.ReasonSuccess, true, nil)
 	}
 }
 
@@ -441,8 +465,8 @@ func (e *Engine) sessionLostLocked() []*job {
 	for id, in := range e.in {
 		in.dead = true
 		if in.state == inAwaitPubrel && e.store != nil {
-			k := session.RecordKey{Dir: session.Inbound, PacketID: id}
-			jobs = append(jobs, e.queueLocked(&in.writes, &job{
+			k := inKey(id)
+			jobs = append(jobs, e.queueLocked(k, in, &job{
 				op: "delete inbound", do: func(ctx context.Context) error { return e.store.Delete(ctx, k) },
 			}))
 		}
@@ -627,7 +651,7 @@ func (e *Engine) Collect(gen, upTo uint64, f *Frames) int {
 		e.released = upTo
 	}
 	n := 0
-	for len(e.ctrl) > 0 && e.ctrl[0].ready() {
+	for len(e.ctrl) > 0 && e.readyLocked(&e.ctrl[0]) {
 		c := e.ctrl[0]
 		f.appendAck(c.typ, c.id, c.rc)
 		if (c.typ == wire.PUBACK || c.typ == wire.PUBCOMP) && c.in != nil && e.in[c.id] == c.in {
@@ -643,7 +667,7 @@ func (e *Engine) Collect(gen, upTo uint64, f *Frames) int {
 	sent := 0
 	var now time.Time
 	for o := e.cursor; o != nil && sent < maxPublishesPerCollect; o = e.cursor {
-		if o.seq > e.released || !o.writes.idle() || e.quota == 0 {
+		if o.seq > e.released || !e.storedLocked(outKey(o.id)) || e.quota == 0 {
 			break
 		}
 		if !o.attempted && !o.expiresAt.IsZero() {
@@ -681,10 +705,10 @@ func (e *Engine) Collect(gen, upTo uint64, f *Frames) int {
 	return n + sent
 }
 
-// pushCtrlLocked queues an acknowledgement or PUBREL. out or in, when
-// set, is the flow whose store writes it waits for (see ctrlFrame).
-func (e *Engine) pushCtrlLocked(t wire.PacketType, id uint16, rc wire.ReasonCode, out *Out, in *In) {
-	e.ctrl = append(e.ctrl, ctrlFrame{typ: t, id: id, rc: rc, out: out, in: in})
+// pushCtrlLocked queues an acknowledgement or PUBREL; see ctrlFrame for
+// gated and in.
+func (e *Engine) pushCtrlLocked(t wire.PacketType, id uint16, rc wire.ReasonCode, gated bool, in *In) {
+	e.ctrl = append(e.ctrl, ctrlFrame{typ: t, id: id, rc: rc, gated: gated, in: in})
 }
 
 func (e *Engine) wake() {

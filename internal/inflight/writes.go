@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+
+	"github.com/ashtonian/mqttv5/session"
 )
 
 // ErrStoreFailed is matched by every [StoreError].
@@ -32,7 +34,7 @@ type settleError struct{ err error }
 func (e *settleError) Error() string { return "settle: " + e.err.Error() }
 func (e *settleError) Unwrap() error { return e.err }
 
-// job is one store write for a flow and what follows from it.
+// job is one store write for a record and what follows from it.
 type job struct {
 	op string
 	do func(ctx context.Context) error
@@ -45,33 +47,63 @@ type job struct {
 	// store is in memory: it runs a producer's Settle.
 	goroutine bool
 
-	q     *writeQueue
+	key   session.RecordKey
+	owner any // the flow the write is for; see cancelLocked
 	epoch uint64
 }
 
-// writeQueue orders one flow's store writes: each starts once the one
-// before it has finished, so an older state never overwrites a newer
-// one, also when the connection changes while a write is slow. A flow
-// whose queue is empty is stored as it stands, and the packets that
-// depend on its record may be sent.
-type writeQueue struct{ jobs []*job }
-
-func (q *writeQueue) idle() bool { return len(q.jobs) == 0 }
-
-// queueLocked appends j to q. It returns j when j is first in line, for
-// the caller to pass to start once it has released e.mu, and nil when
-// the job before it will start it.
-func (e *Engine) queueLocked(q *writeQueue, j *job) *job {
-	j.q, j.epoch = q, e.epoch
-	q.jobs = append(q.jobs, j)
+// queueLocked appends j to the write queue of the record it writes.
+// Each record's writes run one at a time, in the order they were
+// decided, so an older state never overwrites a newer one: not when the
+// connection changes while a write is slow, and not when a new flow
+// reuses the packet identifier of one whose writes are still running. A
+// record whose queue is empty is stored as it stands; the packets that
+// depend on it may be sent (see storedLocked).
+//
+// It returns j when j is first in line, for the caller to pass to start
+// once it has released e.mu, and nil when the job before it will start
+// it.
+func (e *Engine) queueLocked(key session.RecordKey, owner any, j *job) *job {
+	j.key, j.owner, j.epoch = key, owner, e.epoch
+	q := append(e.queues[key], j)
+	e.queues[key] = q
 	if e.writes == 0 {
 		e.writesIdle = make(chan struct{})
 	}
 	e.writes++
-	if len(q.jobs) == 1 {
+	if len(q) == 1 {
 		return j
 	}
 	return nil
+}
+
+// storedLocked reports whether every write decided for key has
+// finished.
+func (e *Engine) storedLocked(key session.RecordKey) bool { return len(e.queues[key]) == 0 }
+
+// cancelLocked drops the writes queued for key on behalf of owner that
+// have not started, for a flow that is gone before they ran. It is
+// called from the after of the write at the head of the queue.
+func (e *Engine) cancelLocked(key session.RecordKey, owner any) {
+	q := e.queues[key]
+	kept := q[:1]
+	for _, j := range q[1:] {
+		if j.owner == owner {
+			e.writes--
+			continue
+		}
+		kept = append(kept, j)
+	}
+	clear(q[len(kept):])
+	e.queues[key] = kept
+}
+
+func outKey(id uint16) session.RecordKey {
+	return session.RecordKey{Dir: session.Outbound, PacketID: id}
+}
+
+func inKey(id uint16) session.RecordKey {
+	return session.RecordKey{Dir: session.Inbound, PacketID: id}
 }
 
 // start runs jobs that queueLocked returned: on this goroutine when the
@@ -88,7 +120,7 @@ func (e *Engine) start(jobs ...*job) {
 	}
 }
 
-// run performs j, then each job queued behind it in the same flow.
+// run performs j, then each job queued behind it for the same record.
 func (e *Engine) run(j *job) {
 	for j != nil {
 		err := j.do(e.bg)
@@ -104,14 +136,15 @@ func (e *Engine) run(j *job) {
 				failure = &StoreError{Op: j.op, Err: err}
 			}
 		}
-		q := j.q
-		q.jobs[0] = nil
-		q.jobs = q.jobs[1:]
+		q := e.queues[j.key]
+		q[0] = nil
+		q = q[1:]
 		var next *job
-		if len(q.jobs) > 0 {
-			next = q.jobs[0]
+		if len(q) > 0 {
+			next = q[0]
+			e.queues[j.key] = q
 		} else {
-			q.jobs = nil
+			delete(e.queues, j.key)
 		}
 		e.writes--
 		if e.writes == 0 {

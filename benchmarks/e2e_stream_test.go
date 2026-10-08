@@ -31,7 +31,7 @@ import (
 // scenarios use). ns/op is the time per delivered message and cpu-ns/op
 // the whole process's CPU per message, rawServer included. The floor
 // column is the cheapest subscriber the harness can feed (see
-// floorLib): what rawServer, the sink and loopback cost on their own.
+// floorLib), a reference point for the harness's own cost.
 func BenchmarkE2E_ReceiveStream(b *testing.B) {
 	type variant struct {
 		mode mode
@@ -356,9 +356,10 @@ func rawRemaining(frame []byte) uint32 {
 // floorLib is the cheapest subscriber the harness can feed: MQTT 5 on
 // the wire package, taking each PUBLISH's payload straight from the read
 // buffer and acknowledging QoS 1 in one write per read. Its column in
-// BenchmarkE2E_ReceiveStream is what rawServer, the sink and the
-// loopback socket cost without a library, so a library's cost above it
-// is its own.
+// BenchmarkE2E_ReceiveStream shows what rawServer, the sink and the
+// loopback socket cost with almost no subscriber: a reference point, not
+// an amount to subtract, since how often rawServer wakes depends on the
+// subscriber.
 var floorLib = lib{name: "floor", v5: true, modes: []mode{modeCallback}, subscribe: subscribeFloor}
 
 func subscribeFloor(b *testing.B, cfg clientConfig, filter string, qos byte, _ mode, _ int, onMsg func([]byte)) func() int64 {

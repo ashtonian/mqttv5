@@ -5,6 +5,8 @@ package mqttv5
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -309,5 +311,134 @@ func TestQueueAckFailureKeepsTheExchange(t *testing.T) {
 	waitEmpty(t, st)
 	if got := qb.payloads(); len(got) != 1 {
 		t.Fatalf("broker received %v, want the message once", got)
+	}
+}
+
+// registerGate holds the first AwaitPuback Put until release is closed
+// and fails every AwaitPubcomp Put.
+type registerGate struct {
+	*session.MemoryStore
+	held, release chan struct{}
+	once          sync.Once
+}
+
+func (s *registerGate) Put(ctx context.Context, r session.Record) error {
+	if r.Phase == session.AwaitPuback {
+		s.once.Do(func() {
+			close(s.held)
+			<-s.release
+		})
+	}
+	if r.Phase == session.AwaitPubcomp {
+		return errors.New("disk full")
+	}
+	return s.MemoryStore.Put(ctx, r)
+}
+
+// A store failure while a queued message's record is being written ends
+// that message's exchange once: the QueuePublisher sees one outcome, so
+// its accounting holds (no negative WaitGroup) and it closes cleanly.
+func TestQueuePublisherSurvivesStoreFailureDuringRegister(t *testing.T) {
+	st := &registerGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
+	triggered, pubrec := make(chan struct{}), make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		p := c.Expect(wire.PUBLISH, 0)
+		close(triggered)
+		<-pubrec
+		c.Pubrec(p.PacketID, wire.ReasonSuccess)
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b, WithStore(st), WithOnStoreFailure(func(error) {}))
+	failed := make(chan error, 1)
+	go func() { failed <- cli.Publish(context.Background(), PublishOptions{Topic: "trigger", QoS: 2}) }()
+	// PUBLISHes go out in order: the queued message, held below, must
+	// come after the trigger.
+	<-triggered
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, cli, q)
+	enqueueAll(t, p, 1, "registering")
+	<-st.held
+	close(pubrec) // the QoS 2 phase write fails and ends the session
+	select {
+	case err := <-failed:
+		if !errors.Is(err, ErrStoreFailed) {
+			t.Fatalf("Publish: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the store failure did not end the session")
+	}
+	close(st.release)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cli.engine.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := q.Len(context.Background()); n != 1 {
+		t.Fatalf("queue length %d, want the message kept", n)
+	}
+	if err := p.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// pausingLog holds the client between the session's reconciliation and
+// the connection's activation, at the log line that falls between them.
+type pausingLog struct {
+	slog.Handler
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (h *pausingLog) Handle(ctx context.Context, r slog.Record) error {
+	if strings.HasPrefix(r.Message, "mqttv5: connected without a session") {
+		h.once.Do(func() {
+			close(h.entered)
+			<-h.release
+		})
+	}
+	return nil
+}
+
+// A store write that Connected started and that fails before the
+// connection is installed stops the client for good: Connect returns the
+// failure and OnConnectionUp never fires.
+func TestStoreFailureDuringActivation(t *testing.T) {
+	st := &phaseFailStore{MemoryStore: session.NewMemoryStore(), phase: session.AwaitPuback}
+	storedPublish(t, st.MemoryStore, 1, 1, "stored")
+	st.fail.Store(true) // the session-loss rewrite of the stored message fails
+	log := &pausingLog{Handler: slog.Default().Handler(), entered: make(chan struct{}), release: make(chan struct{})}
+	failures := make(chan error, 1)
+	up := make(chan struct{}, 1)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	cli, err := New(WithBroker(b.URL()), WithClientID("activation"), WithStore(st), WithLogger(slog.New(log)),
+		WithoutKeepAlive(), WithOnStoreFailure(func(err error) { failures <- err }),
+		WithOnConnectionUp(func(ConnackInfo) { up <- struct{}{} }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected := make(chan error, 1)
+	go func() { connected <- cli.Connect(context.Background()) }()
+	<-log.entered
+	select {
+	case <-failures:
+	case <-time.After(5 * time.Second):
+		close(log.release)
+		t.Fatal("the failed write did not stop the client")
+	}
+	close(log.release)
+	if err := <-connected; !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("Connect returned %v after the client stopped", err)
+	}
+	select {
+	case <-up:
+		t.Fatal("OnConnectionUp fired for a connection of a stopped client")
+	default:
+	}
+	if cli.Connected() {
+		t.Fatal("a stopped client is connected")
 	}
 }

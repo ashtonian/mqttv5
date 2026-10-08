@@ -15,7 +15,7 @@ import (
 func rawResults(t *testing.T, dir string, n int) {
 	t.Helper()
 	var b strings.Builder
-	b.WriteString("date: 2026-10-09T01:02:03Z\ncommit: 0123456789abcdef0123+dirty\nbroker: mosquitto | 2.1\ngoos: darwin\ngoarch: arm64\npkg: example\n")
+	b.WriteString("date: 2026-10-09T01:02:03Z\ncommit: 0123456789abcdef0123+dirty\nsource-hash: 5eed\nbroker: mosquitto | 2.1\ngoos: darwin\ngoarch: arm64\npkg: example\n")
 	for i := range n {
 		for _, size := range []string{"64B", "1KiB"} {
 			fmt.Fprintf(&b, "BenchmarkPub/lib=fast/size=%s-12 \t 1000 \t %d ns/op \t 6 allocs/op\n", size, 100000+1000*i)
@@ -42,11 +42,11 @@ func TestRender(t *testing.T) {
 		"\n| size | fast | slow | fast vs slow |\n|---|---:|---:|---:|\n" +
 		"| 64B | 104.5µs ±3% | 204.5µs ±2% | -48.90% (p=0.000 n=10) |\n" +
 		"| 1KiB | 104.5µs ±3% | 204.5µs ±2% | -48.90% (p=0.000 n=10) |\n" +
-		"\n<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 0123456789ab+dirty.</sub>\n" +
+		"\n<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 0123456789ab+dirty (source 5eed).</sub>\n" +
 		"<!-- /benchtab -->\n\n" +
 		`<!-- benchtab file=raw.txt rows=size cols=lib unit=allocs/op -->` + "\n" +
 		"\n| size | fast | slow |\n|---|---:|---:|\n| 64B | 6 | 53 |\n| 1KiB | 6 | 53 |\n" +
-		"\n<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 0123456789ab+dirty.</sub>\n" +
+		"\n<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 0123456789ab+dirty (source 5eed).</sub>\n" +
 		"<!-- /benchtab -->\n"
 	if string(out) != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", out, want)

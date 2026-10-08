@@ -28,9 +28,11 @@ import (
 // with [PublishWaitForFlush] — writes it on the calling goroutine when
 // the connection is a TCP or Unix socket and nothing is queued for its
 // writer goroutine, saving the hand-off; otherwise the writer sends it
-// behind the queued packets. ctx bounds the call either way: a write it
-// interrupts is finished by the writer goroutine, so the packet may
-// still reach the broker after Publish returned ctx's error.
+// behind the queued packets. ctx bounds the call either way — a write
+// still blocked when ctx is cancelled stops within 20 ms, one at ctx's
+// deadline at once — and a write it interrupts is finished by the
+// writer goroutine, so the packet may still reach the broker after
+// Publish returned ctx's error.
 //
 // With [WithPublisherPool] the call first tries the pool per
 // [PoolRoutingPolicy] and falls back to the main connection if every
@@ -91,6 +93,11 @@ func (c *Client) publishTracked(ctx context.Context, po PublishOptions, ref []by
 	if err := c.applyServerLimits(cs, &opts); err != nil {
 		return err
 	}
+	if opts.QoS == 0 {
+		// WithQoSDowngrade against a broker that grants only QoS 0: no
+		// acknowledgement would ever settle the message.
+		return fmt.Errorf("%w: the broker's Maximum QoS is 0 and a tracked publish needs an acknowledgement", ErrQoSNotSupported)
+	}
 	_, err := c.startReliable(ctx, opts, ref, settle)
 	return err
 }
@@ -130,74 +137,90 @@ func checkPacketSize(cs *connState, n int) error {
 //
 // With [WithOutboundTopicAliases] a topic is replaced by an alias the
 // broker learned from an earlier PUBLISH on the same connection. The
-// alias is allocated and the packet written or queued under one lock,
-// so a PUBLISH that uses an alias can never be written before the one
-// that registers it, and a new alias is kept only once its
-// PUBLISH is admitted — written, or queued for the writer — so one the
-// broker never saw is never used.
+// alias is allocated and the packet given its place in the write order
+// under one semaphore, so a PUBLISH that uses an alias can never be
+// written before the one that registers it, and a new alias is kept
+// only once its PUBLISH is admitted — written, or queued for the
+// writer — so one the broker never saw is never used. Waiting for the
+// semaphore ends with ctx; waiting for a queued write happens after it
+// is released.
 func (c *Client) publishQoS0(ctx context.Context, cs *connState, opts wire.PublishOpts) error {
 	if opts.TopicAlias != 0 && opts.TopicAlias > cs.info.TopicAliasMaximum {
 		return fmt.Errorf("%w: alias %d, broker maximum %d", ErrTopicAliasInvalid, opts.TopicAlias, cs.info.TopicAliasMaximum)
 	}
+	var (
+		done <-chan error
+		err  error
+	)
 	if c.cfg.OutboundTopicAliases && opts.TopicAlias == 0 && opts.Topic != "" && cs.info.TopicAliasMaximum > 0 {
-		cs.outAliasMu.Lock()
-		defer cs.outAliasMu.Unlock()
-		if topic, registered := assignOutboundAlias(cs, &opts); registered {
-			admitted, err := c.sendQoS0(ctx, cs, &opts)
-			if !admitted {
-				delete(cs.outAliasMap, topic)
-				cs.outAliasNext--
-			}
-			return err
+		select {
+		case cs.aliasSlot <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-cs.dying:
+			return ErrNotConnected
 		}
+		topic, registered := assignOutboundAlias(cs, &opts)
+		var admitted bool
+		admitted, done, err = c.admitQoS0(ctx, cs, &opts)
+		if registered && !admitted {
+			delete(cs.outAliasMap, topic)
+			cs.outAliasNext--
+		}
+		<-cs.aliasSlot
+	} else {
+		_, done, err = c.admitQoS0(ctx, cs, &opts)
 	}
-	_, err := c.sendQoS0(ctx, cs, &opts)
-	return err
+	if err != nil || done == nil {
+		return err
+	}
+	return awaitWrite(ctx, cs, done)
 }
 
-// sendQoS0 writes or queues a QoS 0 PUBLISH. admitted reports whether
+// admitQoS0 writes or queues a QoS 0 PUBLISH. admitted reports whether
 // the packet entered the connection's write order: it was written, is
-// being finished by the writer, or is queued for it.
-func (c *Client) sendQoS0(ctx context.Context, cs *connState, opts *wire.PublishOpts) (admitted bool, err error) {
+// being finished by the writer, or is queued for it. done, when not
+// nil, is where the writer reports a queued write the caller waits for.
+func (c *Client) admitQoS0(ctx context.Context, cs *connState, opts *wire.PublishOpts) (admitted bool, done <-chan error, err error) {
 	waitForFlush := c.cfg.PublishMode == PublishWaitForFlush
 	if waitForFlush && cs.acquireIdle() {
 		admitted, err = cs.writePublish(ctx, opts)
 		cs.wmu.Unlock()
-		return admitted, err
+		return admitted, nil, err
 	}
 
 	bp, err := wire.EncodePublish(*opts)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if err = checkPacketSize(cs, len(*bp)); err != nil {
 		wire.ReleaseBuf(bp)
-		return false, err
+		return false, nil, err
 	}
 
 	req := writeReq{pkt: bp}
-	var done chan error
+	var answer chan error
 	if waitForFlush {
-		done = make(chan error, 1)
-		req.done = done
+		answer = make(chan error, 1)
+		req.done = answer
 	}
 	// WriteDropNewest fails at once when the queue is full; WriteBlock
 	// waits for room, ctx or teardown.
 	if err = cs.queue(ctx, req, c.cfg.WriteOverflowPolicy != WriteDropNewest); err != nil {
 		wire.ReleaseBuf(bp)
-		return false, err
+		return false, nil, err
 	}
 	// The writer owns bp now; it releases it after the write.
 	if !waitForFlush {
-		return true, nil
+		return true, nil, nil
 	}
-	return true, awaitWrite(ctx, cs, done)
+	return true, answer, nil
 }
 
 // assignOutboundAlias replaces opts.Topic with an alias registered on cs,
 // or registers a new one while the broker's budget lasts, reporting the
-// topic it registered. The caller holds cs.outAliasMu until the packet
-// is queued, and undoes a registration whose packet was not.
+// topic it registered. The caller holds cs.aliasSlot until the packet is
+// admitted, and undoes a registration whose packet was not.
 func assignOutboundAlias(cs *connState, opts *wire.PublishOpts) (topic string, registered bool) {
 	if alias, ok := cs.outAliasMap[opts.Topic]; ok {
 		opts.TopicAlias = alias

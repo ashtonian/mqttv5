@@ -5,6 +5,7 @@
 package benchmarks
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -385,28 +386,35 @@ func subscribePaho3(b *testing.B, cfg clientConfig, filter string, qos byte, m m
 }
 
 // sink checks what a subscriber receives against what the raw sources
-// sent: target messages of size bytes, each stamped with its sequence
-// number at both ends of the payload (see stampSeq). It counts each
-// sequence number once; a duplicate, an unknown or torn payload, or a
-// message missing at the end fails the benchmark. A zero-length payload
-// is a probe: it only shows that the subscription is live.
+// sent: target messages of size bytes, Payload(size) each stamped with
+// its sequence number at both ends (see stampSeq). It counts each
+// sequence number once; a duplicate, a payload that differs anywhere
+// from what was sent, or a message missing at the end fails the
+// benchmark. A zero-length payload is a probe: it only shows that the
+// subscription is live.
 type sink struct {
-	size   int
-	target int64
-	seen   []atomic.Uint64 // one bit per sequence number
-	got    atomic.Int64    // distinct messages
-	dup    atomic.Int64
-	wrong  atomic.Int64 // wrong size, unknown or mismatched sequence numbers
-	ready  chan struct{}
-	once   sync.Once
-	done   chan struct{}
+	size    int
+	target  int64
+	pattern []byte          // the payload between the stamps
+	seen    []atomic.Uint64 // one bit per sequence number
+	got     atomic.Int64    // distinct messages
+	dup     atomic.Int64
+	wrong   atomic.Int64 // wrong size or content, unknown or torn sequence numbers
+	all     atomic.Int64 // every delivery but probes
+	ready   chan struct{}
+	once    sync.Once
+	done    chan struct{}
 }
 
 func newSink(size, target int) *sink {
-	return &sink{
+	s := &sink{
 		size: size, target: int64(target), seen: make([]atomic.Uint64, (target+63)/64),
 		ready: make(chan struct{}), done: make(chan struct{}),
 	}
+	if size >= 2*seqBytes {
+		s.pattern = Payload(size)[seqBytes : size-seqBytes]
+	}
+	return s
 }
 
 func (s *sink) onMsg(p []byte) {
@@ -414,8 +422,9 @@ func (s *sink) onMsg(p []byte) {
 		s.once.Do(func() { close(s.ready) })
 		return
 	}
+	s.all.Add(1)
 	seq, ok := readSeq(p)
-	if len(p) != s.size || !ok || seq >= uint64(s.target) {
+	if len(p) != s.size || !ok || seq >= uint64(s.target) || !bytes.Equal(p[seqBytes:len(p)-seqBytes], s.pattern) {
 		s.wrong.Add(1)
 		return
 	}
@@ -435,15 +444,33 @@ func (s *sink) String() string {
 }
 
 // check fails the benchmark unless every message arrived exactly once
-// and intact.
+// and intact (see verify).
 func (s *sink) check(b *testing.B, dropped func() int64) {
 	b.Helper()
+	if err := s.verify(dropped); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// verify waits until deliveries have stopped — no new one for 50 ms,
+// within a second — so one that trails the last expected message is
+// counted too, then reports anything but every message once and intact.
+func (s *sink) verify(dropped func() int64) error {
+	last := s.all.Load()
+	quiet := time.Now()
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline) && time.Since(quiet) < 50*time.Millisecond; {
+		time.Sleep(5 * time.Millisecond)
+		if n := s.all.Load(); n != last {
+			last, quiet = n, time.Now()
+		}
+	}
 	if n := dropped(); n > 0 {
-		b.Fatalf("subscriber dropped %d messages; a run with drops measures nothing", n)
+		return fmt.Errorf("subscriber dropped %d messages; a run with drops measures nothing", n)
 	}
 	if s.wrong.Load() > 0 || s.dup.Load() > 0 || s.got.Load() != s.target {
-		b.Fatal(s.String())
+		return errors.New(s.String())
 	}
+	return nil
 }
 
 // seqBytes is the size of the sequence number stamped at each end of a

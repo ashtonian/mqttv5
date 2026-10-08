@@ -135,6 +135,11 @@ func testRoundTrip(t *testing.T, s session.Store) {
 			return r
 		}(),
 		func() session.Record { r := outRec(5, 13, session.AwaitPuback, "d"); r.Ref = []byte{}; return r }(),
+		func() session.Record {
+			r := outRec(8, 16, session.Completed, "")
+			r.QoS, r.Packet, r.Ref = 1, nil, []byte("entry-8")
+			return r
+		}(),
 		inRec(4),
 	}
 	for _, r := range want {

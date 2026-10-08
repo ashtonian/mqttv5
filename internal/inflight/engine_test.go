@@ -571,7 +571,7 @@ func (s *blockingStore) Delete(ctx context.Context, k session.RecordKey) error {
 func (h *harness) headCtrlReady() bool {
 	h.e.mu.Lock()
 	defer h.e.mu.Unlock()
-	return len(h.e.ctrl) > 0 && h.e.ctrl[0].ready()
+	return len(h.e.ctrl) > 0 && h.e.readyLocked(&h.e.ctrl[0])
 }
 
 func waitFor(t *testing.T, cond func() bool) {

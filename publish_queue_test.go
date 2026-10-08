@@ -504,19 +504,42 @@ func TestQueuePublisherRepublishesAfterSessionLoss(t *testing.T) {
 }
 
 // A message the broker's limits rule out is dead-lettered, not retried.
+// With WithQoSDowngrade too: a QoS 0 message could never be
+// acknowledged, so the publisher does not send one.
 func TestQueuePublisherDeadLettersWhatTheBrokerCannotTake(t *testing.T) {
-	zero := byte(0)
-	b := testbroker.New(t, func(c *testbroker.Conn) {
-		c.AcceptConnect(wire.ConnackOpts{MaximumQoS: &zero})
-		c.ServeAuto()
-	})
-	var dl deadLetters
-	q := NewMemoryPublisherQueue()
-	p := newQueuePublisher(t, tbClient(t, b), q, WithDeadLetter(dl.record))
-	enqueueAll(t, p, 1, "qos1")
-	waitQueueLen(t, q, 0)
-	if got, errs := dl.get(); !slices.Equal(got, []string{"qos1"}) || !errors.Is(errs[0], ErrQoSNotSupported) {
-		t.Fatalf("dead letters %q %v", got, errs)
+	for _, downgrade := range []bool{false, true} {
+		t.Run(fmt.Sprintf("downgrade=%v", downgrade), func(t *testing.T) {
+			zero := byte(0)
+			published := make(chan testbroker.Packet, 1)
+			b := testbroker.New(t, func(c *testbroker.Conn) {
+				c.AcceptConnect(wire.ConnackOpts{MaximumQoS: &zero})
+				if p, ok := c.Await(wire.PUBLISH, 300*time.Millisecond); ok {
+					published <- p
+				}
+				c.ServeAuto()
+			})
+			var opts []Option
+			if downgrade {
+				opts = append(opts, WithQoSDowngrade())
+			}
+			cli := tbClient(t, b, opts...)
+			var dl deadLetters
+			q := NewMemoryPublisherQueue()
+			p := newQueuePublisher(t, cli, q, WithDeadLetter(dl.record))
+			enqueueAll(t, p, 1, "qos1")
+			waitQueueLen(t, q, 0)
+			if got, errs := dl.get(); !slices.Equal(got, []string{"qos1"}) || !errors.Is(errs[0], ErrQoSNotSupported) {
+				t.Fatalf("dead letters %q %v", got, errs)
+			}
+			select {
+			case pkt := <-published:
+				t.Fatalf("sent a QoS %d PUBLISH that no acknowledgement could settle", pkt.QoS)
+			case <-time.After(400 * time.Millisecond):
+			}
+			if n := cli.engine.OutboundLen(); n != 0 {
+				t.Fatalf("%d outbound flows left", n)
+			}
+		})
 	}
 }
 

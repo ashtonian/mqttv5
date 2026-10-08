@@ -5,6 +5,7 @@ package mqttv5
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,15 +18,24 @@ import (
 )
 
 // countingBroker answers every connection, refusing PUBLISHes with
-// refuse (0 accepts) and counting them; connections from client IDs
-// in dead are dropped.
+// refuse (0 accepts) and counting them; a client ID in dead never gets
+// connected: its CONNECT is refused with 0x88 Server unavailable.
 func countingBroker(t *testing.T, refuse wire.ReasonCode, dead func(clientID string) bool) (*testbroker.Broker, *atomic.Int32) {
 	var publishes atomic.Int32
 	b := testbroker.New(t)
 	b.SetFallback(func(c *testbroker.Conn) {
-		ci := c.AcceptConnect(wire.ConnackOpts{})
-		if ci == nil || (dead != nil && dead(ci.ClientID)) {
+		connect, ok := c.Await(wire.CONNECT, 0)
+		if !ok {
+			return
+		}
+		if dead != nil && dead(connect.Connect.ClientID) {
+			_ = c.Write(func(w io.Writer) (int64, error) {
+				return wire.WriteConnack(w, wire.ConnackOpts{ReasonCode: wire.ReasonServerUnavailable})
+			})
 			c.Close()
+			return
+		}
+		if err := c.Write(func(w io.Writer) (int64, error) { return wire.WriteConnack(w, wire.ConnackOpts{}) }); err != nil {
 			return
 		}
 		for {
@@ -77,7 +87,10 @@ func TestPoolFailsOverWhenAMemberIsDown(t *testing.T) {
 	waitForPoolReady(t, cli, 1, 3*time.Second)
 	const n = 6
 	for range n {
-		if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1})
+		cancel()
+		if err != nil {
 			t.Fatal(err)
 		}
 	}

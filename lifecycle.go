@@ -384,6 +384,7 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		direct:        supportsDirectWrites(r.conn),
 		engine:        c.engine,
 		wake:          make(chan struct{}, 1),
+		aliasSlot:     make(chan struct{}, 1),
 		life:          life,
 		dying:         make(chan struct{}),
 		writerDone:    make(chan struct{}),
@@ -432,6 +433,17 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		c.cfg.Logger.Info("mqttv5: connected without a session; unacknowledged publishes follow the session-loss policy",
 			slog.Int("outbound", c.engine.OutboundLen()))
 	}
+	// A store write Connected started may already have failed and the
+	// span be ending: then the connection is never installed. Otherwise
+	// it is installed, and OnConnectionUp fired, before the teardown can
+	// start, which then takes it down.
+	life.mu.Lock()
+	defer life.mu.Unlock()
+	if err := c.activationErr(life); err != nil {
+		c.engine.Disconnected(cs)
+		_ = r.conn.Close()
+		return err
+	}
 	cs.gen.Store(gen)
 	if !r.info.SessionPresent {
 		c.markSessionLost()
@@ -465,6 +477,24 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 	return nil
 }
 
+// activationErr is why a connection must not be installed in span life:
+// the session store failed, or the span is ending. The caller holds
+// life.mu.
+func (c *Client) activationErr(life *lifecycle) error {
+	if err := c.engine.Failure(); err != nil {
+		return err
+	}
+	if life.stopping {
+		return ErrClosed
+	}
+	select {
+	case <-life.shutdown:
+		return life.closedErr()
+	default:
+		return nil
+	}
+}
+
 // storeFailed is the session engine's OnFailure: a store write failed,
 // the engine has dropped its session state, and the client stops rather
 // than run without the guarantee the store exists for (see WithStore).
@@ -484,6 +514,9 @@ func (c *Client) storeFailed(err error) {
 func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
 	defer cancel()
+	life.mu.Lock()
+	life.stopping = true
+	life.mu.Unlock()
 	life.disconnOnce.Do(func() {
 		c.sendDisconnectWith(ctx, wire.DisconnectOpts{ReasonCode: wire.ReasonUnspecifiedError})
 		life.endWith(err)

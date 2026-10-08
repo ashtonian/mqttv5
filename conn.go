@@ -119,8 +119,9 @@ type connState struct {
 	// Only applied to QoS 0 publishes — QoS 1/2 publishes must use
 	// the full topic string so the supervisor's replay path works
 	// across a reconnect (the broker's alias state resets per
-	// §3.3.2.3.4).
-	outAliasMu   sync.Mutex
+	// §3.3.2.3.4). aliasSlot, a one-slot semaphore a caller can stop
+	// waiting for when its ctx ends, guards both.
+	aliasSlot    chan struct{}
 	outAliasMap  map[string]uint16
 	outAliasNext uint16
 
@@ -302,46 +303,61 @@ func (cs *connState) writePublish(ctx context.Context, opts *wire.PublishOpts) (
 	return started, err
 }
 
-// aLongTimeAgo is a deadline in the past, which interrupts a write.
-var aLongTimeAgo = time.Unix(1, 0)
+// writeSlice bounds how long a direct write runs without checking the
+// caller's ctx: a write that ctx ends stops within about this long,
+// or at ctx's deadline.
+const writeSlice = 20 * time.Millisecond
 
-// writeDirect writes bufs; the caller holds wmu. When ctx can end, it
-// interrupts a write still blocked at that point with a deadline in the
-// past: the caller gets ctx's error, and the bytes not yet written go to
-// the writer goroutine, which sends them before anything else, so the
-// stream stays whole. A packet ctx ended before its first byte is not
-// sent at all, unless must is set (its bytes were promised to the
-// connection). started reports whether any of bufs was, or will be,
-// written. Any other write error ends the connection.
+// writeDirect writes bufs; the caller holds wmu. When ctx can end, the
+// write runs under a deadline renewed every writeSlice (or ctx's own
+// deadline, if sooner), so a write still blocked when ctx ends is
+// interrupted without a goroutine or an allocation: the caller gets
+// ctx's error, and the bytes not yet written go to the writer goroutine,
+// which sends them before anything else, so the stream stays whole. A
+// packet ctx ended before its first byte is not sent at all, unless must
+// is set (its bytes were promised to the connection). started reports
+// whether any of bufs was, or will be, written. Any other write error
+// ends the connection.
 func (cs *connState) writeDirect(ctx context.Context, bufs *net.Buffers, must bool) (started bool, err error) {
-	var n int64
 	if ctx.Done() == nil {
-		n, err = bufs.WriteTo(cs.conn)
-	} else {
-		if err = ctx.Err(); err != nil && !must {
-			return false, err
-		}
-		interrupted := make(chan struct{})
-		stop := context.AfterFunc(ctx, func() {
-			_ = cs.conn.SetWriteDeadline(aLongTimeAgo)
-			close(interrupted)
-		})
-		n, err = bufs.WriteTo(cs.conn)
-		if !stop() {
-			<-interrupted
-			_ = cs.conn.SetWriteDeadline(time.Time{})
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				if n == 0 && !must {
-					return false, ctx.Err()
-				}
-				cs.handOff(*bufs)
-				return true, ctx.Err()
-			}
-		}
+		_, err = bufs.WriteTo(cs.conn)
+		return cs.wrote(err)
 	}
+	if err = ctx.Err(); err != nil && !must {
+		return false, err
+	}
+	var written int64
+	for {
+		deadline := time.Now().Add(writeSlice)
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+		_ = cs.conn.SetWriteDeadline(deadline)
+		n, werr := bufs.WriteTo(cs.conn)
+		written += n
+		if werr == nil || !errors.Is(werr, os.ErrDeadlineExceeded) {
+			_ = cs.conn.SetWriteDeadline(time.Time{})
+			started, err = cs.wrote(werr)
+			return started || written > 0, err
+		}
+		if ctx.Err() == nil {
+			continue
+		}
+		_ = cs.conn.SetWriteDeadline(time.Time{})
+		if written == 0 && !must {
+			return false, ctx.Err()
+		}
+		cs.handOff(*bufs)
+		return true, ctx.Err()
+	}
+}
+
+// wrote finishes a direct write that ran to its end: err ends the
+// connection.
+func (cs *connState) wrote(err error) (started bool, _ error) {
 	if err != nil {
 		cs.writeFailed(err)
-		return n > 0, err
+		return false, err
 	}
 	cs.lastWriteUnixNano.Store(cs.clk.Now().UnixNano())
 	return true, nil

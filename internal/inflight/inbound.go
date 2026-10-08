@@ -27,9 +27,6 @@ type In struct {
 	qos   byte
 	state inState
 	dead  bool // its session is gone; Ack is a no-op
-	// writes holds the QoS 2 flow's store writes; its PUBREC or PUBCOMP
-	// waits for them.
-	writes writeQueue
 }
 
 // Receive registers an inbound QoS 1/2 PUBLISH. deliver is false for a
@@ -47,7 +44,7 @@ func (e *Engine) Receive(id uint16, qos byte) (in *In, deliver bool, err error) 
 	if x := e.in[id]; x != nil {
 		resend := x.state == inAwaitPubrel && qos == 2
 		if resend {
-			e.pushCtrlLocked(wire.PUBREC, id, wire.ReasonSuccess, nil, x)
+			e.pushCtrlLocked(wire.PUBREC, id, wire.ReasonSuccess, true, nil)
 		}
 		e.mu.Unlock()
 		if resend {
@@ -82,14 +79,14 @@ func (e *Engine) Ack(in *In) {
 	for ; n < len(e.fifo) && e.fifo[n].state == inAcked; n++ {
 		head := e.fifo[n]
 		if head.qos == 1 {
-			e.pushCtrlLocked(wire.PUBACK, head.id, wire.ReasonSuccess, nil, head)
+			e.pushCtrlLocked(wire.PUBACK, head.id, wire.ReasonSuccess, false, head)
 			continue
 		}
 		head.state = inAwaitPubrel
-		e.pushCtrlLocked(wire.PUBREC, head.id, wire.ReasonSuccess, nil, head)
+		e.pushCtrlLocked(wire.PUBREC, head.id, wire.ReasonSuccess, true, nil)
 		if e.store != nil {
-			k := session.RecordKey{Dir: session.Inbound, PacketID: head.id}
-			jobs = append(jobs, e.queueLocked(&head.writes, &job{
+			k := inKey(head.id)
+			jobs = append(jobs, e.queueLocked(k, head, &job{
 				op: "put inbound",
 				do: func(ctx context.Context) error {
 					return e.store.Put(ctx, session.Record{Key: k, QoS: 2, Phase: session.AwaitPubrel})
@@ -127,13 +124,13 @@ func (e *Engine) HandlePubrel(id uint16) {
 	switch {
 	case in != nil && in.state == inReleased:
 	case in == nil || in.state != inAwaitPubrel:
-		e.pushCtrlLocked(wire.PUBCOMP, id, wire.ReasonPacketIdentifierNotFound, nil, nil)
+		e.pushCtrlLocked(wire.PUBCOMP, id, wire.ReasonPacketIdentifierNotFound, false, nil)
 	default:
 		in.state = inReleased
-		e.pushCtrlLocked(wire.PUBCOMP, id, wire.ReasonSuccess, nil, in)
+		e.pushCtrlLocked(wire.PUBCOMP, id, wire.ReasonSuccess, true, in)
 		if e.store != nil {
-			k := session.RecordKey{Dir: session.Inbound, PacketID: id}
-			j = e.queueLocked(&in.writes, &job{
+			k := inKey(id)
+			j = e.queueLocked(k, in, &job{
 				op: "delete inbound",
 				do: func(ctx context.Context) error { return e.store.Delete(ctx, k) },
 			})

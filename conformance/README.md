@@ -49,7 +49,7 @@ their doc comments, and prints the block to paste.
 | `TestSubscribe_RefusedFilterReported` | `faults_test.go` | A filter a broker will not take is reported, and the client carries on. |
 | `TestReceiveMaximumHonoured` | `limits_test.go` | Publishes far more QoS 1 messages at once than the broker's Receive Maximum (mosquitto advertises 20, EMQX 32, HiveMQ 10, the strict HiveMQ 4) and checks the client never had more in flight than the broker allows and that every publish completes. |
 | `TestSubscribe_NoLocal_SuppressesOwnPublishes` | `nolocal_test.go` | Verifies the MQTT v5 §3.8.3.1 No-Local subscription option: when a client subscribes with NoLocal=true, the broker must NOT deliver that client's own matching PUBLISHes back to it. |
-| `TestOverlappingSubscriptionsOneCopyEach` | `overlap_test.go` | Checks against real brokers that with two overlapping subscriptions on one client, each receives the message exactly once. |
+| `TestOverlappingSubscriptionsOneCopyEach` | `overlap_test.go` | Checks against real brokers that, with two overlapping subscriptions on one client, each receives the message exactly once. |
 | `TestQueuePublisher_DrainsInOrderOnce` | `queue_test.go` | A pipelined QueuePublisher delivers every queued message once, in order, through a real broker at QoS 1 and 2. |
 | `TestReauthenticate_SCRAM_EMQX` | `reauth_test.go` | Exercises client-initiated MQTT 5 re-authentication (§4.12) end-to-end against a real broker. |
 | `TestReconnect_QoS1SurvivesConnectionDrop` | `reconnect_replay_test.go` | A QoS 1 message published across an ungraceful connection drop is resent after the reconnect, delivered at least once, and its Publish call returns success. |

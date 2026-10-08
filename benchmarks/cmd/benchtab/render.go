@@ -244,9 +244,10 @@ func (s spec) renderMeta(dir string) (string, error) {
 }
 
 // recorded describes where the raw results came from — "recorded
-// 2026-10-09 at 1a2b3c4d5e6f" — from the date and commit lines
-// scripts/run.sh writes, or "" when the file has neither. The raw files
-// are not kept in the repository, so this is what ties a table to them.
+// 2026-10-09 at 1a2b3c4d5e6f" — from the date, commit and source-hash
+// lines scripts/run.sh writes, or "" when the file has none. The raw
+// files are not kept in the repository, so this is what ties a table to
+// them; a recording of uncommitted changes carries their hash.
 func recorded(values map[string]string) string {
 	var parts []string
 	if d := values["date"]; d != "" {
@@ -260,6 +261,9 @@ func recorded(values map[string]string) string {
 		}
 		if suffix != "" {
 			sha += "+" + suffix
+		}
+		if h := values["source-hash"]; h != "" {
+			sha += " (source " + h + ")"
 		}
 		parts = append(parts, "at "+sha)
 	}
