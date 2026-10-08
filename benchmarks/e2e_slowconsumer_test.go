@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/metrics"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	waitLive(b, s, func() error { return pub.publish(topic, 0, nil, 1) })
 
 	runtime.GC()
-	sampler := startHeapSampler()
+	sampler := startHeapSampler(b)
 	b.ResetTimer()
 	if err := pub.publish(topic, 0, Payload(size), b.N); err != nil {
 		b.Fatalf("raw publisher: %v", err)
@@ -98,6 +99,7 @@ type heapSampler struct {
 	base  uint64
 	peak  atomic.Uint64
 	last  atomic.Uint64
+	once  sync.Once
 	stopc chan struct{}
 	done  chan struct{}
 }
@@ -110,8 +112,11 @@ func heapBytes() uint64 {
 	return s[0].Value.Uint64()
 }
 
-func startHeapSampler() *heapSampler {
+// startHeapSampler starts sampling; the sampler stops when b ends, if
+// not before.
+func startHeapSampler(b *testing.B) *heapSampler {
 	h := &heapSampler{base: heapBytes(), stopc: make(chan struct{}), done: make(chan struct{})}
+	b.Cleanup(func() { h.stop() })
 	go func() {
 		defer close(h.done)
 		t := time.NewTicker(time.Millisecond)
@@ -134,8 +139,9 @@ func startHeapSampler() *heapSampler {
 
 func (h *heapSampler) current() uint64 { return h.last.Load() }
 
+// stop ends sampling and returns the peak growth.
 func (h *heapSampler) stop() uint64 {
-	close(h.stopc)
+	h.once.Do(func() { close(h.stopc) })
 	<-h.done
 	return h.peak.Load()
 }

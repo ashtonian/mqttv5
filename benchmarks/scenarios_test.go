@@ -136,3 +136,17 @@ func TestBrokerScenariosRejectCorruption(t *testing.T) {
 		}
 	})
 }
+
+// A benchmark that fails while sampling the heap stops its sampler.
+func TestHeapSamplerStopsWithItsBenchmark(t *testing.T) {
+	var h *heapSampler
+	testing.Benchmark(func(b *testing.B) {
+		h = startHeapSampler(b)
+		b.Fatal("failed while sampling")
+	})
+	select {
+	case <-h.done:
+	default:
+		t.Fatal("the sampler outlived its failed benchmark")
+	}
+}
