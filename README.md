@@ -181,7 +181,7 @@ supervisor:
   subscriptions, Subscription Identifiers, topic aliases in both
   directions, session expiry and resumption, retained messages, the Will
   and its properties, server redirects, enhanced authentication (CONNECT
-  and mid-session, §4.12), and the broker's CONNACK limits enforced
+  and mid-session, [§4.12]), and the broker's CONNACK limits enforced
   before a packet is sent. The [conformance suite](conformance/) runs
   against mosquitto and EMQX on every change, and nightly against HiveMQ
   CE, including one that announces tight CONNACK limits.
@@ -453,7 +453,7 @@ that must be resumed exactly.
 
 ### Redirecting at runtime
 
-A broker can send the client elsewhere (§4.11): a CONNACK or DISCONNECT
+A broker can send the client elsewhere ([§4.11]): a CONNACK or DISCONNECT
 with reason `0x9D` Server moved or `0x9C` Use another server and a
 Server Reference. `WithOnServerRedirect` reports each one;
 `WithFollowServerRedirects()` acts on it — a move replaces the broker
@@ -623,7 +623,7 @@ mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOp
 
 ### Re-authentication without reconnecting
 
-`Client.Reauthenticate(ctx)` drives MQTT v5 re-authentication (§4.12) on
+`Client.Reauthenticate(ctx)` drives MQTT v5 re-authentication ([§4.12]) on
 the *live* connection — no reconnect, no QoS-state churn:
 
 1. Sends an AUTH `0x19` carrying a fresh `Authenticator.Begin(ctx)` payload.
@@ -719,7 +719,7 @@ See [`examples/disconnect`](examples/disconnect).
 | `WithClientID(s)` | broker-assigned | MQTT ClientID. Empty = ask the broker to assign one via `AssignedClientIdentifier`; `cli.ClientID()` then returns the assigned value after CONNACK. |
 | `WithCredentials(user, pass)` | — | CONNECT username + password. Static. For per-attempt rotation use `WithConnectPacketBuilder`. |
 | `WithConnectPacketBuilder(fn)` | — | `func(ctx, *ConnectOptions) error`. Change the CONNECT's username, password and user properties before each attempt; canonical OAuth-token-rotation hook. |
-| `WithAuthenticator(a)` | — | MQTT v5 enhanced auth (CONNECT + re-auth §4.12). `Begin(ctx)` resolves the credential; client-initiated refresh via `Client.Reauthenticate`. |
+| `WithAuthenticator(a)` | — | MQTT v5 enhanced auth (CONNECT + re-auth [§4.12]). `Begin(ctx)` resolves the credential; client-initiated refresh via `Client.Reauthenticate`. |
 
 #### Session and CONNECT properties
 
@@ -727,16 +727,16 @@ See [`examples/disconnect`](examples/disconnect).
 |---|---|---|
 | `WithCleanStart(b)` | true, or false when there is session state to resume | `CleanStart` on the initial CONNECT. Unset, the client resumes (CleanStart=0) when it holds unfinished QoS 1/2 flows from an earlier `Connect` or from `WithStore`; `true` always starts fresh and discards that state. |
 | `WithCleanStartOnReconnect(b)` | false | `CleanStart` on every reconnect. False preserves QoS 1/2 session for resume. |
-| `WithSessionExpiry(seconds)` | 300 (5 min) | Session Expiry Interval (§3.1.2.11.2). Pass 0 to end the session with the connection. A broker override in CONNACK is honoured. |
+| `WithSessionExpiry(seconds)` | 300 (5 min) | Session Expiry Interval ([§3.1.2.11.2]). Pass 0 to end the session with the connection. A broker override in CONNACK is honoured. |
 | `WithSessionLossPolicy(p)` | `SessionLossRepublish` | What happens to unacknowledged QoS 1/2 publishes when a connection starts without the session (Session Present = 0): `SessionLossRepublish` sends them again as new messages in their original order; `SessionLossFail` completes them with `ErrSessionLost`. |
 | `WithStore(s)` | none (in memory) | `session.Store` that persists session state across restarts (use `store/file`). Without it, state survives reconnects only. A failed write of a new message's record fails that `Publish`; any other failed write stops the client (see [Store failures](#store-failures)). |
 | `WithReceiveMaximum(n)` | unset (65535) | Cap on concurrent inbound QoS 1/2. A broker that exceeds it is disconnected with reason 0x93. |
-| `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property §3.1.2.11.4 — caps the largest packet the broker may send. See note below. |
-| `WithInboundTopicAliasMaximum(n)` | 0 (no inbound aliases) | CONNECT property §3.1.2.11.5 — opt into wire compression on inbound PUBLISHes. An alias the broker sends outside 1..n closes the connection (`0x94`). |
+| `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property [§3.1.2.11.4] — caps the largest packet the broker may send. See note below. |
+| `WithInboundTopicAliasMaximum(n)` | 0 (no inbound aliases) | CONNECT property [§3.1.2.11.5] — opt into wire compression on inbound PUBLISHes. An alias the broker sends outside 1..n closes the connection (`0x94`). |
 | `WithOutboundTopicAliases()` | off | Replace repeated QoS 0 topics with topic aliases within the broker's Topic Alias Maximum. |
 | `WithLenientDecoding()` | off | Tolerate a non-minimal Remaining Length and reserved PINGRESP flags from the broker (logged) instead of disconnecting. |
-| `WithRequestResponseInformation(b)` | false | CONNECT property §3.1.2.11.6 — broker returns `ResponseInformation` in CONNACK. |
-| `WithRequestProblemInformation(b)` | true | CONNECT property §3.1.2.11.7 — broker returns `ReasonString` / `UserProperties` on errors. Pass `false` to opt out. |
+| `WithRequestResponseInformation(b)` | false | CONNECT property [§3.1.2.11.6] — broker returns `ResponseInformation` in CONNACK. |
+| `WithRequestProblemInformation(b)` | true | CONNECT property [§3.1.2.11.7] — broker returns `ReasonString` / `UserProperties` on errors. Pass `false` to opt out. |
 | `WithConnectUserProperty(k, v)` / `WithConnectUserProperties(p)` | — | CONNECT user properties; append-style or bulk replace. |
 | `WithWill(*WillOptions)` | — | Will message + properties; validated by `New`. |
 
@@ -751,7 +751,7 @@ See [`examples/disconnect`](examples/disconnect).
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithKeepAlive(seconds)` | 30 | Requested keep-alive. 0 rejected — use `WithoutKeepAlive`. A Server Keep Alive in CONNACK replaces it (§3.2.2.3.14); `ServerInfo().KeepAlive` reports the one in effect. |
+| `WithKeepAlive(seconds)` | 30 | Requested keep-alive. 0 rejected — use `WithoutKeepAlive`. A Server Keep Alive in CONNACK replaces it ([§3.2.2.3.14]); `ServerInfo().KeepAlive` reports the one in effect. |
 | `WithoutKeepAlive()` | — | Request no keep-alive (no PINGREQ unless the broker sets a Server Keep Alive). Rarely correct in production. |
 | `WithConnectTimeout(d)` | 10 s | Dial + CONNECT/CONNACK budget. |
 | `WithPingTimeout(d)` | min(10 s, KeepAlive/2) | How long to wait for any packet after a PINGREQ before declaring the connection dead. Must be shorter than the keep-alive (`New` rejects it otherwise). |
@@ -1003,8 +1003,8 @@ also reported to `WithOnServerRedirect` and followed with
 ### Sessions
 
 **Session resume (Session Present = 1).** Unacknowledged QoS 1/2
-PUBLISHes are resent in their original send order with `DUP=1` (§4.4,
-§4.6); a QoS 2 message that already got its PUBREC resends PUBREL,
+PUBLISHes are resent in their original send order with `DUP=1` ([§4.4],
+[§4.6]); a QoS 2 message that already got its PUBREC resends PUBREL,
 never the PUBLISH; PUBRELs follow PUBREC order. Acks the application
 made while disconnected are sent on resume. The caller stays blocked on
 `Publish` across the drop.
@@ -1021,7 +1021,7 @@ session for a CleanStart=1 CONNECT is a protocol error (DISCONNECT
 loss.
 
 **Send quota.** At most the broker's Receive Maximum QoS 1/2 PUBLISHes
-are in flight (§4.9); further publishes wait in order.
+are in flight ([§4.9]); further publishes wait in order.
 
 **Packet identifiers.** Owned per flow (publish, subscribe,
 unsubscribe) and released only when that flow completes, so a stray ack
@@ -1037,7 +1037,7 @@ unknown or mismatched packet identifiers are ignored and counted in
 ### Delivery
 
 **Acknowledgement order.** A QoS 1 PUBACK is held until `m.Ack()` and
-flushed in §4.6 arrival order. A QoS 2 PUBREC is held until `m.Ack()`;
+flushed in [§4.6] arrival order. A QoS 2 PUBREC is held until `m.Ack()`;
 PUBCOMP goes out automatically when PUBREL arrives.
 
 **One message, several subscriptions.** A PUBLISH matching several
@@ -1068,7 +1068,7 @@ then fails with `*RejectedByDisconnectError`. A filter the broker never
 granted is not unsubscribed.
 
 **Shared filters.** A broker keeps one subscription per exact filter,
-and a SUBSCRIBE for a filter it already holds replaces it (§3.8.4).
+and a SUBSCRIBE for a filter it already holds replaces it ([§3.8.4]).
 Subscriptions of one client with the same filter therefore share the
 broker's: each receives every message for it; the options of the most
 recent `Subscribe` (QoS, No Local, Retain As Published, Retain
@@ -1122,7 +1122,7 @@ Inbound aliases need `WithInboundTopicAliasMaximum(n)`; an alias of 0
 or above `n` is a DISCONNECT `0x94`, an alias used before it was
 registered a `0x82`.
 
-**Re-authentication (§4.12).** Client-initiated with
+**Re-authentication ([§4.12]).** Client-initiated with
 `Reauthenticate(ctx)`: AUTH `0x19`, then `Begin`/`Continue`, until the
 broker's `0x00` Success. The client always replies `0x18` Continue;
 only the server concludes, and an inbound `0x00` is terminal. A
@@ -1583,3 +1583,19 @@ head-to-head comparison only — it is not redistributed.
 Apache 2.0 — see [LICENSE](LICENSE) for the full text and
 [NOTICE](NOTICE) for the attribution notice. Per-file headers carry
 `SPDX-License-Identifier: Apache-2.0`.
+
+<!-- MQTT v5.0 citations -->
+
+[§3.1.2.11.2]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901048 "3.1.2.11.2 Session Expiry Interval"
+[§3.1.2.11.4]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901050 "3.1.2.11.4 Maximum Packet Size"
+[§3.1.2.11.5]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901051 "3.1.2.11.5 Topic Alias Maximum"
+[§3.1.2.11.6]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901052 "3.1.2.11.6 Request Response Information"
+[§3.1.2.11.7]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901053 "3.1.2.11.7 Request Problem Information"
+[§3.2.2.3.14]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901094 "3.2.2.3.14 Server Keep Alive"
+[§3.8.4]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901170 "3.8.4 SUBSCRIBE Actions"
+[§4.4]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901238 "4.4 Message delivery retry"
+[§4.6]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901240 "4.6 Message ordering"
+[§4.9]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901251 "4.9 Flow Control"
+[§4.11]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901255 "4.11 Server redirection"
+[§4.12]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901256 "4.12 Enhanced authentication"
+[MQTT-3.14.2-2]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901211 "3.14.2.2.2 Session Expiry Interval"

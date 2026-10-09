@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -77,7 +78,8 @@ func testTable() (string, error) {
 }
 
 // firstSentence returns doc's first sentence on one line, dropping a
-// leading reference to the test itself ("TestX verifies …").
+// leading reference to the test itself ("TestX verifies …"), with its
+// citations of the MQTT v5.0 standard as reference links.
 func firstSentence(name, doc string) string {
 	s := strings.Join(strings.Fields(doc), " ")
 	if rest, ok := strings.CutPrefix(s, name+" "); ok && rest != "" {
@@ -86,5 +88,53 @@ func firstSentence(name, doc string) string {
 	if i := strings.Index(s, ". "); i >= 0 {
 		s = s[:i+1]
 	}
+	s = specSection.ReplaceAllString(s, "[$0]")
 	return strings.ReplaceAll(s, "|", `\|`)
+}
+
+// specSection matches a citation of a section of the MQTT v5.0
+// standard, such as §4.12.
+var specSection = regexp.MustCompile(`§\d+(\.\d+)*`)
+
+// Every citation of the standard in the README links to it: each §N is
+// written as the reference [§N], and each reference has a definition.
+func TestREADMELinksEveryCitation(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range unlinkedCitations(string(readme)) {
+		t.Error(msg)
+	}
+}
+
+// unlinkedCitations reports the §N citations in markdown, outside code,
+// that are not a reference link with a definition.
+func unlinkedCitations(markdown string) []string {
+	var problems []string
+	defined := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\[(§[\d.]+)\]: `).FindAllStringSubmatch(markdown, -1) {
+		defined[m[1]] = true
+	}
+	inFence := false
+	for n, line := range strings.Split(markdown, "\n") {
+		if strings.HasPrefix(line, "```") {
+			inFence = !inFence
+		}
+		if inFence || strings.HasPrefix(line, "[§") && strings.Contains(line, "]: ") {
+			continue
+		}
+		line = regexp.MustCompile("`[^`]*`").ReplaceAllString(line, "")
+		for _, loc := range specSection.FindAllStringIndex(line, -1) {
+			cite := line[loc[0]:loc[1]]
+			linked := loc[0] > 0 && line[loc[0]-1] == '[' && loc[1] < len(line) && line[loc[1]] == ']'
+			switch {
+			case !linked:
+				problems = append(problems, fmt.Sprintf("line %d: %s is not written as the link [%s]", n+1, cite, cite))
+			case !defined[cite]:
+				problems = append(problems, fmt.Sprintf("line %d: [%s] has no definition", n+1, cite))
+			}
+		}
+	}
+	return problems
 }

@@ -329,7 +329,7 @@ func containsWildcard(filter string) bool {
 // filter doesn't have the share prefix, in which case underlying is
 // the input verbatim.
 //
-// Per MQTT v5 §4.8.2.1, the share name must be non-empty, must not
+// Per MQTT v5 §4.8.2, the share name must be non-empty, must not
 // contain '/', '+', or '#', and the filter portion follows the same
 // rules as a regular topic filter.
 func parseShareFilter(filter string) (group, underlying string, isShared bool) {

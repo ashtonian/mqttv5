@@ -17,7 +17,7 @@ cli, err := mqttv5.New(
 |---|---|
 | Module | `github.com/ashtonian/mqttv5/transport/ws` |
 | Depends on | `github.com/ashtonian/mqttv5`, [`github.com/gobwas/ws`](https://github.com/gobwas/ws) v1.4.0 |
-| Spec | MQTT v5.0 §6 (WebSocket transport), RFC 6455 |
+| Spec | MQTT v5.0 [§6] (WebSocket transport), RFC 6455 |
 
 ## Overview
 
@@ -119,3 +119,8 @@ Connection-level health and counters come from the client
 | `ws.go` | `DialFunc`, `Dial`, `Conn` (framing, control frames) |
 | `ws_test.go` | dialing, round trips, TLS |
 | `control_test.go` | ping/pong, close, text frames, concurrent writes |
+
+<!-- MQTT v5.0 citations -->
+
+[§6]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901285 "6 Using WebSocket as a network transport"
+[MQTT-6.0.0-1]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901285 "6 Using WebSocket as a network transport"

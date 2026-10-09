@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,42 @@ func TestREADMEDocumentsEveryOption(t *testing.T) {
 				if !strings.Contains(string(readme), "`"+fn.Name.Name+"(") {
 					t.Errorf("README.md documents no %s", fn.Name.Name)
 				}
+			}
+		}
+	}
+}
+
+// Every citation of the MQTT v5.0 standard in the README links to it:
+// each §N is written as the reference [§N], and each reference has a
+// definition.
+func TestREADMELinksEveryCitation(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defined := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\[(§[\d.]+)\]: `).FindAllStringSubmatch(string(readme), -1) {
+		defined[m[1]] = true
+	}
+	section := regexp.MustCompile(`§\d+(\.\d+)*`)
+	code := regexp.MustCompile("`[^`]*`")
+	inFence := false
+	for n, line := range strings.Split(string(readme), "\n") {
+		if strings.HasPrefix(line, "```") {
+			inFence = !inFence
+		}
+		if inFence || strings.HasPrefix(line, "[§") && strings.Contains(line, "]: ") {
+			continue
+		}
+		line = code.ReplaceAllString(line, "")
+		for _, loc := range section.FindAllStringIndex(line, -1) {
+			cite := line[loc[0]:loc[1]]
+			linked := loc[0] > 0 && line[loc[0]-1] == '[' && loc[1] < len(line) && line[loc[1]] == ']'
+			switch {
+			case !linked:
+				t.Errorf("README.md:%d: %s is not written as the link [%s]", n+1, cite, cite)
+			case !defined[cite]:
+				t.Errorf("README.md:%d: [%s] has no definition", n+1, cite)
 			}
 		}
 	}

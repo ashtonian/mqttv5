@@ -150,7 +150,7 @@ func (r *rawSub) expectPublish(t *testing.T, wantTopic string, wantPayload []byt
 }
 
 // TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery verifies the
-// MQTT v5 §3.4.2.3 Subscription Identifier echo: when a SUBSCRIBE
+// MQTT v5 Subscription Identifier echo (§3.3.4): when a SUBSCRIBE
 // carries a Subscription Identifier (§3.8.2.1.2), every matching
 // PUBLISH the broker dispatches to that subscription is tagged with the
 // same identifier in PropSubscriptionIdentifier (§3.3.2.3.8).
@@ -166,7 +166,7 @@ func (r *rawSub) expectPublish(t *testing.T, wantTopic string, wantPayload []byt
 // disabled (a present 0), the test skips — the broker would SUBACK-
 // reject the identifier and there is nothing to echo. Otherwise sub-ids
 // are available and a MISSING echo is a hard failure (the broker MUST
-// mirror a requested identifier per §3.4.2.3), never a skip. mosquitto
+// mirror a requested identifier per §3.3.4), never a skip. mosquitto
 // 2.x and emqx both support subscription identifiers.
 func TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery(t *testing.T) {
 	requireBroker(t, brokerURL())
@@ -192,7 +192,7 @@ func TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery(t *testing.T) {
 	gotID, ok := m1.Properties.Varint(wire.PropSubscriptionIdentifier)
 	m1.Release()
 	if !ok {
-		t.Errorf("first delivery dropped the SubscriptionIdentifier; broker advertised sub-ids available so it MUST echo the requested id=%d (§3.4.2.3)", wantID)
+		t.Errorf("first delivery dropped the SubscriptionIdentifier; broker advertised sub-ids available so it MUST echo the requested id=%d (§3.3.4)", wantID)
 	} else if gotID != wantID {
 		t.Errorf("first delivery SubscriptionIdentifier = %d, want %d (broker must echo the requested id)", gotID, wantID)
 	}
