@@ -1182,7 +1182,7 @@ under and how to read them, are in
 Allocations to decode one PUBLISH from a stream (`props=five`: a
 content type and five user properties), then read its properties:
 
-<!-- benchtab file=benchmarks/results/2026-10-09-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=allocs/op -->
 
 | props | size | eclipse | mqttv5 |
 |---|---|---:|---:|
@@ -1195,7 +1195,7 @@ content type and five user properties), then read its properties:
 | five | 1KiB | 95 | 0 |
 | five | 16KiB | 103 | 0 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
 Allocations to encode one PUBLISH and write it, with each of mqttv5's
@@ -1206,7 +1206,7 @@ goroutine), and `mqttv5-owned` copies it into a buffer of its own that
 the session keeps for retransmission (every QoS 1/2 publish). See the
 [codec section](benchmarks/README.md#codec):
 
-<!-- benchtab file=benchmarks/results/2026-10-09-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=allocs/op -->
 
 | props | size | eclipse | mqttv5-header | mqttv5-pooled | mqttv5-owned |
 |---|---|---:|---:|---:|---:|
@@ -1219,7 +1219,7 @@ the session keeps for retransmission (every QoS 1/2 publish). See the
 | five | 1KiB | 12 | 0 | 0 | 1 |
 | five | 16KiB | 12 | 0 | 0 | 1 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
 ### Publishing
@@ -1231,7 +1231,7 @@ the payload); QoS 1 and 2 return when the broker has acknowledged. The
 packet a QoS 1/2 publish keeps for retransmission is one exact-size
 copy.
 
-<!-- benchtab file=benchmarks/results/2026-10-09-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=allocs/op -->
 
 | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---:|---:|---:|
@@ -1240,15 +1240,15 @@ copy.
 | 0 | 1MiB | 0 | 15 | 23 |
 | 1 | 64B | 5 | 53 | 42 |
 | 1 | 1KiB | 5 | 53 | 42 |
-| 1 | 1MiB | 7 | 55 | 43 |
-| 2 | 64B | 7 | 92 | 62 |
-| 2 | 1KiB | 7 | 92 | 62 |
-| 2 | 1MiB | 9.500 ±5% | 93 | 63 |
+| 1 | 1MiB | 7 | 55 ±2% | 43 |
+| 2 | 64B | 6 | 92 | 62 |
+| 2 | 1KiB | 6 | 92 | 62 |
+| 2 | 1MiB | 8 | 93 | 63 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
-<!-- benchtab file=benchmarks/results/2026-10-09-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=B/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=B/op -->
 
 | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---:|---:|---:|
@@ -1258,11 +1258,11 @@ copy.
 | 1 | 64B | 424B | 4.309KiB | 1.641KiB |
 | 1 | 1KiB | 1.447KiB | 5.309KiB | 2.642KiB |
 | 1 | 1MiB | 1.009MiB | 1.012MiB | 1.010MiB |
-| 2 | 64B | 464B | 7.191KiB | 2.146KiB |
-| 2 | 1KiB | 1.486KiB | 8.191KiB | 3.146KiB |
+| 2 | 64B | 440B | 7.191KiB | 2.145KiB |
+| 2 | 1KiB | 1.462KiB | 8.191KiB | 3.146KiB |
 | 2 | 1MiB | 1.009MiB | 1.015MiB | 1.010MiB |
 
-<sub>B/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>B/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
 ### Receiving
@@ -1275,45 +1275,45 @@ forwards into from its handler. A QoS 1 message is acknowledged when
 the callback returns, or, in `chan` and `queue` mode, when a consumer
 takes it.
 
-<!-- benchtab file=benchmarks/results/2026-10-09-e2e/e2e.txt filter=".name:E2E_Receive /consumers:1" rows=mode,qos,size cols=lib unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Receive /consumers:1" rows=mode,qos,size cols=lib unit=allocs/op -->
 
 | mode | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---|---:|---:|---:|
 | callback | 0 | 64B | 2 | 27 | 16 |
 | callback | 0 | 1KiB | 2 | 29 | 16 |
-| callback | 1 | 64B | 5 | 40 | 33 ±3% |
-| callback | 1 | 1KiB | 6 | 42 | 34 |
+| callback | 1 | 64B | 5 | 40 | 33 |
+| callback | 1 | 1KiB | 5 | 42 | 34 |
 | chan | 1 | 64B | 5 | 40 | — |
 | chan | 1 | 1KiB | 5 | 42 | — |
 | queue | 1 | 64B | 6 | — | — |
 | queue | 1 | 1KiB | 6 | — | — |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
 Publish-to-delivery round trip, both clients in one process:
 
-<!-- benchtab file=benchmarks/results/2026-10-09-e2e/e2e.txt filter=".name:E2E_RoundTrip" rows=qos,size cols=lib unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-e2e/e2e.txt filter=".name:E2E_RoundTrip" rows=qos,size cols=lib unit=allocs/op -->
 
 | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---:|---:|---:|
 | 0 | 64B | 5 | 45 | 42 |
 | 0 | 1KiB | 5 | 47 | 42 |
 | 0 | 1MiB | 13 | 66 | 42 |
-| 1 | 64B | 14 | 95 | 78 |
-| 1 | 1KiB | 14 | 97 | 78 |
-| 1 | 1MiB | 23 ±4% | 117 ±1% | 80 ±1% |
-| 2 | 64B | 18 | 173 | 120 ±1% |
-| 2 | 1KiB | 18 | 175 | 120 |
-| 2 | 1MiB | 28.50 ±2% | 194 | 121 |
+| 1 | 64B | 13 | 95 | 78 |
+| 1 | 1KiB | 13 | 97 | 78 |
+| 1 | 1MiB | 22 ±5% | 117 ±1% | 80 |
+| 2 | 64B | 15 | 173 | 120 |
+| 2 | 1KiB | 15 | 175 | 120 |
+| 2 | 1MiB | 25 ±4% | 194 | 121 ±1% |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
 mqttv5's receive path by delivery mode, measured in-process without a
 broker (`BenchmarkReceive`, 64-byte payloads):
 
-<!-- benchtab file=benchmarks/results/2026-10-09-receive/receive.txt filter=".name:Receive /size:64B" rows=qos,consumer cols=delivery unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-10-10-receive/receive.txt filter=".name:Receive /size:64B" rows=qos,consumer cols=delivery unit=allocs/op -->
 
 | qos | consumer | owned | zerocopy |
 |---|---|---:|---:|
@@ -1322,7 +1322,7 @@ broker (`BenchmarkReceive`, 64-byte payloads):
 | 1 | queue | 4 | 3 |
 | 0 | callback | 2 | 1 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at fee34aa305a5.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
 <!-- /benchtab -->
 
 `WithStats` is off in these runs; its counters are atomic adds behind a
