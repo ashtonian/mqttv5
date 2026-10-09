@@ -5,56 +5,47 @@
 [![CI](https://github.com/ashtonian/mqttv5/actions/workflows/ci.yml/badge.svg)](https://github.com/ashtonian/mqttv5/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-An MQTT v5 client for Go with a low cost per message and an ergonomic
-API.
+An MQTT v5 client for Go: a low cost per message, an API that reads
+like Go, and QoS 1/2 sessions that survive reconnects and, with a file
+store, process restarts.
 
-- Single package, stdlib-only core.
-- PUBLISH decode without allocation (frames up to 64 KiB, from warm pools).
-- Go-native subscribe surface: `<-chan *Message`, `Queue[*Message]`, or a callback.
-- The supervisor (reconnect + replay + resubscribe) is baked into every `Client`.
+- One package, standard library only. Persistence, WebSocket and codecs
+  are optional submodules.
+- Reconnect, session resumption and re-subscription are built into every
+  `Client`.
+- Messages arrive on a channel, a bounded queue or a callback, and are
+  acknowledged when you say so.
+- Decoding a PUBLISH of up to 64 KiB allocates nothing once pools are
+  warm.
 
 ```bash
 go get github.com/ashtonian/mqttv5
 ```
 
-| | |
-|---|---|
-| Module | `github.com/ashtonian/mqttv5` |
-| License | [Apache 2.0](LICENSE) (with [NOTICE](NOTICE)) |
-| Go | 1.26+ |
-| Benchmarks | [benchmarks/README.md](benchmarks/README.md) |
+Requires Go 1.26 or later. Licensed under [Apache 2.0](LICENSE).
 
 ## Contents
 
-- [Example](#example)
-- [Why this over paho.golang + autopaho](#why-this-over-eclipsepahogolang--autopaho)
-- [Runnable examples](#runnable-examples)
-- [Install / submodules](#install--submodules)
-- [Three multi-broker patterns](#three-multi-broker-patterns)
-- [Subscribe shapes](#subscribe-shapes)
-- [Typed publish / subscribe](#typed-publish--subscribe)
-- [Durable `QueuePublisher`](#durable-queuepublisher)
-- [WebSocket](#websocket)
-- [Options reference](#options-reference)
-- [Observability — `Client.Stats()`](#observability--clientstats)
-- [Graceful disconnect](#graceful-disconnect)
-- [Credential rotation and re-authentication](#credential-rotation-and-re-authentication)
-- [Sentinel errors](#sentinel-errors)
-- [Performance](#performance)
-- [Reliability semantics](#reliability-semantics)
-- [Architecture](#architecture)
-- [External dependencies](#external-dependencies)
-- [Operations](#operations)
-- [Security](#security)
-- [Code map](#code-map)
-- [Build / test / bench](#build--test--bench)
-- [Stability](#stability)
-- [Independence](#independence)
-- [License](#license)
+- **Start:** [Quick start](#quick-start) · [Modules](#modules) ·
+  [Examples](#examples) · [Why mqttv5](#why-mqttv5)
+- **Guide:** [Publishing](#publishing) · [Subscribing](#subscribing) ·
+  [Typed publish / subscribe](#typed-publish--subscribe) ·
+  [Durable publishing](#durable-publishing-with-queuepublisher) ·
+  [Multiple brokers](#multiple-brokers) · [WebSocket](#websocket) ·
+  [Authentication](#authentication) · [Disconnecting](#disconnecting)
+- **Reference:** [Options](#options) · [Errors](#errors) ·
+  [Reliability semantics](#reliability-semantics)
+- **Running it:** [Operations](#operations) · [Security](#security) ·
+  [Performance](#performance)
+- **Internals:** [Architecture](#architecture) · [Code map](#code-map) ·
+  [External dependencies](#external-dependencies) ·
+  [Build and test](#build-and-test)
+- **Project:** [Stability](#stability) · [Independence](#independence) ·
+  [License](#license)
 
 ---
 
-## Example
+## Quick start
 
 ```go
 package main
@@ -62,158 +53,56 @@ package main
 import (
     "context"
     "fmt"
+    "log"
 
     "github.com/ashtonian/mqttv5"
-    jsoncodec "github.com/ashtonian/mqttv5/codec/json"
 )
-
-type Event struct {
-    Device string  `json:"device"`
-    Temp   float64 `json:"temp"`
-}
 
 func main() {
     ctx := context.Background()
 
-    client, _ := mqttv5.New(mqttv5.WithBroker("mqtt://localhost:1883"))
-    _ = client.Connect(ctx)
-    defer client.Disconnect(ctx)
+    cli, err := mqttv5.New(
+        mqttv5.WithBroker("mqtt://localhost:1883"),
+        mqttv5.WithClientID("quickstart"),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := cli.Connect(ctx); err != nil {
+        log.Fatal(err)
+    }
+    defer cli.Disconnect(ctx)
 
-    // Generic typed pub/sub via Codec[T] (JSON ships in a sibling
-    // submodule). Supervisor handles reconnect + auto-resubscribe +
-    // QoS 1/2 replay underneath — you just write the consumer loop.
-    events := mqttv5.NewTyped(client, jsoncodec.Codec[Event]{})
+    // Reconnects, session resumption and re-subscription happen underneath.
+    msgs, _, err := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    msgs, _, _ := events.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}})
-    go func() {
-        for m := range msgs {
-            fmt.Printf("%s: %+v\n", m.Topic, m.Value) // m.Value already decoded
-            _ = m.Ack() // PUBACK held for QoS 1 until you ack
-        }
-    }()
+    err = cli.Publish(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1, Payload: []byte("22.5")})
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    _ = events.Publish(ctx, mqttv5.PublishOptions{Topic: "events/hello", QoS: 1}, Event{Device: "a1", Temp: 22.5})
+    m := <-msgs
+    fmt.Printf("%s: %s\n", m.Topic, m.Payload)
+    _ = m.Ack() // the broker gets its PUBACK once the message is acked
 }
 ```
 
-See [`examples/`](examples/) for full demos: TLS, multi-broker failover,
-publisher pool, durable queue, raw-bytes subscribe, WebSocket, OAuth
-rotation, and lifecycle observability.
-
----
-
-## Why this over [eclipse/paho.golang](https://github.com/eclipse/paho.golang) + [autopaho](https://github.com/eclipse/paho.golang/tree/master/autopaho)
-
-**Go-idiomatic top to bottom.**
-Channels (`<-chan *Message`) and queues for delivery, not just global
-`OnPublishReceived` callbacks. `context.Context` on every operation.
-Sentinel errors with `errors.Is`. Functional options instead of a
-40-field `ClientOptions` struct.
-
-**One client. Supervisor baked in.**
-No `paho` / `autopaho` split — reconnect, replay-in-flight, and
-auto-resubscribe are always on.
-
-**Allocation-free decode.**
-The `wire` decoder hands out views into a pooled frame and decodes
-properties only when they are read: once its pools are warm, decoding a
-PUBLISH of up to 64 KiB allocates nothing; a larger one gets a buffer
-of its own ([measurements](#performance)).
-
-**Messages you can keep.**
-A delivered `*Message` owns its topic, payload and properties, is safe
-to retain, and can be `Ack`ed twice. Up to 64 KiB that costs two
-allocations at QoS 0 (one exact-size copy, one handle); acknowledging
-QoS 1 and 2 adds a few more ([measurements](#receiving)). A larger
-message keeps the buffer it was read into, which is never recycled, so
-it is not copied at all. Hot paths opt into frame-aliasing delivery
-with `SubZeroCopy()`, which saves the copy.
-
-**Multi-broker, kept distinct and composable.**
-Three real patterns, each its own API:
-
-- Failover — `WithBrokers`
-- Fan-out across N independent brokers — `ClientGroup`
-- Publish-only pool against one broker — `WithPublisherPool`
-
-Compose them: `WithBrokers` inside a `GroupMember` for HA-per-region,
-then `WithPublisherPool` on top to publish over more than one
-connection.
-
-**Writes inline when idle, batched when busy.**
-On a TCP connection, a publish that waits for its write (QoS 1/2, or
-QoS 0 with `PublishWaitForFlush`) writes on its own goroutine when
-nothing is queued for the connection: no goroutine hand-off, and a
-QoS 0 payload goes out with its header in one `writev`, without being
-copied (QoS 1/2 writes the copy the session keeps for retransmission).
-ctx still bounds the call. When
-publishers overlap, they leave their packets to a per-connection writer
-goroutine, which writes the queued ones together (`WithWriteBatch(n)`
-coalesces them into one `writev`) instead of every publisher taking a
-turn on the socket. Fire-and-forget QoS 0 always goes through the
-writer, so `Publish` returns before the write. `WithPublisherPool(N)`
-runs N connections, each with its own writer goroutine and socket, so
-publishing is not limited to one connection's writer.
-
-**Backpressure as a first-class concept.**
-Per-subscription `DropNewest` / `DropOldest`, with the dropped message
-auto-ack'd so the broker stops retransmitting.
-
-**Generic typed payloads.**
-`Codec[T]` boundary; JSON and msgpack codecs ship in separate
-submodules so the core stays stdlib-only.
-
-**Durable outbound queue.**
-`QueuePublisher` + file-backed `queue/file/` — enqueue while
-disconnected, keep a window of messages in flight, and, with
-`store/file` as the session store, survive a process crash without
-publishing in-flight messages twice.
-
-**The MQTT v5 client feature set, tested against real brokers.**
-Shared subscriptions, Subscription Identifiers, topic aliases (in and
-out), session expiry and resumption, retained messages, the Will and
-its properties, server redirects, and enhanced authentication (CONNECT
-and mid-session, §4.12). The [conformance suite](conformance/) runs
-against mosquitto and EMQX on every change, and nightly also against
-HiveMQ CE, including a HiveMQ that announces tight CONNACK limits.
-
-CONNACK capability flags are honoured — `Subscribe*` errors before the
-wire when the broker has disabled the feature.
-
-**WebSocket as a sibling module.**
-`transport/ws` brings ws/wss via `WithDialFunc(ws.DialFunc(opts))`
-(see [`examples/ws`](examples/ws)). Zero impact on the core's
-stdlib-only promise.
-
----
-
-## Runnable examples
-
-In [`examples/`](examples/) — one go.mod. Run any of them with
-`MQTT_BROKER=mqtt://127.0.0.1:1883`:
-
-| Path | Shows |
-|---|---|
-| [`examples/basic`](examples/basic) | Connect, channel subscribe, publish |
-| [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
-| [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
-| [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
-| [`examples/ws`](examples/ws) | WebSocket transport — `WithDialFunc(ws.DialFunc(opts))` |
-| [`examples/stats`](examples/stats) | `Client.Stats()` snapshot — bridge into Prometheus / OTel / expvar |
-| [`examples/oauth`](examples/oauth) | `WithConnectPacketBuilder` rotating an OAuth bearer per CONNECT |
-| [`examples/disconnect`](examples/disconnect) | `DisconnectWith` carrying ReasonCode + ReasonString + SessionExpiry override |
+Run it against a local broker:
 
 ```bash
-docker run -d -p 1883:1883 eclipse-mosquitto
-go -C examples run ./basic
+docker run -d -p 1883:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf
+go -C examples run ./readme/quickstart
 ```
 
 ---
 
-## Install / submodules
+## Modules
 
-The core is stdlib-only. Opt-in submodules each have their own
-`go.mod`, so importing them doesn't add a runtime dep to the core.
+The core uses the standard library only. Each optional submodule has
+its own `go.mod`, so the core never pulls in its dependencies.
 
 | Submodule | Import | Purpose |
 |---|---|---|
@@ -237,9 +126,307 @@ they share, at the same version.
 
 ---
 
-## Three multi-broker patterns
+## Examples
 
-Three distinct shapes, each its own API:
+[`examples/`](examples/) is one module of runnable programs. Each reads
+the broker from `MQTT_BROKER` (default `mqtt://127.0.0.1:1883`):
+
+| Path | Shows |
+|---|---|
+| [`examples/basic`](examples/basic) | Connect, channel subscribe, publish |
+| [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
+| [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
+| [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
+| [`examples/ws`](examples/ws) | WebSocket transport — `WithDialFunc(ws.DialFunc(opts))` |
+| [`examples/stats`](examples/stats) | `Client.Stats()` snapshot — bridge into Prometheus / OTel / expvar |
+| [`examples/oauth`](examples/oauth) | `WithConnectPacketBuilder` rotating an OAuth bearer per CONNECT |
+| [`examples/disconnect`](examples/disconnect) | `DisconnectWith` carrying ReasonCode + ReasonString + SessionExpiry override |
+
+```bash
+docker run -d -p 1883:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf
+go -C examples run ./basic
+```
+
+---
+
+## Why mqttv5
+
+Compared with [eclipse/paho.golang](https://github.com/eclipse/paho.golang)
+and its [autopaho](https://github.com/eclipse/paho.golang/tree/master/autopaho)
+supervisor:
+
+- **One client, supervisor built in.** Reconnect, in-flight replay and
+  re-subscription are always on; there is no second package to wire up.
+- **A Go-shaped API.** Channels and queues for delivery as well as
+  callbacks, `context.Context` on every call, sentinel errors for
+  `errors.Is`, and functional options instead of a large options struct.
+- **A low cost per message.** Decoding a PUBLISH of up to 64 KiB
+  allocates nothing once pools are warm; a delivered message costs two
+  allocations at QoS 0 ([Performance](#performance)).
+- **Messages you can keep.** A delivered `*Message` owns its topic,
+  payload and properties, so it is safe to retain, and `Ack` may be
+  called more than once. `SubZeroCopy()` skips the copy on hot paths.
+- **Backpressure per subscription.** `DropNewest` or `DropOldest`, and a
+  dropped message is acknowledged so the broker stops resending it.
+- **Several brokers, three distinct patterns.** Failover
+  (`WithBrokers`), parallel sessions (`ClientGroup`) and a publish pool
+  (`WithPublisherPool`), each its own API, and they compose
+  ([Multiple brokers](#multiple-brokers)).
+- **Durable publishing.** `QueuePublisher` with `queue/file` and
+  `store/file` keeps publishing through outages and survives a process
+  crash without publishing an in-flight message twice.
+- **Typed payloads.** `Typed[T]` over a `Codec[T]`; JSON and msgpack
+  codecs ship as submodules, so the core stays standard library only.
+- **The MQTT v5 feature set, tested against real brokers.** Shared
+  subscriptions, Subscription Identifiers, topic aliases in both
+  directions, session expiry and resumption, retained messages, the Will
+  and its properties, server redirects, enhanced authentication (CONNECT
+  and mid-session, §4.12), and the broker's CONNACK limits enforced
+  before a packet is sent. The [conformance suite](conformance/) runs
+  against mosquitto and EMQX on every change, and nightly against HiveMQ
+  CE, including one that announces tight CONNACK limits.
+- **WebSocket without a core dependency.** `transport/ws` plugs in
+  through `WithDialFunc` ([WebSocket](#websocket)).
+
+---
+
+## Publishing
+
+```go
+err := cli.Publish(ctx, mqttv5.PublishOptions{
+    Topic:   "sensors/a1/temp",
+    QoS:     1,
+    Payload: []byte(`{"temp":22.5}`),
+})
+```
+
+When `Publish` returns depends on the QoS:
+
+| QoS | `Publish` returns |
+|---|---|
+| 0 | once the packet is queued for the connection's writer; with `WithPublishMode(PublishWaitForFlush)`, once it is written |
+| 1 | when the broker's PUBACK arrives |
+| 2 | when the broker's PUBCOMP arrives |
+
+`ctx` bounds the call. While the client is disconnected `Publish`
+returns `ErrNotConnected`; a [`QueuePublisher`](#durable-publishing-with-queuepublisher)
+queues through outages instead. A QoS 1/2 message accepted before a
+drop belongs to the session: it is resent when the session resumes, and
+the caller stays blocked until the broker acknowledges it. A refusal
+(reason code 0x80 or above) is returned as a `*ReasonCodeError`.
+
+### Write path
+
+- On a TCP or Unix connection with nothing queued, a publish that waits
+  for its write (QoS 1/2, or QoS 0 with `PublishWaitForFlush`) writes on
+  its own goroutine: no hand-off, and a QoS 0 header and payload go out
+  in one `writev` without the payload being copied.
+- When publishers overlap, their packets queue for the connection's
+  writer goroutine, which writes them together; `WithWriteBatch(n)`
+  coalesces them into one `writev`. Fire-and-forget QoS 0 always goes
+  through the writer.
+- If ctx ends during a write, the writer goroutine finishes the packet,
+  so it may still reach the broker after `Publish` returned ctx's error.
+- `WithPublisherPool(N)` spreads publishing over N connections.
+
+### Broker limits
+
+Every publish, subscribe and unsubscribe is checked against the CONNACK
+before anything is written:
+
+- QoS above Maximum QoS → `ErrQoSNotSupported`, or the QoS is lowered
+  with `WithQoSDowngrade()`;
+- retain with Retain Available = 0 → `ErrRetainNotSupported`;
+- a packet above Maximum Packet Size → `ErrPacketTooLarge`.
+
+At most Receive Maximum QoS 1/2 publishes are in flight; further ones
+wait, bounded by ctx (`Stats().SendQuota` shows the headroom). Stored
+messages that a reconnect to a stricter broker rules out complete with
+the same errors. `Client.ServerInfo()` returns everything the broker
+granted.
+
+---
+
+## Subscribing
+
+Three delivery shapes. Each takes `[]TopicFilter`, so several filters
+go out in one SUBSCRIBE.
+
+### Channel — manual ack, ordered flush
+
+```go
+msgs, token, err := cli.Subscribe(ctx,
+    []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},
+    mqttv5.SubBuffer(256),
+)
+for m := range msgs {
+    handle(m)
+    _ = m.Ack() // PUBACK released in §4.6 arrival order
+}
+_ = cli.Unsubscribe(ctx, token) // closes msgs
+```
+
+If the buffer fills, the incoming message is **auto-ack'd and dropped**
+so the broker stops retrying. Observe drops via `SubOnDrop(...)`.
+
+### Queue — bounded, optional `DropOldest`
+
+```go
+q, _, _ := cli.SubscribeQueue(ctx,
+    []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},
+    mqttv5.SubMaxQueueSize(10_000),
+    mqttv5.SubDropPolicy(mqttv5.DropOldest), // keeps freshest 10k
+)
+for {
+    m, ok := q.Dequeue(ctx)
+    if !ok {
+        break
+    }
+    handle(m)
+    _ = m.Ack()
+}
+```
+
+Queues hold at most `DefaultMaxSubscribeQueueSize` (65,536) messages
+unless `WithMaxSubscribeQueueSize` / `SubMaxQueueSize` say otherwise;
+`mqttv5.UnboundedQueue` removes the cap. When full, `DropNewest` (the
+default) acks and drops the incoming message; `DropOldest` evicts the
+queue head and acks it before enqueueing.
+
+Only the queue variant supports `DropOldest` — channels can't
+peek-and-pop without racing the consumer.
+
+### Callback — sync, auto-ack
+
+```go
+cli.SubscribeCallback(ctx,
+    []mqttv5.TopicFilter{{Topic: "ctrl/+", QoS: 0}},
+    func(m *mqttv5.Message) {
+        // Runs on the read goroutine — MUST be non-blocking.
+        process(m)
+        // Ack auto-fires after return.
+    },
+)
+```
+
+Pass `mqttv5.SubZeroCopy()` as a trailing option to skip the copy; the
+message's fields are then valid only until the callback returns. The
+handler must not call `Disconnect`, which waits for the read goroutine;
+start it on another goroutine.
+
+---
+
+## Typed publish / subscribe
+
+```go
+import jsoncodec "github.com/ashtonian/mqttv5/codec/json"
+
+type Reading struct {
+    Device string
+    Temp   float64
+}
+
+typed := mqttv5.NewTyped[Reading](cli, jsoncodec.Codec[Reading]{})
+
+_ = typed.Publish(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
+    Reading{Device: "a1", Temp: 22.5})
+
+ch, _, _ := typed.Subscribe(ctx,
+    []mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
+for m := range ch {
+    fmt.Println(m.Topic, m.Value.Temp)
+    _ = m.Ack()
+}
+```
+
+Implement `mqttv5.Codec[T]` for protobuf, Cap'n Proto, FlatBuffers, or
+custom binary — the core has no codec dependency.
+
+Payloads are decoded on the connection's read goroutine as they arrive
+and delivered with the buffer, bound and drop policy of
+`Client.Subscribe` / `SubscribeQueue`; a payload the codec rejects is
+logged, acked and dropped. The channel or queue closes when the
+subscription ends, whether or not anyone is still reading it.
+
+---
+
+## Durable publishing with `QueuePublisher`
+
+`QueuePublisher` decouples the caller from broker availability:
+
+- `Publish` returns as soon as the message is stored in the queue.
+- A drain goroutine keeps up to `WithQueueWindow` messages in flight
+  (default 32), in queue order, whenever the client is connected, and
+  removes each from the queue once the broker has accepted it. Throughput
+  approaches window ÷ round-trip time: 628 msg/s at 25 ms with a window
+  of 16, against 39 msg/s one at a time (`BenchmarkQueuePublisherRTT`).
+
+```go
+import (
+    qfile "github.com/ashtonian/mqttv5/queue/file"
+    sfile "github.com/ashtonian/mqttv5/store/file"
+)
+
+st, _ := sfile.Open("/var/lib/myapp/session")
+cli, _ := mqttv5.New(mqttv5.WithBroker(url), mqttv5.WithClientID("dev-1"), mqttv5.WithStore(st))
+q, _ := qfile.Open("/var/lib/myapp/outbound")
+pub, _ := mqttv5.NewQueuePublisher(cli, q,
+    mqttv5.WithQueueMaxSize(1_000_000),
+    mqttv5.WithQueueTTL(24*time.Hour),
+    mqttv5.WithDeadLetter(func(e mqttv5.QueueEntry, err error) {
+        log.Printf("dropped %s: %v", e.Publish.Topic, err)
+    }),
+)
+defer pub.Close(ctx)
+
+_ = pub.Publish(ctx, mqttv5.PublishOptions{Topic: "logs", Payload: data, QoS: 1})
+```
+
+**Failures.** A refusal that cannot pass — PUBACK/PUBREC 0x87 Not
+authorized, 0x90 Topic Name invalid, 0x95 Packet too large, 0x99 Payload
+format invalid, 0x9A Retain not supported, 0x9B QoS not supported, or the
+same verdict from the broker's CONNACK limits — goes to the dead-letter
+callback and the message is removed (`WithQueueClassifier` replaces the
+rule). Anything else, such as 0x97 Quota exceeded, is retried after
+`WithQueueRetryBackoff`, behind the messages that follow it, so one bad
+message never blocks the queue. An expired message is dead-lettered with
+`ErrMessageExpired` instead of sent; one that is sent carries the
+lifetime it has left as its Message Expiry Interval.
+
+**One exchange per message.** A slow broker never causes a second
+exchange for the same message. Each message's ID is stored with its
+exchange in the client's session (`WithStore`), and the message leaves
+the queue before the session forgets the exchange. With `queue/file` and
+`store/file`, a restarted process continues the exchanges its
+predecessor had in flight — QoS 1 resent with DUP=1, QoS 2 from where it
+stopped — rather than publishing those messages again. If removing a
+finished message from the queue fails, the session keeps the exchange's
+record and the removal is retried with `WithQueueRetryBackoff` (or by
+the next process) without publishing the message again. A message is
+published again as new only if the broker lost the session; enable
+`WithQueueIdempotencyKey` to add the message ID as the `mqttv5-msg-id`
+user property so consumers can drop that copy.
+
+**Bounds.** `WithQueueMaxSize` is enforced atomically by the queue, so
+concurrent producers cannot exceed it. At the bound `DropNewest`
+(default) returns `ErrQueueFull`; `DropOldest` evicts the oldest
+messages not yet being published and dead-letters them with
+`ErrQueueFull`. Constructing a `QueuePublisher` never removes anything.
+
+QoS 0 is rejected (`ErrQoS0NotQueueable`), as is a message that could
+never be sent (invalid topic, Topic Alias): the error comes from
+`Publish`, not a dead letter later. The publisher copies the message, so
+the caller may reuse its buffers.
+
+Use `mqttv5.NewMemoryPublisherQueue()` for in-process buffering without
+crash safety. A custom `PublisherQueue` can be checked against the
+contract with `github.com/ashtonian/mqttv5/queuetest`.
+
+---
+
+## Multiple brokers
+
+Three patterns, each its own API:
 
 | Goal | API | Connections |
 |---|---|---|
@@ -384,180 +571,6 @@ Use `g.Members()` or `g.Member(name)` for direct per-member access
 
 ---
 
-## Subscribe shapes
-
-All take `[]TopicFilter`, so multi-filter SUBSCRIBE is a single packet.
-
-### Channel — manual ack, ordered flush
-
-```go
-msgs, token, err := cli.Subscribe(ctx,
-    []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},
-    mqttv5.SubBuffer(256),
-)
-for m := range msgs {
-    handle(m)
-    _ = m.Ack() // PUBACK released in §4.6 arrival order
-}
-_ = cli.Unsubscribe(ctx, token) // closes msgs
-```
-
-If the buffer fills, the incoming message is **auto-ack'd and dropped**
-so the broker stops retrying. Observe drops via `SubOnDrop(...)`.
-
-### Queue — bounded, optional `DropOldest`
-
-```go
-q, _, _ := cli.SubscribeQueue(ctx,
-    []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},
-    mqttv5.SubMaxQueueSize(10_000),
-    mqttv5.SubDropPolicy(mqttv5.DropOldest), // keeps freshest 10k
-)
-for {
-    m, ok := q.Dequeue(ctx)
-    if !ok {
-        break
-    }
-    handle(m)
-    _ = m.Ack()
-}
-```
-
-Queues hold at most `DefaultMaxSubscribeQueueSize` (65,536) messages
-unless `WithMaxSubscribeQueueSize` / `SubMaxQueueSize` say otherwise;
-`mqttv5.UnboundedQueue` removes the cap. When full, `DropNewest` (the
-default) acks and drops the incoming message; `DropOldest` evicts the
-queue head and acks it before enqueueing.
-
-Only the queue variant supports `DropOldest` — channels can't
-peek-and-pop without racing the consumer.
-
-### Callback — sync, auto-ack
-
-```go
-cli.SubscribeCallback(ctx,
-    []mqttv5.TopicFilter{{Topic: "ctrl/+", QoS: 0}},
-    func(m *mqttv5.Message) {
-        // Runs on the read goroutine — MUST be non-blocking.
-        process(m)
-        // Ack auto-fires after return.
-    },
-)
-```
-
-Pass `mqttv5.SubZeroCopy()` as a trailing option to skip the copy; the
-message's fields are then valid only until the callback returns.
-
----
-
-## Typed publish / subscribe
-
-```go
-import jsoncodec "github.com/ashtonian/mqttv5/codec/json"
-
-type Reading struct {
-    Device string
-    Temp   float64
-}
-
-typed := mqttv5.NewTyped[Reading](cli, jsoncodec.Codec[Reading]{})
-
-_ = typed.Publish(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
-    Reading{Device: "a1", Temp: 22.5})
-
-ch, _, _ := typed.Subscribe(ctx,
-    []mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
-for m := range ch {
-    fmt.Println(m.Topic, m.Value.Temp)
-    _ = m.Ack()
-}
-```
-
-Implement `mqttv5.Codec[T]` for protobuf, Cap'n Proto, FlatBuffers, or
-custom binary — the core has no codec dependency.
-
-Payloads are decoded on the connection's read goroutine as they arrive
-and delivered with the buffer, bound and drop policy of
-`Client.Subscribe` / `SubscribeQueue`; a payload the codec rejects is
-logged, acked and dropped. The channel or queue closes when the
-subscription ends, whether or not anyone is still reading it.
-
----
-
-## Durable `QueuePublisher`
-
-`QueuePublisher` decouples the caller from broker availability:
-
-- `Publish` returns as soon as the message is stored in the queue.
-- A drain goroutine keeps up to `WithQueueWindow` messages in flight
-  (default 32), in queue order, whenever the client is connected, and
-  removes each from the queue once the broker has accepted it. Throughput
-  approaches window ÷ round-trip time: 628 msg/s at 25 ms with a window
-  of 16, against 39 msg/s one at a time (`BenchmarkQueuePublisherRTT`).
-
-```go
-import (
-    qfile "github.com/ashtonian/mqttv5/queue/file"
-    sfile "github.com/ashtonian/mqttv5/store/file"
-)
-
-st, _ := sfile.Open("/var/lib/myapp/session")
-cli, _ := mqttv5.New(mqttv5.WithBroker(url), mqttv5.WithClientID("dev-1"), mqttv5.WithStore(st))
-q, _ := qfile.Open("/var/lib/myapp/outbound")
-pub, _ := mqttv5.NewQueuePublisher(cli, q,
-    mqttv5.WithQueueMaxSize(1_000_000),
-    mqttv5.WithQueueTTL(24*time.Hour),
-    mqttv5.WithDeadLetter(func(e mqttv5.QueueEntry, err error) {
-        log.Printf("dropped %s: %v", e.Publish.Topic, err)
-    }),
-)
-defer pub.Close(ctx)
-
-_ = pub.Publish(ctx, mqttv5.PublishOptions{Topic: "logs", Payload: data, QoS: 1})
-```
-
-**Failures.** A refusal that cannot pass — PUBACK/PUBREC 0x87 Not
-authorized, 0x90 Topic Name invalid, 0x95 Packet too large, 0x99 Payload
-format invalid, 0x9A Retain not supported, 0x9B QoS not supported, or the
-same verdict from the broker's CONNACK limits — goes to the dead-letter
-callback and the message is removed (`WithQueueClassifier` replaces the
-rule). Anything else, such as 0x97 Quota exceeded, is retried after
-`WithQueueRetryBackoff`, behind the messages that follow it, so one bad
-message never blocks the queue. An expired message is dead-lettered with
-`ErrMessageExpired` instead of sent; one that is sent carries the
-lifetime it has left as its Message Expiry Interval.
-
-**One exchange per message.** A slow broker never causes a second
-exchange for the same message. Each message's ID is stored with its
-exchange in the client's session (`WithStore`), and the message leaves
-the queue before the session forgets the exchange. With `queue/file` and
-`store/file`, a restarted process continues the exchanges its
-predecessor had in flight — QoS 1 resent with DUP=1, QoS 2 from where it
-stopped — rather than publishing those messages again. If removing a
-finished message from the queue fails, the session keeps the exchange's
-record and the removal is retried with `WithQueueRetryBackoff` (or by
-the next process) without publishing the message again. A message is
-published again as new only if the broker lost the session; enable
-`WithQueueIdempotencyKey` to add the message ID as the `mqttv5-msg-id`
-user property so consumers can drop that copy.
-
-**Bounds.** `WithQueueMaxSize` is enforced atomically by the queue, so
-concurrent producers cannot exceed it. At the bound `DropNewest`
-(default) returns `ErrQueueFull`; `DropOldest` evicts the oldest
-messages not yet being published and dead-letters them with
-`ErrQueueFull`. Constructing a `QueuePublisher` never removes anything.
-
-QoS 0 is rejected (`ErrQoS0NotQueueable`), as is a message that could
-never be sent (invalid topic, Topic Alias): the error comes from
-`Publish`, not a dead letter later. The publisher copies the message, so
-the caller may reuse its buffers.
-
-Use `mqttv5.NewMemoryPublisherQueue()` for in-process buffering without
-crash safety. A custom `PublisherQueue` can be checked against the
-contract with `github.com/ashtonian/mqttv5/queuetest`.
-
----
-
 ## WebSocket
 
 ```go
@@ -579,9 +592,116 @@ them otherwise.
 
 ---
 
-## Options reference
+## Authentication
 
-### Client construction
+`WithCredentials(user, pass)` sends a fixed username and password.
+For credentials that change, rotate them per connection attempt or
+re-authenticate the live connection; `WithAuthenticator` adds MQTT v5
+enhanced authentication (challenge/response such as SCRAM).
+
+### Credentials per connection attempt
+
+`WithConnectPacketBuilder(fn)` runs immediately before each CONNECT is
+serialised. Use it to refresh an OAuth token, fetch a SigV4-signed
+CONNECT credential, or rotate any other per-attempt secret. The context
+is bounded by `ConnectTimeout`.
+
+```go
+mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOptions) error {
+    tok, err := oauth.FetchToken(ctx)
+    if err != nil {
+        return err // fails this attempt; supervisor retries after backoff
+    }
+    opts.Username = "service-account"
+    opts.Password = []byte(tok)
+    return nil
+}),
+```
+
+`WithOnConnectError` reports each failed attempt with its error. See
+[`examples/oauth`](examples/oauth).
+
+### Re-authentication without reconnecting
+
+`Client.Reauthenticate(ctx)` drives MQTT v5 re-authentication (§4.12) on
+the *live* connection — no reconnect, no QoS-state churn:
+
+1. Sends an AUTH `0x19` carrying a fresh `Authenticator.Begin(ctx)` payload.
+2. Services any broker challenges via `Continue`.
+3. Returns when the broker concludes with `0x00` Success.
+
+Use it on a long-lived connection whose bearer token (OAuth, JWT)
+expires: start a timer from the token's lifetime and call
+`Reauthenticate` ahead of expiry.
+
+```go
+// e.g. 30s before the JWT `exp`:
+if err := cli.Reauthenticate(ctx); err != nil {
+    // ErrReauthRejected → broker refused the new credential;
+    // the supervisor is already reconnecting with a fresh CONNECT.
+}
+```
+
+Behaviour:
+
+- `ctx` bounds the whole operation, including the token fetch in `Begin`.
+- Calls are single-flighted per connection.
+- A broker rejection returns `ErrReauthRejected` and tears the
+  connection down, so the supervisor reconnects through the normal
+  CONNECT path.
+- `WithOnReauthenticated` observes every successful refresh in one
+  place.
+
+### Mutual authentication
+
+For mechanisms with mutual authentication (e.g. SCRAM), an
+`Authenticator` may also implement the optional `ServerFinalVerifier`
+interface (`VerifyServerFinal([]byte) error`).
+
+The client hands it the server's concluding `AuthenticationData` — the
+CONNACK on connect, the AUTH `0x00` on re-auth — so it can verify the
+server proved knowledge of the credential.
+
+A verification failure aborts the connect, or fails `Reauthenticate`
+and tears the connection down.
+
+---
+
+## Disconnecting
+
+`Disconnect(ctx)` ends the client gracefully:
+
+1. it sends DISCONNECT (Normal disconnection) after any acknowledgements
+   already made;
+2. it waits for the connection's goroutines (the read loop runs
+   `SubscribeCallback` handlers) and closes every subscription's channel
+   or queue;
+3. it waits, bounded by ctx, for session store writes.
+
+Unfinished QoS 1/2 exchanges stay in the session for the next `Connect`.
+`Disconnect` is idempotent and does not fire `OnConnectionDown`: the
+call itself is the "going down" signal. A lifecycle callback may call
+it; a `SubscribeCallback` handler must not (see
+[Lifecycle callbacks](#lifecycle-callbacks)).
+
+`DisconnectWith(ctx, opts)` sets the reason code and properties:
+
+```go
+expiry := uint32(0)
+_ = cli.DisconnectWith(ctx, mqttv5.DisconnectOptions{
+    ReasonCode:            mqttv5.ReasonAdministrativeAction,
+    ReasonString:          "planned shutdown",
+    SessionExpiryInterval: &expiry, // override to drop the session immediately
+})
+```
+
+See [`examples/disconnect`](examples/disconnect).
+
+---
+
+## Options
+
+### Client
 
 #### Broker and transport
 
@@ -652,7 +772,7 @@ them otherwise.
 |---|---|---|
 | `WithReconnectBackoff(b)` | `ExponentialBackoff(1s, 30s, 200ms)` | Delay before reconnect attempt n. `ConstantBackoff(d)` also shipped. The attempt count carries over connections that drop sooner than the delay before them. |
 | `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure. |
-| `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see Redirecting at runtime). |
+| `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Redirecting at runtime](#redirecting-at-runtime)). |
 
 #### Write path and publishing
 
@@ -667,15 +787,8 @@ them otherwise.
 | `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"` | Customise per-member ClientIDs. Required when the parent ClientID is empty (broker-assigned). |
 | `WithQoSDowngrade()` | off | Send a publish whose QoS exceeds the broker's Maximum QoS at that maximum instead of failing it with `ErrQoSNotSupported`. Weakens the guarantee (QoS 2 becomes at-least-once). |
 
-> **Broker limits.** Every publish, subscribe and unsubscribe is checked
-> against the CONNACK before it is written: QoS above Maximum QoS →
-> `ErrQoSNotSupported` (or downgraded), retain with Retain Available = 0
-> → `ErrRetainNotSupported`, a packet above Maximum Packet Size →
-> `ErrPacketTooLarge`. At most Receive Maximum QoS 1/2 publishes are in
-> flight; further ones wait (bounded by ctx; `Stats().SendQuota` shows
-> the headroom). Stored messages that a reconnect to a stricter broker
-> rules out complete with the same errors. `Client.ServerInfo()`
-> returns everything the broker granted.
+> **Broker limits.** Checked before a packet is written; see
+> [Broker limits](#broker-limits).
 
 > **Write overflow policy.**
 >
@@ -694,20 +807,23 @@ them otherwise.
 
 #### Lifecycle callbacks
 
-These callbacks run one at a time, in the order of the events they
-report, on a goroutine of the client's own, so they may call
-`Disconnect`, `Connect` and `SetBrokers`. Before each reconnect
-attempt the client waits for the callbacks so far: a `SetBrokers` call
-from one applies to that attempt, and a slow callback delays it.
-`OnConnectionUp` may run after `Connect` returns, and a callback for an
-event before `Disconnect` may run after `Disconnect` returns.
+These callbacks run one at a time, in event order, on a goroutine the
+client owns:
 
-Message handlers are different. `SubscribeCallback` handlers and
+- They may call `Disconnect`, `Connect` and `SetBrokers`.
+- Before each reconnect attempt the client waits for the callbacks so
+  far, so a `SetBrokers` call from one applies to that attempt, and a
+  slow callback delays it.
+- They run after their event, not inside the call that caused it:
+  `OnConnectionUp` may run after `Connect` returns, and a callback for an
+  event before `Disconnect` may run after `Disconnect` returns.
+
+Message handlers are different: `SubscribeCallback` handlers and
 `SubOnDrop` hooks run on the connection's read loop, which `Disconnect`
-waits for: calling `Disconnect` from one would wait for itself, so start
-it on another goroutine (`go cli.Disconnect(ctx)`). A teardown held up
-by a handler logs `disconnect is waiting for a SubscribeCallback
-handler` after five seconds.
+waits for. Calling `Disconnect` from one would wait for itself; start it
+on another goroutine (`go cli.Disconnect(ctx)`). A teardown held up by a
+handler logs `disconnect is waiting for a SubscribeCallback handler`
+after five seconds.
 
 | Option | Signature / when | Effect |
 |---|---|---|
@@ -738,7 +854,7 @@ handler` after five seconds.
 | `SubBuffer(n)` | Channel buffer size (Subscribe only). Default `DefaultSubscribeBuffer` (64). |
 | `SubMaxQueueSize(n)` | Queue cap (SubscribeQueue only). 0 keeps the client default; `UnboundedQueue` removes the cap. |
 | `SubDropPolicy(p)` | `DropNewest` / `DropOldest`. SubscribeQueue honours both; chan-based `Subscribe` returns `ErrChanDropOldestUnsupported` when DropOldest is set explicitly. |
-| `SubOnDrop(fn)` | Hook run on the read goroutine before a dropped message is acked; every field is readable. Must not block. |
+| `SubOnDrop(fn)` | Hook run on the read goroutine before a dropped message is acked; every field is readable. Must not block or call `Disconnect`. |
 | `SubAutoAck()` | Opt-in: the dispatcher acks each delivery before handing it to the consumer. See note below. Ignored by `SubscribeCallback`. |
 | `SubZeroCopy()` | Deliver messages whose Topic / Payload / Properties alias the network frame (valid until every receiving subscription has acked; for callbacks, until return). Saves the copy: one allocation per message at QoS 0. Also accepted by `SubscribeCallback`. |
 
@@ -767,145 +883,23 @@ handler` after five seconds.
 | Option | Type | Default | Effect |
 |---|---|---|---|
 | `WithGroupSharedOpts(opts...)` | `...Option` | none | Client options applied to every member before its `GroupMember.Opts`. |
-| `WithGroupPublishPolicy(p)` | `GroupPublishPolicy` | `GroupPublishBroadcast` | Broadcast, RoundRobin or HashByTopic (see ClientGroup policies). |
+| `WithGroupPublishPolicy(p)` | `GroupPublishPolicy` | `GroupPublishBroadcast` | Broadcast, RoundRobin or HashByTopic (see [`ClientGroup` policies](#clientgroup-policies)). |
 | `WithGroupSuccess(s)` | `GroupSuccess` | `GroupSuccessAll` | How many members must succeed for a broadcast Publish or a Subscribe; `GroupSuccessAny`, `GroupSuccessQuorum(n)`. |
 | `WithGroupSequentialLifecycle()` | — | parallel | Connect, Disconnect and Subscribe members one after another. |
 
 ---
 
-## Observability — `Client.Stats()`
+## Errors
 
-`Client.Stats()` returns a snapshot of in-memory counters. Opt in via
-`WithStats()` — when off, the hot path skips every atomic increment and
-`Stats()` returns the zero value.
-
-```go
-cli, _ := mqttv5.New(
-    mqttv5.WithBroker(broker),
-    mqttv5.WithStats(),
-)
-// ...
-s := cli.Stats()
-fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
-    s.PublishesSent, s.PublishesAcked, s.PublishesInflight,
-    s.Connects, s.ConnectFailures)
-```
-
-Counters cover connect/disconnect/publish/subscribe lifecycle, inbound
-drops, pool fallbacks, ping timeouts, ignored acks, session store
-errors and broker protocol violations.
-
-Bridge each field into your own metrics surface (Prometheus /
-OpenTelemetry / expvar) — the lib intentionally has no metrics-library
-dependency. Full field list in the
-[`Stats`](https://pkg.go.dev/github.com/ashtonian/mqttv5#Stats) godoc.
-See [`examples/stats`](examples/stats).
-
----
-
-## Graceful disconnect
-
-`Disconnect(ctx)` sends `ReasonNormalDisconnection` with no properties.
-Use `DisconnectWith(ctx, opts)` to override:
-
-```go
-expiry := uint32(0)
-_ = cli.DisconnectWith(ctx, mqttv5.DisconnectOptions{
-    ReasonCode:            mqttv5.ReasonAdministrativeAction,
-    ReasonString:          "planned shutdown",
-    SessionExpiryInterval: &expiry, // override to drop the session immediately
-})
-```
-
-The `OnConnectionDown` callback is *not* invoked on a user-initiated
-disconnect — the call site itself is the "going down" signal.
-
-See [`examples/disconnect`](examples/disconnect).
-
----
-
-## Credential rotation and re-authentication
-
-### Per-attempt credential rotation
-
-`WithConnectPacketBuilder(fn)` runs immediately before each CONNECT is
-serialised. Use it to refresh an OAuth token, fetch a SigV4-signed
-CONNECT credential, or rotate any other per-attempt secret. The context
-is bounded by `ConnectTimeout`.
-
-```go
-mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOptions) error {
-    tok, err := oauth.FetchToken(ctx)
-    if err != nil {
-        return err // fails this attempt; supervisor retries after backoff
-    }
-    opts.Username = "service-account"
-    opts.Password = []byte(tok)
-    return nil
-}),
-```
-
-Pair with `WithOnConnectError` for observability — every refusal /
-network failure fires the callback with the per-attempt error. See
-[`examples/oauth`](examples/oauth).
-
-### Refresh without reconnecting
-
-`Client.Reauthenticate(ctx)` drives MQTT v5 re-authentication (§4.12) on
-the *live* connection — no reconnect, no QoS-state churn:
-
-1. Sends an AUTH `0x19` carrying a fresh `Authenticator.Begin(ctx)` payload.
-2. Services any broker challenges via `Continue`.
-3. Returns when the broker concludes with `0x00` Success.
-
-It's ideal for a long-lived connection whose bearer (OAuth/JWT) outlives
-the session: start a timer from the token lifetime and call
-`Reauthenticate` ahead of expiry.
-
-```go
-// e.g. 30s before the JWT `exp`:
-if err := cli.Reauthenticate(ctx); err != nil {
-    // ErrReauthRejected → broker refused the new credential;
-    // the supervisor is already reconnecting with a fresh CONNECT.
-}
-```
-
-Behaviour:
-
-- `ctx` bounds the whole operation, including the token fetch in `Begin`.
-- Calls are single-flighted per connection.
-- A broker rejection returns `ErrReauthRejected` and tears the
-  connection down, so the supervisor reconnects through the normal
-  CONNECT path.
-- Pair with `WithOnReauthenticated` to observe successful refreshes
-  centrally — it also fires for a broker-driven re-auth, which has no
-  return value to inspect.
-
-### Mutual authentication
-
-For mechanisms with mutual authentication (e.g. SCRAM), an
-`Authenticator` may also implement the optional `ServerFinalVerifier`
-interface (`VerifyServerFinal([]byte) error`).
-
-The client hands it the server's concluding `AuthenticationData` — the
-CONNACK on connect, the AUTH `0x00` on re-auth — so it can verify the
-server proved knowledge of the credential.
-
-A verification failure aborts the connect, or fails `Reauthenticate`
-and tears the connection down.
-
----
-
-## Sentinel errors
-
-Branch with `errors.Is(err, ...)`; stable across versions.
+Branch on sentinel errors with `errors.Is`. Typed errors
+(`*ReasonCodeError`, `*SubscribeError`, …) carry the details; reach
+them with `errors.As`.
 
 ### Connection lifecycle
 
 | Error | Source | Meaning |
 |---|---|---|
 | `ErrNotConnected` | `Publish`, `Subscribe*` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect. |
-| `*GroupError` | `ClientGroup.Publish`, `ClientGroup.Subscribe` | Fewer members succeeded than `WithGroupSuccess` requires; `Results` has each member's outcome and `errors.Is` sees their errors. |
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
 | `ErrClosed` | any after `Disconnect` | Client torn down. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason; the error is a `*ReasonCodeError` carrying the code, reason string and server reference. |
@@ -963,10 +957,304 @@ Branch with `errors.Is(err, ...)`; stable across versions.
 | `ErrMessageExpired` | dead letters | The message's TTL or Message Expiry ran out before it was sent. |
 | `*ReasonCodeError` | dead letters | The broker refused the message with a code `WithQueueClassifier` calls permanent. |
 
+### `ClientGroup`
+
+| Error | Source | Meaning |
+|---|---|---|
+| `*GroupError` | `ClientGroup.Publish`, `ClientGroup.Subscribe` | Fewer members succeeded than `WithGroupSuccess` requires; `Results` has each member's outcome and `errors.Is` sees their errors. |
+
 ### Transport
 
 | Error | Source | Meaning |
 |---|---|---|
+| `transport.ErrUnknownScheme` | `transport.Dial` | The URL's scheme is not one the built-in dialer knows. `New` rejects such a broker URL up front with `ErrInvalidBrokerURL`. |
+| `transport.ErrMissingHost` | `transport.Dial` | The URL has no host. |
+
+---
+
+## Reliability semantics
+
+### Connection
+
+**Connect.** Blocks until the CONNACK, or until ctx ends. Without
+`WithRetryInitialConnect()` it returns the first failure. With it,
+`Connect` returns nil, the supervisor retries with the reconnect
+backoff, and `Client.AwaitConnection(ctx)` waits for the connection;
+until then `Publish` and `Subscribe` return `ErrNotConnected` and a
+`QueuePublisher` keeps queuing.
+
+**Reconnect.** `ExponentialBackoff(1s, 30s, 200ms)` by default. With
+`WithBrokers`, URLs rotate per attempt and a successful connect sticks.
+The backoff starts over only after a connection outlives the delay that
+preceded it, so a broker that accepts the CONNECT and drops the
+connection at once is retried at a growing interval, not in a tight
+loop.
+
+**Keep-alive.** After a PINGREQ, any packet from the broker counts as
+the answer. With none within `PingTimeout` the connection is treated as
+dead and the supervisor redials.
+
+**Server-initiated DISCONNECT.** `WithOnServerDisconnect(fn)` receives
+a `DisconnectInfo` (reason, reason string, server reference, user
+properties) before `OnConnectionDown`. Redirects (`0x9C`/`0x9D`) are
+also reported to `WithOnServerRedirect` and followed with
+`WithFollowServerRedirects`.
+
+### Sessions
+
+**Session resume (Session Present = 1).** Unacknowledged QoS 1/2
+PUBLISHes are resent in their original send order with `DUP=1` (§4.4,
+§4.6); a QoS 2 message that already got its PUBREC resends PUBREL,
+never the PUBLISH; PUBRELs follow PUBREC order. Acks the application
+made while disconnected are sent on resume. The caller stays blocked on
+`Publish` across the drop.
+
+**Session loss (Session Present = 0, or CleanStart = 1).** Inbound
+state is discarded, so the new session's messages are never mistaken
+for duplicates, and an `Ack` on a message from the old session is a
+no-op. Unacknowledged outbound QoS 1/2 messages follow
+`WithSessionLossPolicy`: republished as new messages (the default; a
+duplicate is possible, and QoS 2 cannot stay exactly-once across the
+loss) or failed with `ErrSessionLost`. A broker that reports a present
+session for a CleanStart=1 CONNECT is a protocol error (DISCONNECT
+`0x82`). With `WithBrokers`, failover to another broker is a session
+loss.
+
+**Send quota.** At most the broker's Receive Maximum QoS 1/2 PUBLISHes
+are in flight (§4.9); further publishes wait in order.
+
+**Packet identifiers.** Owned per flow (publish, subscribe,
+unsubscribe) and released only when that flow completes, so a stray ack
+cannot free an identifier another flow is using.
+
+**Duplicates from the broker.** A resent PUBLISH (DUP) for a message
+the application still holds is neither delivered again nor acknowledged
+on the application's behalf; a QoS 2 duplicate after PUBREC gets PUBREC
+again; PUBREL for an unknown identifier gets PUBCOMP `0x92`. Acks for
+unknown or mismatched packet identifiers are ignored and counted in
+`Stats().AcksIgnored`.
+
+### Delivery
+
+**Acknowledgement order.** A QoS 1 PUBACK is held until `m.Ack()` and
+flushed in §4.6 arrival order. A QoS 2 PUBREC is held until `m.Ack()`;
+PUBCOMP goes out automatically when PUBREL arrives.
+
+**One message, several subscriptions.** A PUBLISH matching several
+subscriptions gives each its own `*Message` handle over the same bytes.
+The broker's ack (PUBACK or PUBREC) goes out once every handle has been
+acked. `m.Ack()` is idempotent per handle: a second call is a no-op and
+never affects another message or handler.
+
+**Topic and payload lifetime.** Owned by the message and valid for as
+long as you hold it. With `SubZeroCopy()` they alias the network frame
+and are valid only until every receiving subscription has acked
+(callbacks: until return); use `m.CloneTopic()` / `m.ClonePayload()` to
+keep them longer.
+
+### Subscriptions
+
+**Across a drop.** A SUBSCRIBE or UNSUBSCRIBE still waiting for its
+answer when the connection drops is sent again on the next one, in the
+order the calls were made; `Subscribe` and `Unsubscribe` keep waiting
+until the answer arrives or ctx ends. When the broker has no session,
+pending UNSUBSCRIBEs complete without being sent and every subscription
+is subscribed again, oldest first. Filters the broker refuses then end
+the subscription's share of them: `WithOnResubscribeError` is called,
+and a subscription left with no filters closes with `token.Err()` set.
+A SUBSCRIBE or UNSUBSCRIBE the broker answers by disconnecting
+(DISCONNECT blaming a packet it received) is sent at most three times,
+then fails with `*RejectedByDisconnectError`. A filter the broker never
+granted is not unsubscribed.
+
+**Shared filters.** A broker keeps one subscription per exact filter,
+and a SUBSCRIBE for a filter it already holds replaces it (§3.8.4).
+Subscriptions of one client with the same filter therefore share the
+broker's: each receives every message for it; the options of the most
+recent `Subscribe` (QoS, No Local, Retain As Published, Retain
+Handling) apply to all of them until the last one unsubscribes; retained
+messages sent for a later `Subscribe` reach the earlier ones as well.
+`Unsubscribe` sends an UNSUBSCRIBE only for filters no other
+subscription of the client uses.
+
+**Subscription Identifiers.** When the broker supports them (CONNACK),
+every SUBSCRIBE carries a Subscription Identifier the client allocates,
+and a PUBLISH tagged with identifiers reaches only the subscriptions it
+was sent for. With overlapping filters (`a/#` and `a/b`) a broker may
+send one copy per matching subscription; each subscription then
+receives exactly one. Without identifiers every matching subscription
+receives every copy.
+
+**Broker capabilities.** When the CONNACK disables shared subscriptions,
+wildcards or Subscription Identifiers, `Subscribe*` fails before
+anything is sent.
+
+**Teardown.** `Unsubscribe` closes the subscription's channel or queue
+before it returns, then reports the broker's answer; `Disconnect` closes
+all of them. Each closes exactly once; a PUBLISH already being
+dispatched to a closed subscription is acked instead of delivered.
+`Disconnect` clears all routes, so `Connect` followed by `Subscribe`
+starts clean.
+
+### Protocol
+
+**Validation.** Every packet from the broker is checked against MQTT v5
+before it is acted on (fixed-header flags, minimal Remaining Length,
+which properties each packet may carry and their values, UTF-8 strings,
+topic names, packet identifiers, reason codes, topic aliases). A
+violation closes the connection with DISCONNECT and the spec's reason
+code (`0x81` Malformed Packet, `0x82` Protocol Error, or a specific one
+such as `0x93`, `0x94`, `0x95`), then the supervisor reconnects; each
+is logged at Error and counted in `Stats().ProtocolErrors`.
+`WithLenientDecoding()` tolerates the two violations real brokers
+produce harmlessly (a non-minimal Remaining Length, reserved PINGRESP
+flag bits). Outbound packets are validated the same way: an invalid
+topic, filter or option fails the call with `ErrInvalidTopic`,
+`ErrInvalidField` or `ErrFieldTooLong` before anything is sent.
+
+**Topic aliases.** Outbound aliases are opt-in
+(`WithOutboundTopicAliases()`): QoS 0 publishes then replace a repeated
+topic with an alias while the broker's Topic Alias Maximum lasts; the
+alias is allocated, encoded and queued under one lock per connection,
+so a use never overtakes its registration. QoS 1/2 always carry the full
+topic, since they may be resent on a connection that knows no aliases.
+Inbound aliases need `WithInboundTopicAliasMaximum(n)`; an alias of 0
+or above `n` is a DISCONNECT `0x94`, an alias used before it was
+registered a `0x82`.
+
+**Re-authentication (§4.12).** Client-initiated with
+`Reauthenticate(ctx)`: AUTH `0x19`, then `Begin`/`Continue`, until the
+broker's `0x00` Success. The client always replies `0x18` Continue;
+only the server concludes, and an inbound `0x00` is terminal. A
+rejection returns `ErrReauthRejected` and the client reconnects with a
+fresh CONNECT.
+
+The exchange is validated: during CONNECT the broker may only send AUTH
+`0x18` under the CONNECT's Authentication Method, and a CONNACK may not
+name another method; after CONNACK a broker AUTH is only valid inside a
+re-authentication the client started (a broker cannot initiate one),
+again under the same method. Anything else is a protocol error
+(DISCONNECT `0x82`). Authenticators that do I/O to answer a challenge
+can implement `ContextAuthenticator` to be cancelled at the connect
+timeout.
+
+---
+
+## Operations
+
+### Health and metrics
+
+`Client.Connected()` reports a live connection, and
+`Client.ServerInfo()` what the broker granted. The
+[lifecycle callbacks](#lifecycle-callbacks) report connection events as
+they happen.
+
+`Client.Stats()` returns a snapshot of in-memory counters. Opt in via
+`WithStats()` — when off, the hot path skips every atomic increment and
+`Stats()` returns the zero value.
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBroker(broker),
+    mqttv5.WithStats(),
+)
+// ...
+s := cli.Stats()
+fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
+    s.PublishesSent, s.PublishesAcked, s.PublishesInflight,
+    s.Connects, s.ConnectFailures)
+```
+
+The counters cover connects and disconnects, publishes and
+subscriptions, inbound drops, pool fallbacks, ping timeouts, ignored
+acks, session store errors and broker protocol violations; the
+[`Stats`](https://pkg.go.dev/github.com/ashtonian/mqttv5#Stats) godoc
+lists every field. The library has no metrics dependency: export the
+fields to Prometheus, OpenTelemetry or expvar on a timer (see
+[`examples/stats`](examples/stats)).
+
+### Logs
+
+Structured `log/slog` through `WithLogger` (default `slog.Default()`).
+Normal message traffic logs nothing.
+
+- **Info:** connects and disconnects.
+- **Warn:** recoverable problems: reconnects, refused filters, stray
+  acknowledgements, typed decode failures, a teardown waiting on a
+  handler.
+- **Error:** protocol violations and store failures.
+
+### Troubleshooting
+
+| Symptom | Check | Then |
+|---|---|---|
+| `Connect` returns `ErrConnectRefused` | `errors.As(err, &rce)` for the CONNACK reason code | 0x86/0x87: credentials or authorization; 0x9C/0x9D: the broker redirects, see `WithFollowServerRedirects` |
+| Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
+| `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
+| `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
+| Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream: raise `SubBuffer` / `SubMaxQueueSize`, consume faster, or use a callback (backpressure) |
+| Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
+| `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
+| Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
+| Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
+| `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
+| Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
+
+### Store failures
+
+Every packet that depends on a `WithStore` record waits until the
+record is written: a PUBLISH for its record, a PUBREL for the
+AwaitPubcomp phase, a PUBREC for the inbound AwaitPubrel record and a
+PUBCOMP for that record's deletion. One flow's writes reach the store in
+the order the client decided them, also across a reconnect.
+
+A failed write of a new message's record fails that `Publish` with a
+`*StoreError`. Any other failed write means the store no longer holds
+what the session has done, so the client stops instead of carrying on
+without the guarantee the store is there for, much as a crash would
+stop it:
+
+1. it drops the session state it holds in memory and sends nothing more
+   that depends on it;
+2. it sends DISCONNECT 0x80 (the broker publishes the Will) and ends as
+   `Disconnect` would;
+3. QoS 1/2 `Publish` calls still waiting return the `*StoreError`
+   (`errors.Is(err, ErrStoreFailed)`); their messages stay in the store;
+4. `WithOnStoreFailure` fires;
+5. the next `Connect` reloads the session from the store and continues
+   every exchange from the phase it holds.
+
+The client treats every store error as final. A `session.Store` over a
+backend with transient failures (a network database, say) retries them
+itself within the ctx it is given. `store/file` returns an error only
+when the file system does: check free space and the Error log, then
+`Connect` again.
+
+---
+
+## Security
+
+- **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
+  broker against the system roots by default; `WithTLSConfig` supplies
+  CAs, client certificates or a server name. Never set
+  `InsecureSkipVerify` outside tests.
+- **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
+  (per-attempt rotation) keep secrets in memory only; the client never
+  logs them. Enhanced authentication (`WithAuthenticator`) supports
+  SCRAM-style challenge/response and re-authentication
+  (`Reauthenticate`).
+- **Untrusted input.** Every packet from the broker is validated
+  before it is acted on, and a violation closes the connection (see
+  [Reliability semantics](#reliability-semantics)). Memory a broker can
+  make the client hold is bounded: per packet by `WithMaximumPacketSize`
+  (unset: the decoder holds at most eight times the bytes actually
+  received until a packet is complete), per subscription by `SubBuffer`
+  / `SubMaxQueueSize`, and in flight by `WithReceiveMaximum`.
+- **Persistence.** `store/file` and `queue/file` write message payloads
+  to disk unencrypted, with 0600 permissions by default under a 0700
+  directory; encrypt the volume if payloads are sensitive.
+- **Reporting.** Report vulnerabilities privately through GitHub
+  security advisories on this repository.
 
 ---
 
@@ -1144,181 +1432,6 @@ nil check.
 
 ---
 
-## Reliability semantics
-
-**`Connect`** —
-Blocks until CONNACK (or ctx). The supervisor handles all subsequent
-reconnects in the background.
-
-**Reconnect** —
-`ExponentialBackoff(1s, 30s, 200ms)` default. With `WithBrokers`, URLs
-rotate per attempt; a successful connect sticks. The backoff starts over
-only after a connection outlives the delay that preceded it: a broker
-that accepts the CONNECT and drops the connection at once is retried at
-a growing interval, not in a tight loop.
-
-**Session resume (Session Present = 1)** —
-Unacknowledged QoS 1/2 PUBLISHes are resent in their original send
-order with `DUP=1` (§4.4, §4.6); a QoS 2 message that already got its
-PUBREC resends PUBREL, never the PUBLISH; PUBRELs follow PUBREC order.
-Acks the application made while disconnected are sent on resume. The
-caller stays blocked on Publish across the drop.
-
-**Session loss (Session Present = 0, or CleanStart = 1)** —
-Inbound state is discarded, so the new session's messages are never
-mistaken for duplicates, and an `Ack` on a message from the old session
-is a no-op. Unacknowledged outbound QoS 1/2 messages follow
-`WithSessionLossPolicy`: republished as new messages (default; a
-duplicate is possible, and QoS 2 cannot stay exactly-once across the
-loss) or failed with `ErrSessionLost`. A broker that reports a present
-session for a CleanStart=1 CONNECT is a protocol error (DISCONNECT
-`0x82`). With `WithBrokers`, failover to another broker is a session
-loss.
-
-**Send quota** —
-At most the broker's Receive Maximum QoS 1/2 PUBLISHes are in flight
-(§4.9); further publishes wait in order.
-
-**Duplicates from the broker** —
-A resent PUBLISH (DUP) for a message the application still holds is
-neither delivered again nor acknowledged on the application's behalf;
-a QoS 2 duplicate after PUBREC gets PUBREC again; PUBREL for an
-unknown identifier gets PUBCOMP `0x92`. Acks for unknown or mismatched
-packet identifiers are ignored and counted in `Stats().AcksIgnored`.
-
-**Packet identifiers** —
-Owned per flow (publish / subscribe / unsubscribe) and released only
-when that flow completes, so a stray ack cannot free an identifier
-another flow is using.
-
-**Subscribe across a drop** —
-A SUBSCRIBE or UNSUBSCRIBE still waiting for its answer when the
-connection drops is sent again on the next one, in the order the calls
-were made; `Subscribe` and `Unsubscribe` keep waiting until the answer
-arrives or ctx ends. When the broker has no session, pending
-UNSUBSCRIBEs complete without being sent and every subscription is
-subscribed again, oldest first. Filters the broker refuses then end the
-subscription's share of them: `WithOnResubscribeError` is called, and a
-subscription left with no filters closes with `token.Err()` set. A
-SUBSCRIBE or UNSUBSCRIBE the broker answers by disconnecting — DISCONNECT
-blaming a packet it received — is sent at most three times, then fails
-with `*RejectedByDisconnectError`. A filter the broker never granted is
-not unsubscribed.
-
-**Subscriptions sharing a filter** —
-A broker keeps one subscription per exact filter, and a SUBSCRIBE for a
-filter it already holds replaces it (§3.8.4). Subscriptions of one
-client with the same filter therefore share the broker's: each receives
-every message for it; the options of the most recent `Subscribe` (QoS,
-No Local, Retain As Published, Retain Handling) apply to all of them
-until the last one unsubscribes; retained messages sent for a later
-`Subscribe` reach the earlier ones as well. `Unsubscribe` sends an
-UNSUBSCRIBE only for filters no other subscription of the client uses.
-
-**Subscription Identifiers** —
-When the broker supports them (CONNACK), every SUBSCRIBE carries a
-Subscription Identifier the client allocates, and a PUBLISH tagged with
-identifiers reaches only the subscriptions it was sent for. With
-overlapping filters (`a/#` and `a/b`) a broker may send one copy per
-matching subscription; each subscription then receives exactly one.
-Without identifiers every matching subscription receives every copy.
-
-**Re-authentication (§4.12)** —
-Client-initiated via `Reauthenticate(ctx)` (AUTH `0x19` →
-`Begin`/`Continue` → broker `0x00` Success). The client always replies
-`0x18` Continue — only the server concludes (`0x00`), and an inbound
-`0x00` is terminal. Rejection → `ErrReauthRejected` + reconnect via
-fresh CONNECT.
-
-The exchange is validated: during CONNECT the broker may only send AUTH
-`0x18` under the CONNECT's Authentication Method, and a CONNACK may not
-name another method; after CONNACK a broker AUTH is only valid inside a
-re-authentication the client started (a broker cannot initiate one),
-again under the same method. Anything else is a protocol error
-(DISCONNECT `0x82`). Authenticators that do I/O to answer a challenge
-can implement `ContextAuthenticator` to be cancelled at the connect
-timeout.
-
-**Protocol violations** —
-Every packet from the broker is checked against MQTT v5 before it is
-acted on (fixed-header flags, minimal Remaining Length, which
-properties each packet may carry and their values, UTF-8 strings,
-topic names, packet identifiers, reason codes, topic aliases). A
-violation closes the connection with DISCONNECT and the spec's reason
-code — `0x81` Malformed Packet, `0x82` Protocol Error, or a specific
-one such as `0x93`, `0x94`, `0x95` — then the supervisor reconnects;
-each is logged at Error and counted in `Stats().ProtocolErrors`.
-`WithLenientDecoding()` tolerates the two violations real brokers
-produce harmlessly (a non-minimal Remaining Length, reserved PINGRESP
-flag bits). Outbound packets are validated the same way: an invalid
-topic, filter or option fails the call with `ErrInvalidTopic`,
-`ErrInvalidField` or `ErrFieldTooLong` before anything is sent.
-
-**CONNACK capability flags** —
-`Shared` / `Wildcard` / `SubscriptionIdentifier` availability is
-honoured — `Subscribe*` errors before the wire if the broker disabled
-the feature.
-
-**Server-initiated DISCONNECT** —
-`WithOnServerDisconnect(fn)` fires with a `DisconnectInfo` (reason,
-reason string, server reference, user properties) before the generic
-`OnConnectionDown`. Redirects (`0x9C`/`0x9D`) are also reported to
-`WithOnServerRedirect` and followed with `WithFollowServerRedirects`.
-
-**Starting without the broker** —
-`Connect` returns the first failure unless `WithRetryInitialConnect()`
-is set; then it returns nil, the supervisor retries with the reconnect
-backoff, and `Client.AwaitConnection(ctx)` waits for the connection.
-Until then `Publish` and `Subscribe` return `ErrNotConnected`; a
-`QueuePublisher` keeps queuing.
-
-**PINGRESP liveness** —
-No PINGRESP within `PingTimeout` → connection treated as dead →
-supervisor redials.
-
-**Manual ack ordering** —
-QoS 1 PUBACK is held until `m.Ack()`, flushed in §4.6 arrival order.
-QoS 2 PUBREC is held until `m.Ack()`; PUBCOMP fires automatically when
-PUBREL arrives.
-
-**Multi-handler dispatch** —
-A PUBLISH matching several subscriptions gives each its own `*Message`
-handle over the same bytes. The broker ack (PUBACK / PUBREC) goes out
-once every handle has been acked. `m.Ack()` is idempotent per handle:
-a second call is a no-op and never affects another message or handler.
-
-**Topic / payload lifetime** —
-Owned by the message and valid for as long as you hold it. With
-`SubZeroCopy()` they alias the network frame and are valid only until
-every receiving subscription has acked (callbacks: until return); use
-`m.CloneTopic()` / `m.ClonePayload()` to keep them longer.
-
-**Subscription teardown** —
-`Unsubscribe` closes the subscription's channel or queue before it
-returns, then reports the broker's answer; `Disconnect` closes all of
-them. Each closes exactly once; a PUBLISH already being dispatched to a
-closed subscription is acked instead of delivered. `Disconnect` clears
-all routes, so `Connect` followed by `Subscribe` starts clean.
-
-**Topic aliases** —
-Outbound aliases are opt-in (`WithOutboundTopicAliases()`): QoS 0
-publishes then replace a repeated topic with an alias while the broker's
-Topic Alias Maximum lasts; the alias is allocated, encoded and queued
-under one lock per connection, so a use never overtakes its
-registration. QoS 1/2 always carry the full topic, since they may be
-resent on a connection that knows no aliases. Inbound aliases need
-`WithInboundTopicAliasMaximum(n)`; an alias of 0 or above `n` is a
-DISCONNECT `0x94`, an alias used before it was registered a `0x82`.
-
-**`Disconnect`** —
-Best-effort graceful DISCONNECT (bounded by ctx + `cs.dying`) after any
-acks the application already made, tears down per-conn goroutines,
-closes consumer channels/queues, and waits (bounded by ctx) for pending
-session store writes. Unfinished QoS 1/2 flows stay in the session for
-the next `Connect`. Idempotent.
-
----
-
 ## Architecture
 
 One goroutine per connection drives
@@ -1367,123 +1480,11 @@ control queue that survives reconnects.
 
 ---
 
-## External dependencies
-
-| Module | Depends on |
-|---|---|
-| `github.com/ashtonian/mqttv5` (core) | Go standard library only, tests included |
-| `store/file`, `queue/file` | [`go.etcd.io/bbolt`](https://github.com/etcd-io/bbolt) through `internal/filedb` |
-| `transport/ws` | [`github.com/gobwas/ws`](https://github.com/gobwas/ws) |
-| `codec/json` | standard library |
-| `codec/msgpack` | [`github.com/vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack) |
-| `benchmarks` | eclipse/paho.golang, eclipse/paho.mqtt.golang, golang.org/x/perf (not a dependency of anything else) |
-
-At runtime the client needs only an MQTT v5 broker reachable over TCP,
-TLS or (with `transport/ws`) WebSocket.
-
----
-
-## Operations
-
-**Health.** `Client.Connected()` reports a live connection;
-`Client.ServerInfo()` what the broker granted. `WithOnConnectionUp`,
-`WithOnConnectionDown`, `WithOnConnectError`, `WithOnReconnectAttempt`,
-`WithOnServerDisconnect` and `WithOnServerRedirect` report lifecycle
-events as they happen. `WithStats()` enables `Client.Stats()` counters
-(see [Observability](#observability--clientstats)); export them to your
-metrics system on a timer.
-
-**Logs.** Structured `log/slog` through `WithLogger` (default
-`slog.Default()`): connects and disconnects at Info, recoverable
-problems (reconnects, refused filters, stray acknowledgements, typed
-decode failures) at Warn, protocol violations and store failures at
-Error. Normal message traffic logs nothing.
-
-**Failure modes and what to check:**
-
-| Symptom | Check | Then |
-|---|---|---|
-| `Connect` returns `ErrConnectRefused` | `errors.As(err, &rce)` for the CONNACK reason code | 0x86/0x87: credentials or authorization; 0x9C/0x9D: the broker redirects, see `WithFollowServerRedirects` |
-| Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
-| `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
-| `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
-| Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream: raise `SubBuffer` / `SubMaxQueueSize`, consume faster, or use a callback (backpressure) |
-| Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
-| `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
-| Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
-| Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
-| `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
-| Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
-
-**Shutdown.** `Disconnect(ctx)` sends DISCONNECT after any acks already
-made, waits for the connection's goroutines (the read loop runs
-`SubscribeCallback` handlers), closes every subscription's output, and
-waits — bounded by ctx — for session store writes. Unfinished QoS 1/2
-flows stay in the store for the next `Connect`.
-
-#### Store failures
-
-Every packet that depends on a `WithStore` record waits until the
-record is written: a PUBLISH for its record, a PUBREL for the
-AwaitPubcomp phase, a PUBREC for the inbound AwaitPubrel record and a
-PUBCOMP for that record's deletion. One flow's writes reach the store in
-the order the client decided them, also across a reconnect.
-
-A failed write of a new message's record fails that `Publish` with a
-`*StoreError`. Any other failed write means the store no longer holds
-what the session has done, so the client stops instead of carrying on
-without the guarantee the store is there for, much as a crash would
-stop it:
-
-1. it drops the session state it holds in memory and sends nothing more
-   that depends on it;
-2. it sends DISCONNECT 0x80 (the broker publishes the Will) and ends as
-   `Disconnect` would;
-3. QoS 1/2 `Publish` calls still waiting return the `*StoreError`
-   (`errors.Is(err, ErrStoreFailed)`); their messages stay in the store;
-4. `WithOnStoreFailure` fires;
-5. the next `Connect` reloads the session from the store and continues
-   every exchange from the phase it holds.
-
-The client treats every store error as final. A `session.Store` over a
-backend with transient failures (a network database, say) retries them
-itself within the ctx it is given. `store/file` returns an error only
-when the file system does: check free space and the Error log, then
-`Connect` again.
-
----
-
-## Security
-
-- **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
-  broker against the system roots by default; `WithTLSConfig` supplies
-  CAs, client certificates or a server name. Never set
-  `InsecureSkipVerify` outside tests.
-- **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
-  (per-attempt rotation) keep secrets in memory only; the client never
-  logs them. Enhanced authentication (`WithAuthenticator`) supports
-  SCRAM-style challenge/response and re-authentication
-  (`Reauthenticate`).
-- **Untrusted input.** Every packet from the broker is validated
-  before it is acted on, and a violation closes the connection (see
-  [Reliability semantics](#reliability-semantics)). Memory a broker can
-  make the client hold is bounded: per packet by `WithMaximumPacketSize`
-  (unset: the decoder holds at most eight times the bytes actually
-  received until a packet is complete), per subscription by `SubBuffer`
-  / `SubMaxQueueSize`, and in flight by `WithReceiveMaximum`.
-- **Persistence.** `store/file` and `queue/file` write message payloads
-  to disk unencrypted, with 0600 permissions by default under a 0700
-  directory; encrypt the volume if payloads are sensitive.
-- **Reporting.** Report vulnerabilities privately through GitHub
-  security advisories on this repository.
-
----
-
 ## Code map
 
 | Path | What |
 |---|---|
-| `client.go`, `lifecycle.go`, `conn.go` | `Client`, `Connect`/`Disconnect`, the supervisor, per-connection state |
+| `client.go`, `lifecycle.go`, `conn.go`, `events.go` | `Client`, `Connect`/`Disconnect`, the supervisor, per-connection state, the lifecycle callback queue |
 | `extensions.go`, `auth.go` | `Authenticator` and backoff policies; AUTH handling and `Reauthenticate` |
 | `reader.go`, `writer.go`, `keepalive.go` | read loop and dispatch, writer goroutine, keep-alive |
 | `publish.go`, `pool.go` | `Publish`, broker-limit checks, publisher pool |
@@ -1507,7 +1508,23 @@ when the file system does: check free space and the Error log, then
 
 ---
 
-## Build / test / bench
+## External dependencies
+
+| Module | Depends on |
+|---|---|
+| `github.com/ashtonian/mqttv5` (core) | Go standard library only, tests included |
+| `store/file`, `queue/file` | [`go.etcd.io/bbolt`](https://github.com/etcd-io/bbolt) through `internal/filedb` |
+| `transport/ws` | [`github.com/gobwas/ws`](https://github.com/gobwas/ws) |
+| `codec/json` | standard library |
+| `codec/msgpack` | [`github.com/vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack) |
+| `benchmarks` | eclipse/paho.golang, eclipse/paho.mqtt.golang, golang.org/x/perf (not a dependency of anything else) |
+
+At runtime the client needs only an MQTT v5 broker reachable over TCP,
+TLS or (with `transport/ws`) WebSocket.
+
+---
+
+## Build and test
 
 ```bash
 # Core — no broker required.
@@ -1533,22 +1550,20 @@ go -C benchmarks run ./cmd/benchtab README.md ../README.md
 
 ## Stability
 
-- Wire protocol: MQTT v5 OASIS, stable.
+mqttv5 is pre-1.0: any minor release may change the API.
+
 - The client API is the `mqttv5` package: `Client`, `Config`, the
-  options, `Stats`, and its own value types (`PublishOptions`,
-  `TopicFilter`, `Message` and `Properties`, `ConnackInfo`,
+  options, `Stats`, and its value types (`PublishOptions`,
+  `TopicFilter`, `Message`, `Properties`, `ConnackInfo`,
   `DisconnectInfo`, `WillOptions`, `ConnectOptions`,
-  `DisconnectOptions`, `ServerRedirect`, results and errors. Before
-  v1.0, any minor release may change it.
+  `DisconnectOptions`, `ServerRedirect`, results and errors).
 - `ReasonCode`, `PacketType` and `UserProperty` are the protocol's own
   values, shared with the codec.
-- Sentinel errors above are stable; branch on them with `errors.Is`.
+- `wire`, the codec underneath, is exported for tools, test brokers and
+  storage formats. The client API never requires it, and it may change
+  in any release.
 - Submodules have their own `go.mod` and are tagged with the core at
-  every release; use matching versions ([Install](#install--submodules)).
-- `wire` is the codec underneath, exported for tools, brokers-in-tests
-  and storage formats but **not covered by the stability promise**:
-  its types may change in any release. The client API never requires
-  it.
+  every release; use matching versions ([Modules](#modules)).
 
 ---
 
