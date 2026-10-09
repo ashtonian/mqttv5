@@ -203,11 +203,10 @@ func (c *Client) reauthDownError(cs *connState) error {
 	return ErrNotConnected
 }
 
-// fireReauthenticated invokes the OnReauthenticated observability hook (if
-// configured) on the read-loop goroutine. The callback must not block.
+// fireReauthenticated posts the OnReauthenticated hook, if configured.
 func (c *Client) fireReauthenticated() {
-	if c.cfg.OnReauthenticated != nil {
-		c.cfg.OnReauthenticated()
+	if fn := c.cfg.OnReauthenticated; fn != nil {
+		c.events.post(fn)
 	}
 }
 

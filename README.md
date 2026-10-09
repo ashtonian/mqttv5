@@ -694,10 +694,20 @@ them otherwise.
 
 #### Lifecycle callbacks
 
-All callbacks must not block. `Disconnect` waits for the goroutines
-that run them (all but `OnStoreFailure`, which fires after the client
-has stopped) and `SubscribeCallback` handlers, so calling it from one
-deadlocks: run it on another goroutine (`go cli.Disconnect(ctx)`).
+These callbacks run one at a time, in the order of the events they
+report, on a goroutine of the client's own, so they may call
+`Disconnect`, `Connect` and `SetBrokers`. Before each reconnect
+attempt the client waits for the callbacks so far: a `SetBrokers` call
+from one applies to that attempt, and a slow callback delays it.
+`OnConnectionUp` may run after `Connect` returns, and a callback for an
+event before `Disconnect` may run after `Disconnect` returns.
+
+Message handlers are different. `SubscribeCallback` handlers and
+`SubOnDrop` hooks run on the connection's read loop, which `Disconnect`
+waits for: calling `Disconnect` from one would wait for itself, so start
+it on another goroutine (`go cli.Disconnect(ctx)`). A teardown held up
+by a handler logs `disconnect is waiting for a SubscribeCallback
+handler` after five seconds.
 
 | Option | Signature / when | Effect |
 |---|---|---|
@@ -1402,11 +1412,14 @@ Error. Normal message traffic logs nothing.
 | `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
 | Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
 | Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
+| `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
+| Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
 
 **Shutdown.** `Disconnect(ctx)` sends DISCONNECT after any acks already
-made, closes every subscription's output, and waits — bounded by ctx —
-for session store writes. Unfinished QoS 1/2 flows stay in the store
-for the next `Connect`.
+made, waits for the connection's goroutines (the read loop runs
+`SubscribeCallback` handlers), closes every subscription's output, and
+waits — bounded by ctx — for session store writes. Unfinished QoS 1/2
+flows stay in the store for the next `Connect`.
 
 #### Store failures
 

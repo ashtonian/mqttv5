@@ -714,9 +714,9 @@ func TestReauthenticate_FiresOnReauthenticated(t *testing.T) {
 		<-fb.Done()
 	})
 
-	var reauthed atomic.Int32
+	reauthed := make(chan struct{}, 2)
 	cli, err := New(WithBroker(fb.URL()), WithAuthenticator(&countingAuth{}),
-		WithOnReauthenticated(func() { reauthed.Add(1) }))
+		WithOnReauthenticated(func() { reauthed <- struct{}{} }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,10 +728,16 @@ func TestReauthenticate_FiresOnReauthenticated(t *testing.T) {
 	if err := cli.Reauthenticate(context.Background()); err != nil {
 		t.Fatalf("Reauthenticate: %v", err)
 	}
-	// The hook fires on the read loop before Reauthenticate's result is
-	// delivered, so it has run by the time the call returns.
-	if got := reauthed.Load(); got != 1 {
-		t.Errorf("OnReauthenticated fired %d times, want 1", got)
+	select {
+	case <-reauthed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnReauthenticated did not fire")
+	}
+	// Callbacks run in order: once the queue is flushed, a second firing
+	// would have run.
+	cli.events.flush(nil)
+	if n := len(reauthed); n != 0 {
+		t.Errorf("OnReauthenticated fired %d more times", n)
 	}
 }
 

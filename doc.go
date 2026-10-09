@@ -60,6 +60,28 @@
 // and the broker's CONNACK limits enforced before a packet is sent.
 // Every packet from the broker is validated before it is acted on.
 //
+// # Lifecycle callbacks
+//
+// The connection callbacks ([WithOnConnectionUp], [WithOnConnectionDown],
+// [WithOnConnectError], [WithOnReconnectAttempt],
+// [WithOnServerDisconnect], [WithOnServerRedirect],
+// [WithOnResubscribeError], [WithOnReauthenticated] and
+// [WithOnStoreFailure]) run one at a time, in the order of the events
+// they report, on a goroutine of the client's own. They may call
+// [Client.Disconnect], [Client.Connect] and [Client.SetBrokers]. Before
+// each reconnect attempt the client waits for the callbacks posted so
+// far, so a SetBrokers call from one applies to that attempt, and a
+// slow callback delays it. Because they run apart from the calls that
+// cause them, OnConnectionUp may run after Connect returns, and a
+// callback for an event before Disconnect may run after Disconnect
+// returns.
+//
+// Message handlers are different: [Client.SubscribeCallback] handlers
+// and [SubOnDrop] hooks run on the connection's read loop, which
+// Disconnect waits for, so they must not call Disconnect themselves;
+// start it on another goroutine. A teardown held up by one logs a
+// warning after five seconds.
+//
 // # Quick start
 //
 //	cli, err := mqttv5.New(

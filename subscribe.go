@@ -100,8 +100,8 @@ func SubDropPolicy(p DropPolicy) SubscribeOption {
 // SubOnDrop fires when a message is dropped by [Client.Subscribe]
 // (channel full) or [Client.SubscribeQueue] (cap reached). It runs on the
 // read goroutine before the dropped message is acknowledged, so every field
-// is readable; it must not block. On a [SubZeroCopy] subscription the
-// fields must not be retained past return.
+// is readable; it must not block, nor call [Client.Disconnect]. On a
+// [SubZeroCopy] subscription the fields must not be retained past return.
 func SubOnDrop(fn func(*Message)) SubscribeOption {
 	return func(cfg *subscribeConfig) { cfg.onDrop = fn }
 }
@@ -274,7 +274,9 @@ func (c *Client) dropInbound(cfg subscribeConfig, m *Message) {
 // matching inbound PUBLISH.
 //
 // h runs synchronously on the read goroutine and MUST NOT block — a
-// slow handler stalls PINGRESP and drops the connection. The runtime
+// slow handler stalls PINGRESP and drops the connection. It must not
+// call [Client.Disconnect], which waits for the read goroutine: start
+// it on another goroutine. The runtime
 // auto-acks via [Message.Ack] after h returns; use [Client.Subscribe]
 // or [Client.SubscribeQueue] when ack must be deferred past h.
 //

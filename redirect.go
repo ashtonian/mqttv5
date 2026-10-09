@@ -47,8 +47,8 @@ func (c *Client) redirect(r ServerRedirect) {
 	if r.Reference == "" || (r.Reason != ReasonUseAnotherServer && r.Reason != ReasonServerMoved) {
 		return
 	}
-	if c.cfg.OnServerRedirect != nil {
-		c.cfg.OnServerRedirect(r)
+	if fn := c.cfg.OnServerRedirect; fn != nil {
+		c.events.post(func() { fn(r) })
 	}
 	if !c.cfg.FollowServerRedirects {
 		return

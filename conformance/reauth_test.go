@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,20 +87,21 @@ func emqxProvision(t *testing.T, url, body string) {
 // Reauthenticate twice — each presenting a fresh client nonce — and
 // asserts the broker concludes every exchange with AUTH 0x00 Success
 // without dropping the live connection. The OnReauthenticated hook is
-// expected to fire once per successful re-auth.
+// expected to fire once per successful re-auth, on the client's callback
+// goroutine.
 func TestReauthenticate_SCRAM_EMQX(t *testing.T) {
 	url := scramBrokerURL()
 	requireBroker(t, url)
 	provisionSCRAM(t)
 
-	var reauthed atomic.Int32
+	reauthed := make(chan struct{}, 3)
 	auth := newSCRAM(scramUser, scramPass)
 	cli, err := mqttv5.New(
 		mqttv5.WithBroker(url),
 		mqttv5.WithClientID("conf-scram-reauth-"+randSuffix()),
 		mqttv5.WithAuthenticator(auth),
 		mqttv5.WithConnectTimeout(5*time.Second),
-		mqttv5.WithOnReauthenticated(func() { reauthed.Add(1) }),
+		mqttv5.WithOnReauthenticated(func() { reauthed <- struct{}{} }),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -129,8 +129,12 @@ func TestReauthenticate_SCRAM_EMQX(t *testing.T) {
 		}
 	}
 
-	if got := reauthed.Load(); got != 2 {
-		t.Errorf("OnReauthenticated fired %d times, want 2", got)
+	for i := 1; i <= 2; i++ {
+		select {
+		case <-reauthed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("OnReauthenticated fired %d times, want 2", i-1)
+		}
 	}
 	// SCRAM mutual auth ran for the initial connect + both re-auths.
 	if got := auth.verifies.Load(); got != 3 {

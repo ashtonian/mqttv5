@@ -119,7 +119,7 @@ type Config struct {
 	LenientDecoding bool
 
 	// OnResubscribeError fires when the broker refuses filters the client
-	// re-subscribes after a session loss. Must not block.
+	// re-subscribes after a session loss. Runs with the other lifecycle callbacks (see the package documentation).
 	OnResubscribeError func(SubscriptionToken, error)
 
 	// QoSDowngrade lowers a publish's QoS to the broker's Maximum QoS
@@ -227,22 +227,24 @@ type Config struct {
 	PublishMode PublishMode
 
 	// OnConnectionUp fires on each successful CONNECT/CONNACK with
-	// what the broker granted. Must not block.
+	// what the broker granted, possibly after Connect has returned.
+	// Runs with the other lifecycle callbacks (see the package documentation).
 	OnConnectionUp func(ConnackInfo)
 
 	// OnConnectionDown fires on unexpected connection loss (not on
 	// user-initiated Disconnect). Return false to stop the
-	// supervisor; a subsequent Connect restarts it. Must not block.
+	// supervisor, which waits for the answer; a subsequent Connect
+	// restarts it. Runs with the other lifecycle callbacks (see the package documentation).
 	OnConnectionDown func() bool
 
 	// OnConnectError fires per failed CONNECT attempt (dial failure,
 	// CONNACK refusal, AUTH-loop error). Observability only; the
-	// supervisor retries regardless. Must not block.
+	// supervisor retries regardless. Runs with the other lifecycle callbacks (see the package documentation).
 	OnConnectError func(err error)
 
-	// OnReconnectAttempt fires immediately before each reconnect
-	// dial (not the initial Connect). attempt starts at 1. Must not
-	// block.
+	// OnReconnectAttempt fires before each reconnect dial (not the
+	// initial Connect), which waits for it. attempt starts at 1.
+	// Runs with the other lifecycle callbacks (see the package documentation).
 	OnReconnectAttempt func(attempt int, brokerURL string)
 
 	// StatsEnabled toggles the [Client.Stats] counter set. Default
@@ -255,6 +257,7 @@ type Config struct {
 	// Fires after the connection is marked down and before
 	// OnConnectionDown. May call [Client.SetBrokers] to honour a
 	// ServerMoved / UseAnotherServer redirect on the next attempt.
+	// Runs with the other lifecycle callbacks (see the package documentation).
 	OnServerDisconnect func(DisconnectInfo)
 
 	// Authenticator drives MQTT v5 enhanced authentication when set.
@@ -262,9 +265,9 @@ type Config struct {
 
 	// OnReauthenticated fires when a re-authentication (§4.12) the
 	// client started with Reauthenticate concludes successfully (broker
-	// AUTH 0x00 Success). Runs on the read loop; must not block.
+	// AUTH 0x00 Success), possibly after Reauthenticate has returned.
 	// Observability only: the success is also Reauthenticate's return
-	// value.
+	// value. Runs with the other lifecycle callbacks (see the package documentation).
 	OnReauthenticated func()
 
 	// ConnectPacketBuilder is invoked immediately before each CONNECT
@@ -287,7 +290,7 @@ type Config struct {
 	Store session.Store
 
 	// OnStoreFailure fires once when a Store write fails and the client
-	// has stopped because of it (see [WithStore]). Must not block.
+	// has stopped because of it (see [WithStore]). Runs with the other lifecycle callbacks (see the package documentation).
 	OnStoreFailure func(err error)
 
 	TLSConfig *tls.Config
@@ -444,8 +447,8 @@ func WithLenientDecoding() Option {
 // WithOnResubscribeError observes filters the broker refuses when the
 // client re-subscribes after a session loss (Session Present = 0). A
 // subscription that loses every filter closes, and its token's Err
-// reports why; one that keeps some carries on with those. Must not
-// block.
+// reports why; one that keeps some carries on with those. Runs with the
+// other lifecycle callbacks (see the package documentation).
 func WithOnResubscribeError(fn func(SubscriptionToken, error)) Option {
 	return func(c *Config) error {
 		c.OnResubscribeError = fn
@@ -479,7 +482,9 @@ func WithSessionLossPolicy(p SessionLossPolicy) Option {
 
 // WithOnServerRedirect calls fn when the broker refuses a CONNECT, or
 // ends the connection, with reason 0x9C Use another server or 0x9D
-// Server moved and a Server Reference (§4.11). Must not block.
+// Server moved and a Server Reference (§4.11). May call
+// [Client.SetBrokers]: the next attempt waits for it. Runs with the other lifecycle callbacks (see the
+// package documentation).
 func WithOnServerRedirect(fn func(ServerRedirect)) Option {
 	return func(c *Config) error {
 		c.OnServerRedirect = fn
@@ -691,7 +696,9 @@ func WithWill(w *WillOptions) Option {
 // WithOnConnectionUp fires on each successful CONNECT/CONNACK with what
 // the broker granted (session present, limits, assigned ClientID,
 // effective keep-alive, ...); [Client.ServerInfo] returns the same for
-// the current connection. Must not block.
+// the current connection. It may run after [Client.Connect] has
+// returned. Runs with the other lifecycle callbacks (see the package
+// documentation).
 func WithOnConnectionUp(fn func(ConnackInfo)) Option {
 	return func(c *Config) error {
 		c.OnConnectionUp = fn
@@ -701,9 +708,10 @@ func WithOnConnectionUp(fn func(ConnackInfo)) Option {
 
 // WithOnConnectionDown registers a callback fired when the connection
 // is lost. Does NOT fire on user-initiated Disconnect. Return false
-// to terminate the supervisor — no further reconnect attempts. A
-// subsequent Connect on the same Client re-starts the lifecycle.
-// Must not block.
+// to terminate the supervisor — no further reconnect attempts; the
+// supervisor waits for the answer. A subsequent Connect on the same
+// Client re-starts the lifecycle. Runs with the other lifecycle
+// callbacks (see the package documentation).
 func WithOnConnectionDown(fn func() bool) Option {
 	return func(c *Config) error {
 		c.OnConnectionDown = fn
@@ -713,7 +721,8 @@ func WithOnConnectionDown(fn func() bool) Option {
 
 // WithOnConnectError fires per failed CONNECT attempt (dial err,
 // CONNACK refusal, AUTH-loop err). Observability only — the
-// supervisor retries regardless. Must not block.
+// supervisor retries regardless. Runs with the other lifecycle
+// callbacks (see the package documentation).
 func WithOnConnectError(fn func(error)) Option {
 	return func(c *Config) error {
 		c.OnConnectError = fn
@@ -721,11 +730,12 @@ func WithOnConnectError(fn func(error)) Option {
 	}
 }
 
-// WithOnReconnectAttempt fires immediately before each reconnect
-// dial (not the initial [Client.Connect]). attempt starts at 1 after a
-// connection that lasted, and keeps counting across connections that
-// dropped sooner than the reconnect delay before them (see
-// [WithReconnectBackoff]). Must not block.
+// WithOnReconnectAttempt fires before each reconnect dial (not the
+// initial [Client.Connect]), which waits for it. attempt starts at 1
+// after a connection that lasted, and keeps counting across
+// connections that dropped sooner than the reconnect delay before them
+// (see [WithReconnectBackoff]). Runs with the other lifecycle callbacks
+// (see the package documentation).
 func WithOnReconnectAttempt(fn func(attempt int, brokerURL string)) Option {
 	return func(c *Config) error {
 		c.OnReconnectAttempt = fn
@@ -737,9 +747,10 @@ func WithOnReconnectAttempt(fn func(attempt int, brokerURL string)) Option {
 // (§3.14), with its reason, reason string, server reference and user
 // properties. Fires after the connection is marked down and before
 // OnConnectionDown; may call [Client.SetBrokers] to honour a
-// ServerMoved / UseAnotherServer redirect on the next attempt. Not
-// fired for socket-level errors or client-initiated Disconnect.
-// Must not block.
+// ServerMoved / UseAnotherServer redirect on the next attempt, which
+// waits for it. Not fired for socket-level errors or client-initiated
+// Disconnect. Runs with the other lifecycle callbacks (see the package
+// documentation).
 func WithOnServerDisconnect(fn func(DisconnectInfo)) Option {
 	return func(c *Config) error {
 		c.OnServerDisconnect = fn
@@ -749,8 +760,9 @@ func WithOnServerDisconnect(fn func(DisconnectInfo)) Option {
 
 // WithOnReauthenticated registers a callback fired when a
 // re-authentication (§4.12) the client started with Reauthenticate
-// concludes successfully (broker AUTH 0x00 Success). Observability only
-// — runs on the read loop and must not block.
+// concludes successfully (broker AUTH 0x00 Success), possibly after
+// Reauthenticate has returned. Observability only. Runs with the other
+// lifecycle callbacks (see the package documentation).
 func WithOnReauthenticated(fn func()) Option {
 	return func(c *Config) error {
 		c.OnReauthenticated = fn
@@ -1053,8 +1065,9 @@ func WithStore(s session.Store) Option {
 
 // WithOnStoreFailure registers a callback fired once when a session
 // store write failed and the client has stopped because of it (see
-// [WithStore]); err is a [*StoreError]. Call [Client.Connect] to start
-// again from what the store holds. Must not block.
+// [WithStore]); err is a [*StoreError]. Call [Client.Connect], from the
+// callback or later, to start again from what the store holds. Runs
+// with the other lifecycle callbacks (see the package documentation).
 func WithOnStoreFailure(fn func(err error)) Option {
 	return func(c *Config) error {
 		c.OnStoreFailure = fn

@@ -228,9 +228,16 @@ Other changes:
   `Disconnect` likewise ends a reconnect attempt in progress, without
   `OnConnectionDown` or `OnConnectError` firing for it, and returns
   only once the connection's goroutines have exited.
-- `Disconnect` waits for the goroutines that run the lifecycle
-  callbacks and `SubscribeCallback` handlers: call it from one of them
-  on a new goroutine, or it deadlocks.
+- Lifecycle callbacks (`OnConnectionUp`, `OnConnectionDown`,
+  `OnConnectError`, `OnReconnectAttempt`, `OnServerDisconnect`,
+  `OnServerRedirect`, `OnResubscribeError`, `OnReauthenticated`,
+  `OnStoreFailure`) run in order on a goroutine of the client's own and
+  may call `Disconnect` and `Connect`. They no longer run before the call
+  that caused them returns: `OnConnectionUp` may run after `Connect`
+  returns, `OnReauthenticated` after `Reauthenticate`.
+- `SubscribeCallback` handlers and `SubOnDrop` hooks must not call
+  `Disconnect`, which waits for the read loop that runs them; start it on
+  another goroutine.
 
 New, opt-in:
 

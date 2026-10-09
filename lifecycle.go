@@ -137,9 +137,7 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 		}
 		c.stats.addConnectFailure()
 		c.redirectFrom(err)
-		if c.cfg.OnConnectError != nil {
-			c.cfg.OnConnectError(err)
-		}
+		c.connectError(err)
 		if !c.cfg.RetryInitialConnect || ctx.Err() != nil {
 			return err
 		}
@@ -192,9 +190,10 @@ func (c *Client) AwaitConnection(ctx context.Context) error {
 // [Client.DisconnectWith]. Does not fire OnConnectionDown.
 // Idempotent.
 //
-// Disconnect waits for the goroutines that run the lifecycle callbacks
-// (all but OnStoreFailure) and [Client.SubscribeCallback] handlers, so
-// calling it from one of them deadlocks: start it on another goroutine.
+// Lifecycle callbacks may call Disconnect. [Client.SubscribeCallback]
+// handlers and [SubOnDrop] hooks must not: Disconnect waits for the read
+// loop that runs them, so it would wait for itself. Start it on another
+// goroutine.
 func (c *Client) Disconnect(ctx context.Context) error {
 	return c.DisconnectWith(ctx, DisconnectOptions{ReasonCode: ReasonNormalDisconnection})
 }
@@ -202,8 +201,8 @@ func (c *Client) Disconnect(ctx context.Context) error {
 // DisconnectWith sends a DISCONNECT with opts, stops the supervisor,
 // and tears down the current connection. Pool-member disconnect
 // errors are joined into the returned error. Idempotent. Like
-// [Client.Disconnect], it must not be called from a callback's own
-// goroutine.
+// [Client.Disconnect], it must not be called from a SubscribeCallback
+// handler or SubOnDrop hook.
 func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) error {
 	c.startMu.Lock()
 	started, life := c.started, c.life.Load()
@@ -256,8 +255,7 @@ func (c *Client) finish(ctx context.Context, life *lifecycle) error {
 			// Its workers have exited, or are exiting: the supervisor
 			// joins them, but a connection activated by a Connect whose
 			// span ended before the supervisor started has no supervisor.
-			cs.signalDown()
-			<-cs.done
+			c.join(cs)
 		}
 		// The read loop has exited, so nothing dispatches any more.
 		c.closeAllSubs()
@@ -562,8 +560,11 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 	}()
 
 	c.stats.addConnect()
-	if c.cfg.OnConnectionUp != nil {
-		c.cfg.OnConnectionUp(r.info.clone())
+	if fn := c.cfg.OnConnectionUp; fn != nil {
+		// Posted under the fence: before any callback the teardown
+		// causes.
+		info := r.info.clone()
+		c.events.post(func() { fn(info) })
 	}
 	c.cfg.Logger.Info("mqttv5: connected",
 		slog.String("broker", r.url),
@@ -572,6 +573,33 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 	)
 	return nil
 }
+
+// connectError reports a failed connection attempt to OnConnectError.
+func (c *Client) connectError(err error) {
+	if fn := c.cfg.OnConnectError; fn != nil {
+		c.events.post(func() { fn(err) })
+	}
+}
+
+// join takes cs down and waits for its goroutines. The read loop runs
+// SubscribeCallback handlers and SubOnDrop hooks: one that does not
+// return, as one that called Disconnect cannot, holds the teardown, and
+// join says so in the log rather than hang without a word.
+func (c *Client) join(cs *connState) {
+	cs.signalDown()
+	select {
+	case <-cs.done:
+		return
+	case <-c.cfg.clock.After(joinStallWarning):
+	}
+	c.cfg.Logger.Warn("mqttv5: disconnect is waiting for a SubscribeCallback handler or SubOnDrop hook to return; "+
+		"Disconnect called from one never returns", slog.String("client_id", c.ClientID()),
+		slog.Duration("waited", joinStallWarning))
+	<-cs.done
+}
+
+// joinStallWarning is how long join waits before it reports a stall.
+const joinStallWarning = 5 * time.Second
 
 // activationErr is why a connection must not be installed in span life:
 // the session store failed, or the span is ending. The caller holds
@@ -609,8 +637,8 @@ func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
 	defer cancel()
 	_ = c.stop(ctx, life, wire.DisconnectOpts{ReasonCode: wire.ReasonUnspecifiedError}, err)
-	if c.cfg.OnStoreFailure != nil {
-		c.cfg.OnStoreFailure(err)
+	if fn := c.cfg.OnStoreFailure; fn != nil {
+		c.events.post(func() { fn(err) })
 	}
 }
 
@@ -637,8 +665,7 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 		select {
 		case <-cs.done:
 		case <-life.shutdown:
-			cs.signalDown()
-			cs.wg.Wait()
+			c.join(cs)
 			return
 		}
 		if life.isStopping() {
@@ -654,17 +681,22 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 		c.stats.addDisconnect()
 		if sd := cs.serverDisconnect.Load(); sd != nil {
 			c.stats.addServerDisconnect()
-			if c.cfg.OnServerDisconnect != nil {
-				c.cfg.OnServerDisconnect(*sd)
+			if fn := c.cfg.OnServerDisconnect; fn != nil {
+				info := *sd
+				c.events.post(func() { fn(info) })
 			}
 			c.redirect(ServerRedirect{Packet: DISCONNECT, Reason: sd.ReasonCode, Reference: sd.ServerReference})
 		}
 		c.cfg.Logger.Warn("mqttv5: connection lost", slog.String("broker", cs.brokerURL))
-		// OnConnectionDown's bool return decides whether to keep
-		// retrying. Nil callback defaults to "keep going".
+		// OnConnectionDown's answer decides whether to keep retrying;
+		// without the callback the supervisor keeps going.
 		keepRetrying := true
-		if c.cfg.OnConnectionDown != nil {
-			keepRetrying = c.cfg.OnConnectionDown()
+		if fn := c.cfg.OnConnectionDown; fn != nil {
+			c.events.post(func() { keepRetrying = fn() })
+			if !c.events.flush(life.shutdown) {
+				// The span ended while the callback ran.
+				return
+			}
 		}
 		if !keepRetrying {
 			// Caller wants no further reconnect attempts: end the span
@@ -700,6 +732,12 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 		case <-life.shutdown:
 			return false, attempt
 		}
+		// A callback may change the brokers, as OnServerDisconnect and
+		// OnServerRedirect may for a redirect: the attempt dials what
+		// the callbacks so far left.
+		if !c.events.flush(life.shutdown) {
+			return false, attempt
+		}
 
 		// Advance the URL pointer for this attempt. The first attempt
 		// after a drop already moves off the URL that just failed —
@@ -708,8 +746,11 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 		attempt++
 
 		brokerURL := c.nextBrokerURL()
-		if c.cfg.OnReconnectAttempt != nil {
-			c.cfg.OnReconnectAttempt(attempt, brokerURL)
+		if fn := c.cfg.OnReconnectAttempt; fn != nil {
+			c.events.post(func() { fn(attempt, brokerURL) })
+			if !c.events.flush(life.shutdown) {
+				return false, attempt
+			}
 		}
 
 		ctx, cancel := life.context(context.Background())
@@ -724,9 +765,7 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			}
 			c.stats.addConnectFailure()
 			c.redirectFrom(err)
-			if c.cfg.OnConnectError != nil {
-				c.cfg.OnConnectError(err)
-			}
+			c.connectError(err)
 			c.cfg.Logger.Warn("mqttv5: reconnect failed",
 				slog.String("broker", brokerURL),
 				slog.Int("attempt", attempt),

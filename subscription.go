@@ -1086,8 +1086,9 @@ func (c *Client) completeSubscribe(op *ctrlOp, codes []wire.ReasonCode, rejected
 
 func (c *Client) reportResubscribeError(sub *activeSub, err error) {
 	c.cfg.Logger.Warn("mqttv5: broker refused filters when re-subscribing", slog.Any("error", err))
-	if c.cfg.OnResubscribeError != nil {
-		c.cfg.OnResubscribeError(SubscriptionToken{client: c, sub: sub}, err)
+	if fn := c.cfg.OnResubscribeError; fn != nil {
+		token := SubscriptionToken{client: c, sub: sub}
+		c.events.post(func() { fn(token, err) })
 	}
 }
 

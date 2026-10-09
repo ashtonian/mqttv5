@@ -54,6 +54,8 @@ type Client struct {
 	startMu sync.Mutex
 	started bool
 	life    atomic.Pointer[lifecycle]
+	// events runs the lifecycle callbacks.
+	events events
 
 	// cur is the current live connection. Producers (Publish, Subscribe,
 	// etc.) load it atomically; nil means "not connected right now".
