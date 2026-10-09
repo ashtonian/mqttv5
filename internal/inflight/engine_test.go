@@ -432,6 +432,40 @@ func TestInboundAcksLeaveInArrivalOrder(t *testing.T) {
 	want(t, h.collect(), "PUBACK#1", "PUBACK#2", "PUBACK#3")
 }
 
+// The read loop sends the acknowledgements its input made ready itself
+// and leaves to the writer the PUBLISHes that a freed send quota lets
+// out.
+func TestCollectControlLeavesPublishes(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.connect(false, 1)
+	a := h.publish(1, "a")
+	b := h.publish(1, "b")
+	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", a.PacketID()))
+	wakes := h.link.wakes.Load()
+	in, _, _ := h.e.Receive(9, 1)
+	h.e.AckDeferred(in)
+	h.e.HandlePuback(a.PacketID(), 0, nil)
+	if control, publishes := h.e.Pending(); !control || !publishes {
+		t.Fatalf("Pending = %v, %v; want an acknowledgement and a PUBLISH", control, publishes)
+	}
+	var f Frames
+	if n := h.e.CollectControl(h.gen, &f); n != 1 {
+		t.Fatalf("CollectControl gave %d packets, want 1", n)
+	}
+	var buf bytes.Buffer
+	if _, err := f.WriteTo(&buf); err != nil {
+		t.Fatal(err)
+	}
+	want(t, decodeAll(t, buf.Bytes()), "PUBACK#9")
+	if control, publishes := h.e.Pending(); control || !publishes {
+		t.Fatalf("Pending = %v, %v; want only the PUBLISH", control, publishes)
+	}
+	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", b.PacketID()))
+	if n := h.link.wakes.Load() - wakes; n != 0 {
+		t.Fatalf("the writer was woken %d times for what the caller sends", n)
+	}
+}
+
 func TestInboundDuplicatesAreNotRedelivered(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.connect(false, 0)
@@ -569,9 +603,8 @@ func (s *blockingStore) Delete(ctx context.Context, k session.RecordKey) error {
 
 // headCtrlReady reports whether the next acknowledgement can be written.
 func (h *harness) headCtrlReady() bool {
-	h.e.mu.Lock()
-	defer h.e.mu.Unlock()
-	return len(h.e.ctrl) > 0 && h.e.readyLocked(&h.e.ctrl[0])
+	control, _ := h.e.Pending()
+	return control
 }
 
 func waitFor(t *testing.T, cond func() bool) {

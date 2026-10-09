@@ -489,6 +489,9 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		brokerURL:     r.url,
 		connectExpiry: r.connectExpiry,
 	}
+	if cs.direct {
+		cs.raw = newRawWriter(r.conn)
+	}
 	cs.writeFailed = func(err error) { c.handleConnError(cs, err) }
 	// Seed activity timestamps so the first PINGREQ fires KeepAlive
 	// seconds after handshake, not immediately.

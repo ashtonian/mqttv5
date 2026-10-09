@@ -52,6 +52,18 @@ func NewDecoderSize(r io.Reader, size int) *Decoder {
 	return &Decoder{br: bufio.NewReaderSize(r, size)}
 }
 
+// Ready reports whether a whole packet is buffered, so the next
+// ReadPacket returns without reading from the connection.
+func (d *Decoder) Ready() bool {
+	n := d.br.Buffered()
+	if n < 2 {
+		return false
+	}
+	hdr, _ := d.br.Peek(min(n, 1+maxVarintBytes))
+	size, k, err := DecodeVarint(hdr[1:])
+	return err == nil && n >= 1+k+int(size)
+}
+
 // SetLenient makes ReadPacket accept the violations that are harmless
 // in practice — a non-minimally encoded Remaining Length and reserved
 // flag bits on PINGRESP — reporting each to report instead of failing.

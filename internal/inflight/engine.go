@@ -655,27 +655,14 @@ func (e *Engine) Disconnected(l Link) {
 func (e *Engine) Collect(gen, upTo uint64, f *Frames) int {
 	var jobs []*job
 	e.mu.Lock()
-	if gen == 0 || gen != e.gen || e.failure != nil {
+	if !e.servesLocked(gen) {
 		e.mu.Unlock()
 		return 0
 	}
 	if upTo > e.released {
 		e.released = upTo
 	}
-	n := 0
-	for len(e.ctrl) > 0 && e.readyLocked(&e.ctrl[0]) {
-		c := e.ctrl[0]
-		f.appendAck(c.typ, c.id, c.rc)
-		if (c.typ == wire.PUBACK || c.typ == wire.PUBCOMP) && c.in != nil && e.in[c.id] == c.in {
-			delete(e.in, c.id)
-		}
-		e.ctrl[0] = ctrlFrame{}
-		e.ctrl = e.ctrl[1:]
-		n++
-	}
-	if len(e.ctrl) == 0 {
-		e.ctrl = e.ctrl[:0:0]
-	}
+	n := e.collectControlLocked(f)
 	sent := 0
 	var now time.Time
 	for o := e.cursor; o != nil && sent < maxPublishesPerCollect; o = e.cursor {
@@ -717,19 +704,82 @@ func (e *Engine) Collect(gen, upTo uint64, f *Frames) int {
 	return n + sent
 }
 
+// CollectControl is Collect for the ready acknowledgements and PUBRELs
+// alone.
+func (e *Engine) CollectControl(gen uint64, f *Frames) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.servesLocked(gen) {
+		return 0
+	}
+	return e.collectControlLocked(f)
+}
+
+// servesLocked reports whether a writer for connection gen may collect.
+func (e *Engine) servesLocked(gen uint64) bool {
+	return gen != 0 && gen == e.gen && e.failure == nil
+}
+
+func (e *Engine) collectControlLocked(f *Frames) int {
+	n := 0
+	for e.controlReadyLocked() {
+		c := e.ctrl[0]
+		f.appendAck(c.typ, c.id, c.rc)
+		if (c.typ == wire.PUBACK || c.typ == wire.PUBCOMP) && c.in != nil && e.in[c.id] == c.in {
+			delete(e.in, c.id)
+		}
+		e.ctrl[0] = ctrlFrame{}
+		e.ctrl = e.ctrl[1:]
+		n++
+	}
+	if len(e.ctrl) == 0 {
+		e.ctrl = e.ctrl[:0:0]
+	}
+	return n
+}
+
 // pushCtrlLocked queues an acknowledgement or PUBREL; see ctrlFrame for
 // gated and in.
 func (e *Engine) pushCtrlLocked(t wire.PacketType, id uint16, rc wire.ReasonCode, gated bool, in *In) {
 	e.ctrl = append(e.ctrl, ctrlFrame{typ: t, id: id, rc: rc, gated: gated, in: in})
 }
 
+// wake tells the writer to collect, when there is something to collect:
+// waking it for nothing costs two goroutine switches.
 func (e *Engine) wake() {
 	e.mu.Lock()
-	l := e.link
+	var l Link
+	if e.writableLocked() {
+		l = e.link
+	}
 	e.mu.Unlock()
 	if l != nil {
 		l.Wake()
 	}
+}
+
+// Pending reports what Collect would give now: control is a ready
+// acknowledgement or PUBREL, publishes a PUBLISH released to the writer,
+// stored, and within the send quota. The read loop, which handles the
+// broker's acknowledgements and its own acks without waking the writer,
+// checks it before it waits for more input.
+func (e *Engine) Pending() (control, publishes bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.controlReadyLocked(), e.publishReadyLocked()
+}
+
+func (e *Engine) writableLocked() bool {
+	return e.controlReadyLocked() || e.publishReadyLocked()
+}
+
+func (e *Engine) controlReadyLocked() bool {
+	return len(e.ctrl) > 0 && e.readyLocked(&e.ctrl[0])
+}
+
+func (e *Engine) publishReadyLocked() bool {
+	o := e.cursor
+	return o != nil && e.quota > 0 && o.seq <= e.released && e.storedLocked(outKey(o.id))
 }
 
 func (e *Engine) storeError(op string, err error) {

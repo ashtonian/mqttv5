@@ -168,3 +168,50 @@ func TestLargeBodyAllocation(t *testing.T) {
 		}
 	}
 }
+
+// chunkReader returns one chunk per Read.
+type chunkReader struct{ chunks [][]byte }
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[0])
+	r.chunks[0] = r.chunks[0][n:]
+	if len(r.chunks[0]) == 0 {
+		r.chunks = r.chunks[1:]
+	}
+	return n, nil
+}
+
+// Ready reports a whole buffered packet, and nothing less: not an empty
+// buffer, not part of a packet.
+func TestDecoderReady(t *testing.T) {
+	var frames [][]byte
+	for i := range 3 {
+		f, err := MarshalPublish(PublishOpts{Topic: "t", Payload: make([]byte, 200), QoS: 1, PacketID: uint16(i + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, f)
+	}
+	half := len(frames[2]) / 2
+	first := append(append(append([]byte(nil), frames[0]...), frames[1]...), frames[2][:half]...)
+	dec := NewDecoder(&chunkReader{chunks: [][]byte{first, frames[2][half:]}})
+	for i, want := range []bool{false, true, false, false} {
+		if got := dec.Ready(); got != want {
+			t.Fatalf("before read %d: Ready = %v, want %v", i, got, want)
+		}
+		if i == 3 {
+			break
+		}
+		p, err := dec.ReadPacket()
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if id := p.(*Publish).PacketID; id != uint16(i+1) {
+			t.Fatalf("read %d: packet %d", i, id)
+		}
+		p.Release()
+	}
+}

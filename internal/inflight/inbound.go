@@ -31,10 +31,11 @@ type In struct {
 
 // Receive registers an inbound QoS 1/2 PUBLISH. deliver is false for a
 // retransmission of a message already delivered: if it is a QoS 2
-// message whose PUBREC was queued, the PUBREC is sent again (§4.3.3).
-// ErrReceiveMaximumExceeded means the broker broke the client's Receive
-// Maximum; the caller must disconnect with reason 0x93. Nothing is
-// delivered once the session has failed.
+// message whose PUBREC was queued, the PUBREC is queued again for the
+// caller to send (§4.3.3; see Pending). ErrReceiveMaximumExceeded means
+// the broker broke the client's Receive Maximum; the caller must
+// disconnect with reason 0x93. Nothing is delivered once the session has
+// failed.
 func (e *Engine) Receive(id uint16, qos byte) (in *In, deliver bool, err error) {
 	e.mu.Lock()
 	if e.failure != nil {
@@ -42,14 +43,10 @@ func (e *Engine) Receive(id uint16, qos byte) (in *In, deliver bool, err error) 
 		return nil, false, nil
 	}
 	if x := e.in[id]; x != nil {
-		resend := x.state == inAwaitPubrel && qos == 2
-		if resend {
+		if x.state == inAwaitPubrel && qos == 2 {
 			e.pushCtrlLocked(wire.PUBREC, id, wire.ReasonSuccess, true, nil)
 		}
 		e.mu.Unlock()
-		if resend {
-			e.wake()
-		}
 		return nil, false, nil
 	}
 	if limit := int(e.cfg.ReceiveMaximum); limit > 0 && len(e.in) >= limit {
@@ -65,14 +62,26 @@ func (e *Engine) Receive(id uint16, qos byte) (in *In, deliver bool, err error) 
 
 // Ack records that the application is done with in. Acknowledgements go
 // to the broker in arrival order (§4.6): this queues the PUBACK / PUBREC
-// of every consecutive acked message at the head of the arrival order.
-// A QoS 2 message's PUBREC waits until its record is stored.
+// of every consecutive acked message at the head of the arrival order,
+// and wakes the writer. A QoS 2 message's PUBREC waits until its record
+// is stored.
 func (e *Engine) Ack(in *In) {
+	if e.ack(in) {
+		e.wake()
+	}
+}
+
+// AckDeferred is Ack for a caller that sends what it made ready itself
+// (see Pending), such as the read loop.
+func (e *Engine) AckDeferred(in *In) { e.ack(in) }
+
+// ack queues what acking in releases and reports whether anything was.
+func (e *Engine) ack(in *In) bool {
 	var jobs []*job
 	e.mu.Lock()
 	if in.dead || in.state != inDelivered {
 		e.mu.Unlock()
-		return
+		return false
 	}
 	in.state = inAcked
 	n := 0
@@ -103,16 +112,17 @@ func (e *Engine) Ack(in *In) {
 	}
 	e.mu.Unlock()
 	if n == 0 {
-		return
+		return false
 	}
 	e.start(jobs...)
-	e.wake()
+	return true
 }
 
 // HandlePubrel completes an inbound QoS 2 flow: its record is deleted,
-// then PUBCOMP is sent. A PUBREL for an identifier with no PUBREC sent
-// is answered with PUBCOMP 0x92 (§4.3.3); one repeated while the PUBCOMP
-// is still queued is answered by that PUBCOMP.
+// then the caller sends PUBCOMP (see Pending). A PUBREL for an
+// identifier with no PUBREC sent is answered with PUBCOMP 0x92 (§4.3.3);
+// one repeated while the PUBCOMP is still queued is answered by that
+// PUBCOMP.
 func (e *Engine) HandlePubrel(id uint16) {
 	var j *job
 	e.mu.Lock()
@@ -138,5 +148,4 @@ func (e *Engine) HandlePubrel(id uint16) {
 	}
 	e.mu.Unlock()
 	e.start(j)
-	e.wake()
 }

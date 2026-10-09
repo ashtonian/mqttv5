@@ -220,7 +220,9 @@ func (e *Engine) Adopt(ref []byte, settle func(context.Context, error) error) bo
 }
 
 // HandlePuback applies a PUBACK with reason code rc. refused is non-nil
-// when rc is 0x80 or above and becomes the publish's error.
+// when rc is 0x80 or above and becomes the publish's error. The caller
+// sends what it makes ready, the send quota it frees included (see
+// Pending).
 func (e *Engine) HandlePuback(id uint16, rc wire.ReasonCode, refused error) {
 	e.mu.Lock()
 	if e.failure != nil {
@@ -242,7 +244,6 @@ func (e *Engine) HandlePuback(id uint16, rc wire.ReasonCode, refused error) {
 	j := e.retireLocked(o)
 	e.mu.Unlock()
 	e.start(j)
-	e.wake()
 }
 
 // HandlePubrec applies a PUBREC with reason code rc. A refusal (refused
@@ -250,6 +251,7 @@ func (e *Engine) HandlePuback(id uint16, rc wire.ReasonCode, refused error) {
 // AwaitPubcomp and queues the PUBREL, which waits until that phase is
 // stored. A PUBREC for a flow already at AwaitPubcomp is answered with
 // another PUBREL, and one for an unknown identifier with PUBREL 0x92.
+// The caller sends what it makes ready (see Pending).
 func (e *Engine) HandlePubrec(id uint16, rc wire.ReasonCode, refused error) {
 	var j *job
 	e.mu.Lock()
@@ -284,12 +286,11 @@ func (e *Engine) HandlePubrec(id uint16, rc wire.ReasonCode, refused error) {
 	}
 	e.mu.Unlock()
 	e.start(j)
-	e.wake()
 }
 
 // HandlePubcomp applies a PUBCOMP, completing a flow at AwaitPubcomp.
 // Reason 0x92 means the broker had already finished the exchange, so it
-// is not an error.
+// is not an error. The caller sends what it makes ready (see Pending).
 func (e *Engine) HandlePubcomp(id uint16) {
 	e.mu.Lock()
 	if e.failure != nil {
@@ -308,7 +309,6 @@ func (e *Engine) HandlePubcomp(id uint16) {
 	j := e.retireLocked(o)
 	e.mu.Unlock()
 	e.start(j)
-	e.wake()
 }
 
 // finishLocked completes o with err. Its record and packet identifier

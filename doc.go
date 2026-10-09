@@ -147,7 +147,10 @@
 // overlap, and on TLS and WebSocket connections, a second goroutine
 // drains a many-producer-single-consumer write channel and coalesces
 // the queued packets, so they do not take turns on a write lock around
-// [net.Conn.Write]. [WithPublisherPool] runs N such connections, each
+// [net.Conn.Write]. On unix systems the reader writes the
+// acknowledgements it owes itself when the connection is idle, as far
+// as the socket takes them without waiting, and leaves the rest to the
+// writer goroutine. [WithPublisherPool] runs N such connections, each
 // with its own writer goroutine, so publishing is not limited to one
 // connection's writer.
 //

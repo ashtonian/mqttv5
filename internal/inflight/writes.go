@@ -151,7 +151,11 @@ func (e *Engine) run(j *job) {
 		if failure != nil {
 			dropped, first = e.failLocked(failure)
 		}
-		l := e.link
+		// A write may have made a gated frame or a PUBLISH ready.
+		var l Link
+		if e.writableLocked() {
+			l = e.link
+		}
 		e.mu.Unlock()
 
 		if first {

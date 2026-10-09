@@ -219,16 +219,17 @@ func (cfg subscribeConfig) zeroCopyDelivery() bool { return cfg.zeroCopy && !cfg
 // chanDeliver hands each message, converted by wrap, to ch without
 // blocking the read loop: when ch is full the message is dropped and
 // acked. wrap returning false drops and acks the message too (it
-// reports why itself).
+// reports why itself). Like every delivery function, it runs on the
+// read loop.
 func chanDeliver[T any](c *Client, cfg subscribeConfig, ch chan<- T, wrap func(*Message) (T, bool)) HandlerFunc {
 	return func(m *Message) {
 		v, ok := wrap(m)
 		if !ok {
-			_ = m.Ack()
+			m.ackOnReader()
 			return
 		}
 		if cfg.autoAck {
-			_ = m.Ack()
+			m.ackOnReader()
 		}
 		select {
 		case ch <- v:
@@ -245,11 +246,11 @@ func queueDeliver[T any](c *Client, cfg subscribeConfig, q *Queue[T], wrap func(
 	return func(m *Message) {
 		v, ok := wrap(m)
 		if !ok {
-			_ = m.Ack()
+			m.ackOnReader()
 			return
 		}
 		if cfg.autoAck {
-			_ = m.Ack()
+			m.ackOnReader()
 		}
 		evicted, wasEvicted, accepted := q.push(v, cfg.maxQueueSize, cfg.dropPolicy == DropOldest)
 		if wasEvicted {
@@ -267,7 +268,7 @@ func (c *Client) dropInbound(cfg subscribeConfig, m *Message) {
 	if cfg.onDrop != nil {
 		cfg.onDrop(m)
 	}
-	_ = m.Ack()
+	m.ackOnReader()
 }
 
 // SubscribeCallback registers a subscription that invokes h for every
@@ -294,7 +295,7 @@ func (c *Client) SubscribeCallback(ctx context.Context, filters []TopicFilter, h
 	r := &route{zeroCopy: cfg.zeroCopy, sync: true}
 	r.deliver = func(m *Message) {
 		h(m)
-		_ = m.Ack()
+		m.ackOnReader()
 	}
 	return c.subscribe(ctx, filters, r, nil)
 }

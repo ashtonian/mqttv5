@@ -14,10 +14,14 @@ import (
 	"github.com/ashtonian/mqttv5/wire"
 )
 
-// readLoop drives the decoder for one connection.
+// readLoop drives the decoder for one connection. Before it waits for
+// more input it sends what the packets read so far made ready.
 func (c *Client) readLoop(cs *connState) {
 	defer cs.wg.Done()
 	for {
+		if !cs.decoder.Ready() {
+			c.sendReady(cs)
+		}
 		pkt, err := cs.decoder.ReadPacket()
 		if perr := decodeViolation(err); perr != nil {
 			c.protocolViolation(cs, perr)
@@ -30,6 +34,27 @@ func (c *Client) readLoop(cs *connState) {
 		cs.lastReadUnixNano.Store(cs.clk.Now().UnixNano())
 		cs.reads.Add(1)
 		c.dispatch(cs, pkt)
+	}
+}
+
+// sendReady sends what the packets read so far made ready. The broker's
+// acknowledgements and the read loop's own acks queue it without waking
+// the writer goroutine. The read loop writes the acknowledgements and
+// PUBRELs itself when the connection is idle, in one write and without
+// the two goroutine switches a hand-off costs; the writer takes them
+// when it is busy already, and always takes the PUBLISHes a freed send
+// quota lets out, so payloads never hold up reading.
+func (c *Client) sendReady(cs *connState) {
+	control, publishes := c.engine.Pending()
+	if control && cs.raw != nil && cs.acquireIdle() {
+		// A write error ends the connection, which the read loop sees
+		// on its next read.
+		_ = cs.flushControl()
+		cs.wmu.Unlock()
+		control = false
+	}
+	if control || publishes {
+		cs.Wake()
 	}
 }
 
@@ -160,7 +185,7 @@ func (c *Client) handlePublish(cs *connState, pub *wire.Publish) {
 
 	if first == nil {
 		if in != nil {
-			c.engine.Ack(in)
+			c.engine.AckDeferred(in)
 		}
 		pub.Release()
 		return

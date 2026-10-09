@@ -61,6 +61,10 @@ type connState struct {
 	hdr    []byte
 	vec    net.Buffers
 	rest   []byte
+	// raw, set on a direct connection where the platform allows it,
+	// writes without waiting for room in the socket (see flushControl).
+	// It is guarded by wmu.
+	raw *rawWriter
 	// engine is the client's session engine; flushEngine collects from
 	// it. writeFailed reports a failed direct write, which ends the
 	// connection like a failed write on the writer goroutine.
@@ -271,6 +275,34 @@ func (cs *connState) flushEngine(ctx context.Context, upTo uint64) (started bool
 		if err != nil {
 			return started, err
 		}
+	}
+}
+
+// flushControl writes the session engine's ready acknowledgements and
+// PUBRELs on the read loop; the caller holds wmu and cs.raw is set. It
+// writes what the socket takes without waiting and hands the rest to the
+// writer goroutine: the broker may be waiting for the client to read
+// before it reads in turn. A write error ends the connection.
+func (cs *connState) flushControl() error {
+	defer cs.frames.Reset()
+	for {
+		cs.frames.Reset()
+		if cs.engine.CollectControl(cs.gen.Load(), &cs.frames) == 0 {
+			return nil
+		}
+		for bufs := cs.frames.Buffers(); len(bufs) > 0; bufs = bufs[1:] {
+			n, err := cs.raw.tryWrite(bufs[0])
+			if err != nil {
+				_, err = cs.wrote(err)
+				return err
+			}
+			if n < len(bufs[0]) {
+				bufs[0] = bufs[0][n:]
+				cs.handOff(bufs)
+				return nil
+			}
+		}
+		_, _ = cs.wrote(nil)
 	}
 }
 

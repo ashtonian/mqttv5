@@ -619,19 +619,20 @@ With 10,000 subscriptions that do not match the message:
   goroutine, which writes them together; with 8 or 64 publishers mqttv5
   uses less CPU per message, while autopaho's publishers each write and
   contend on its write lock.
-- **The read loop does not write MQTT packets.** Acknowledgements the
-  client owes — PUBACK and PUBREC for received messages, the PUBREL that
-  answers a PUBREC — are handed from the read loop to the writer
-  goroutine, so a full send buffer does not stop the client reading.
-  (Two things still can: a callback subscriber holds the read loop while
-  its callback runs, and over WebSocket the transport answers pings and
-  close frames from its read path.) The hand-off costs a writer wake-up
-  per PUBREL, the likeliest reason a QoS 2 publish of a small message
-  costs a little more CPU than autopaho's (1.6% at 64 bytes, 2.7% at
-  1 KiB), which writes PUBREL from its read loop; the profiles show the
-  wake-ups but do not isolate their share.
-  Acknowledgements that pile up go out together, which the receive
-  tables show as lower CPU per QoS 1 message than the Paho clients'.
+- **The read loop sends the acknowledgements it owes.** PUBACK and
+  PUBREC for received messages, the PUBREL that answers a PUBREC and the
+  PUBCOMP that answers a PUBREL: before the read loop waits for more
+  input, it writes those that are ready itself on an idle TCP or Unix
+  connection, so a QoS 2 exchange wakes no writer goroutine. The write
+  never waits for room in the socket — what the socket does not take
+  goes to the writer goroutine, so a full send buffer does not stop the
+  client reading — and sets no write deadline, whose timer would wake a
+  runtime thread each time. (Two things can still stop reading: a
+  callback subscriber holds the read loop while its callback runs, and
+  over WebSocket the transport answers pings and close frames from its
+  read path.) Acknowledgements that pile up while the read loop works
+  through a burst go out together, which the receive tables show as
+  lower CPU per QoS 1 message than the Paho clients'.
 - **Receiving through the broker measures the broker too.** At QoS 0
   mosquitto — one thread, in a VM on the same machine — can be the
   slowest stage, and its pace varies with how busy the host is. The

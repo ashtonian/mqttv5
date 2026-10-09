@@ -50,8 +50,17 @@ func (m *Message) Ack() error {
 	if m.d == nil || !m.acked.CompareAndSwap(false, true) {
 		return nil
 	}
-	m.d.release()
+	m.d.release(false)
 	return nil
+}
+
+// ackOnReader acks m on the read loop, which sends the acknowledgement
+// itself before it next waits for the broker (see Client.sendReady).
+func (m *Message) ackOnReader() {
+	if m.d == nil || !m.acked.CompareAndSwap(false, true) {
+		return
+	}
+	m.d.release(true)
 }
 
 // CloneTopic returns a copy of Topic. Only needed on zero-copy
@@ -73,11 +82,18 @@ type delivery struct {
 	first  Message       // the first handler's handle, saving one allocation
 }
 
-func (d *delivery) release() {
+// release drops one handle; the last queues the broker acknowledgement.
+// onReader means the read loop is releasing it and sends the
+// acknowledgement itself.
+func (d *delivery) release(onReader bool) {
 	if d.refs.Add(-1) != 0 {
 		return
 	}
-	if d.in != nil {
+	switch {
+	case d.in == nil:
+	case onReader:
+		d.client.engine.AckDeferred(d.in)
+	default:
 		d.client.engine.Ack(d.in)
 	}
 	if d.frame != nil {
@@ -140,16 +156,16 @@ type route struct {
 }
 
 // dispatch hands m to the subscription unless it has been closed, in which
-// case m is acked so the broker isn't left waiting. Channel and queue sends
-// happen under the read lock, so close can never race a send on a closed
-// channel.
+// case m is acked so the broker isn't left waiting. It runs on the read
+// loop. Channel and queue sends happen under the read lock, so close can
+// never race a send on a closed channel.
 func (r *route) dispatch(m *Message) {
 	if r.sync {
 		r.mu.RLock()
 		closed := r.closed
 		r.mu.RUnlock()
 		if closed {
-			_ = m.Ack()
+			m.ackOnReader()
 			return
 		}
 		r.deliver(m)
@@ -158,7 +174,7 @@ func (r *route) dispatch(m *Message) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
-		_ = m.Ack()
+		m.ackOnReader()
 		return
 	}
 	r.deliver(m)

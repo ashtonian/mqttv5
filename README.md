@@ -1445,9 +1445,13 @@ fire-and-forget QoS 0 — one writer goroutine per connection drains an
 MPSC channel of encoded packets to the socket, coalescing queued
 packets into one `writev` when `WithWriteBatch` is set; a write lock
 keeps the two paths from interleaving, and a publish never overtakes a
-packet its caller queued earlier. A supervisor goroutine owns the
-connection lifecycle: reconnect with backoff, session resumption, and
-re-issuing subscriptions.
+packet its caller queued earlier. Before the read loop waits for more
+input, it writes the acknowledgements and PUBRELs it has made ready
+itself — on an idle TCP or Unix connection, on unix systems — as far as
+the socket takes them without waiting; the writer goroutine sends the
+rest, so a broker that stops reading never stops the client reading. A
+supervisor goroutine owns the connection lifecycle: reconnect with
+backoff, session resumption, and re-issuing subscriptions.
 
 **Frames.** The decoder reads through a `WithReadBufferSize` window
 (16 KiB). A body up to 64 KiB goes into a pooled frame from one of five
