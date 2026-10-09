@@ -1,7 +1,6 @@
 # mqttv5
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/ashtonian/mqttv5.svg)](https://pkg.go.dev/github.com/ashtonian/mqttv5)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ashtonian/mqttv5)](https://goreportcard.com/report/github.com/ashtonian/mqttv5)
 [![CI](https://github.com/ashtonian/mqttv5/actions/workflows/ci.yml/badge.svg)](https://github.com/ashtonian/mqttv5/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
