@@ -141,10 +141,9 @@ func TestConnect_AUTHWithoutAuthenticator(t *testing.T) {
 	}
 }
 
-// doneTrueAuth is an Authenticator whose Continue reports done=true. It
-// guards the regression where a done=true return made the client emit a
-// spec-violating AUTH 0x00 instead of 0x18 Continue (§3.15.2.1 — only the
-// server concludes the exchange).
+// doneTrueAuth is an Authenticator whose Continue reports done=true. The
+// client still answers with AUTH 0x18 Continue, never 0x00: only the
+// server concludes the exchange (§3.15.2.1).
 type doneTrueAuth struct {
 	steps atomic.Int32
 }

@@ -111,7 +111,6 @@ carry over to other hardware. Measure on your own hardware with
 | `(*Queue).Enqueue / Peek / Ack / Len / Close` | The `mqttv5.PublisherQueue` contract; Enqueue and Ack are durable per the sync policy when they return. |
 | `(*Queue).Path() string` | Path of `queue.db`. |
 | `(*Queue).Corrupt() []error` | Entries quarantined since `Open`, each wrapping `ErrCorrupt`. |
-| `ImportV010(ctx, q, dir) (int, error)` | Moves the entries of a v0.10 queue directory into `q`, oldest first, deleting each file once stored; safe to re-run after an interruption. |
 | `ErrLocked`, `ErrCorrupt` | Sentinels for `errors.Is`. After `Close`, calls return `mqttv5.ErrQueueClosed`. |
 | `FileName` | `"queue.db"`. |
 
@@ -167,18 +166,6 @@ if they are sensitive. No credentials are stored.
 | File | Contents |
 |---|---|
 | `queue.go` | `Open`, options, the `PublisherQueue` implementation, entry encoding, quarantine. |
-| `legacy.go` | `ImportV010` for v0.10 queue directories. |
 | `queue_test.go` | Conformance suite per sync policy, lock, quarantine, `BenchmarkLen`, `BenchmarkEnqueue`. |
 | `crash_test.go` | Kill-and-restart test with a child process, a `QueuePublisher` and a `store/file` session. |
 | `../../internal/filedb` | Opening under the file lock, the group committer, CRC32C sealing (shared with `store/file`). |
-
-## Upgrading from v0.10
-
-v0.10 stored one gob-encoded `.qent` file per entry in the directory.
-To carry such a backlog over, open the new queue in another directory and
-call `ImportV010(ctx, q, oldDir)` before starting the `QueuePublisher`.
-Each entry gets a new ID; a Message Expiry Interval becomes an expiry
-counted from the original enqueue time. v0.10 had already lost an
-explicit Message Expiry Interval of 0 when it wrote the file, so those
-entries come back without expiry. The `PublisherQueue` interface also
-changed; see the migration guide.

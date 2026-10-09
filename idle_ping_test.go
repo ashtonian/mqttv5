@@ -219,7 +219,7 @@ func TestKeepAliveBusyConnectionSendsNoPing(t *testing.T) {
 
 // Any inbound packet after a PINGREQ proves the broker alive: a stream of
 // PUBLISHes whose PINGRESPs are stuck behind the backlog must not tear
-// the connection down (estavelle RFC 0009 regression).
+// the connection down.
 func TestKeepAliveInboundTrafficCountsAsAnswer(t *testing.T) {
 	h := newPingHarness(t, 2*time.Second, time.Second)
 	h.answer = false

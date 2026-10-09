@@ -131,8 +131,7 @@ func TestCorruptEntriesAreQuarantined(t *testing.T) {
 	}
 }
 
-// Len is constant-time; v0.10 listed the directory, 155 ms at 50,000
-// entries.
+// Len is constant-time.
 func BenchmarkLen(b *testing.B) {
 	q, err := Open(b.TempDir(), WithSyncPolicy(SyncNone))
 	if err != nil {

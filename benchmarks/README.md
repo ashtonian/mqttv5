@@ -610,15 +610,13 @@ With 10,000 subscriptions that do not match the message:
   can show the same ns/op while one spends several times the CPU;
   `cpu-ns/op` shows that.
 - **A publish that waits for its write writes it itself when the
-  connection is idle.** Until 2026-10-08 every `Publish` handed its
-  packet to the connection's writer goroutine, and a single goroutine
-  publishing QoS 0 spent half or more of its CPU in the scheduler
-  parking and waking threads for that hand-off
-  in CPU profiles of `E2E_Publish/qos=0/size=64B`. Now, on a TCP
-  connection with nothing queued, the caller writes the packet itself —
-  a QoS 0 header and its payload in one `writev` — and the profile is
-  the write syscall and the poller, as autopaho's is. If the caller's ctx
-  ends during such a write, the writer goroutine finishes the packet.
+  connection is idle.** On a TCP connection with nothing queued, the
+  caller writes the packet — a QoS 0 header and its payload in one
+  `writev` — so a single publisher's CPU profile
+  (`E2E_Publish/qos=0/size=64B`) is the write syscall and the poller, as
+  autopaho's is, not the scheduler parking and waking a writer
+  goroutine for each packet. If the caller's ctx ends during such a
+  write, the writer goroutine finishes the packet.
   Concurrent publishers still leave their packets to the writer
   goroutine, which writes them together; with 8 or 64 publishers mqttv5
   uses less CPU per message, while autopaho's publishers each write and

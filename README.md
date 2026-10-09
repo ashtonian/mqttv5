@@ -1538,18 +1538,13 @@ go -C benchmarks run ./cmd/benchtab README.md ../README.md
   options, `Stats`, and its own value types (`PublishOptions`,
   `TopicFilter`, `Message` and `Properties`, `ConnackInfo`,
   `DisconnectInfo`, `WillOptions`, `ConnectOptions`,
-  `DisconnectOptions`, `ServerRedirect`, results and errors). Breaking
-  changes are called out in release notes with a mapping
-  ([MIGRATING-0.11.md](docs/MIGRATING-0.11.md) for v0.11).
+  `DisconnectOptions`, `ServerRedirect`, results and errors. Before
+  v1.0, any minor release may change it.
 - `ReasonCode`, `PacketType` and `UserProperty` are the protocol's own
   values, shared with the codec.
 - Sentinel errors above are stable; branch on them with `errors.Is`.
 - Submodules have their own `go.mod` and are tagged with the core at
   every release; use matching versions ([Install](#install--submodules)).
-- v0.10.1 and earlier mishandle QoS 1/2 session resumption, CONNACK
-  limits and message lifetime; v0.11.0 fixes them
-  ([MIGRATING-0.11.md](docs/MIGRATING-0.11.md) lists the behaviour
-  changes).
 - `wire` is the codec underneath, exported for tools, brokers-in-tests
   and storage formats but **not covered by the stability promise**:
   its types may change in any release. The client API never requires

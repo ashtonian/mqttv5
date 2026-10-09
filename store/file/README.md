@@ -164,10 +164,3 @@ are sensitive. No credentials are stored.
 | `store_test.go` | Conformance suite for each sync policy, lock, corruption, closed-store tests. |
 | `crash_test.go` | Kill-and-resume test with a child process. |
 | `bench_test.go` | `BenchmarkPut` per sync policy and writer count. |
-
-## Upgrading from v0.10
-
-Earlier versions wrote an `outbound/` and `inbound/` directory of
-individual files that the client never read back. They are ignored; you
-may delete them. The `session.Store` interface itself changed; see the
-migration guide.
