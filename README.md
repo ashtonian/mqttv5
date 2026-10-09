@@ -25,18 +25,18 @@ Requires Go 1.26 or later. Licensed under [Apache 2.0](LICENSE).
 
 ## Contents
 
-- **Start:** [Quick start](#quick-start) · [Modules](#modules) ·
-  [Examples](#examples) · [Why mqttv5](#why-mqttv5)
+- **Start:** [Quick start](#quick-start) · [Why mqttv5](#why-mqttv5) ·
+  [Examples](#examples) · [Modules](#modules)
 - **Guide:** [Publishing](#publishing) · [Subscribing](#subscribing) ·
   [Typed publish / subscribe](#typed-publish--subscribe) ·
   [Durable publishing](#durable-publishing-with-queuepublisher) ·
-  [Multiple brokers](#multiple-brokers) · [WebSocket](#websocket) ·
-  [Authentication](#authentication) · [Disconnecting](#disconnecting)
+  [Authentication](#authentication) · [WebSocket](#websocket) ·
+  [Multiple brokers](#multiple-brokers) · [Disconnecting](#disconnecting)
 - **Reference:** [Options](#options) · [Errors](#errors) ·
-  [Reliability semantics](#reliability-semantics)
-- **Running it:** [Operations](#operations) · [Security](#security) ·
+  [Reliability semantics](#reliability-semantics) ·
   [Performance](#performance)
-- **Internals:** [Architecture](#architecture) · [Code map](#code-map) ·
+- **Operating:** [Operations](#operations) · [Security](#security)
+- **Contributing:** [Architecture](#architecture) · [Code map](#code-map) ·
   [External dependencies](#external-dependencies) ·
   [Build and test](#build-and-test)
 - **Project:** [Stability](#stability) · [Independence](#independence) ·
@@ -98,56 +98,6 @@ go -C examples run ./readme/quickstart
 
 ---
 
-## Modules
-
-The core uses the standard library only. Each optional submodule has
-its own `go.mod`, so the core never pulls in its dependencies.
-
-| Submodule | Import | Purpose |
-|---|---|---|
-| core | `github.com/ashtonian/mqttv5` | Client, supervisor, options, in-memory queue |
-| JSON codec | `github.com/ashtonian/mqttv5/codec/json` | `Codec[T]` for `Typed[T]` (stdlib only) |
-| msgpack codec | `github.com/ashtonian/mqttv5/codec/msgpack` | `Codec[T]` via `vmihailenco/msgpack/v5` |
-| File session store | `github.com/ashtonian/mqttv5/store/file` | Crash-safe in-flight QoS 1/2 state |
-| File publish queue | `github.com/ashtonian/mqttv5/queue/file` | Crash-safe outbound publish queue for `QueuePublisher` |
-| WebSocket transport | `github.com/ashtonian/mqttv5/transport/ws` | ws:// and wss:// — `WithDialFunc(ws.DialFunc(ws.DialOpts{...}))` |
-
-Every module is released with the same version tag (`store/file/v0.11.0`
-alongside `v0.11.0`); install a submodule at the version of the core you
-use:
-
-```bash
-go get github.com/ashtonian/mqttv5@v0.11.0 github.com/ashtonian/mqttv5/store/file@v0.11.0
-```
-
-`store/file` and `queue/file` bring in `internal/filedb`, the bbolt layer
-they share, at the same version.
-
----
-
-## Examples
-
-[`examples/`](examples/) is one module of runnable programs. Each reads
-the broker from `MQTT_BROKER` (default `mqtt://127.0.0.1:1883`):
-
-| Path | Shows |
-|---|---|
-| [`examples/basic`](examples/basic) | Connect, channel subscribe, publish |
-| [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
-| [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
-| [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
-| [`examples/ws`](examples/ws) | WebSocket transport — `WithDialFunc(ws.DialFunc(opts))` |
-| [`examples/stats`](examples/stats) | `Client.Stats()` snapshot — bridge into Prometheus / OTel / expvar |
-| [`examples/oauth`](examples/oauth) | `WithConnectPacketBuilder` rotating an OAuth bearer per CONNECT |
-| [`examples/disconnect`](examples/disconnect) | `DisconnectWith` carrying ReasonCode + ReasonString + SessionExpiry override |
-
-```bash
-docker run -d -p 1883:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf
-go -C examples run ./basic
-```
-
----
-
 ## Why mqttv5
 
 Compared with [eclipse/paho.golang](https://github.com/eclipse/paho.golang)
@@ -186,6 +136,56 @@ supervisor:
   CE, including one that announces tight CONNACK limits.
 - **WebSocket without a core dependency.** `transport/ws` plugs in
   through `WithDialFunc` ([WebSocket](#websocket)).
+
+---
+
+## Examples
+
+[`examples/`](examples/) is one module of runnable programs. Each reads
+the broker from `MQTT_BROKER` (default `mqtt://127.0.0.1:1883`):
+
+| Path | Shows |
+|---|---|
+| [`examples/basic`](examples/basic) | Connect, channel subscribe, publish |
+| [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
+| [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
+| [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
+| [`examples/ws`](examples/ws) | WebSocket transport — `WithDialFunc(ws.DialFunc(opts))` |
+| [`examples/stats`](examples/stats) | `Client.Stats()` snapshot — bridge into Prometheus / OTel / expvar |
+| [`examples/oauth`](examples/oauth) | `WithConnectPacketBuilder` rotating an OAuth bearer per CONNECT |
+| [`examples/disconnect`](examples/disconnect) | `DisconnectWith` carrying ReasonCode + ReasonString + SessionExpiry override |
+
+```bash
+docker run -d -p 1883:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf
+go -C examples run ./basic
+```
+
+---
+
+## Modules
+
+The core uses the standard library only. Each optional submodule has
+its own `go.mod`, so the core never pulls in its dependencies.
+
+| Submodule | Import | Purpose |
+|---|---|---|
+| core | `github.com/ashtonian/mqttv5` | Client, supervisor, options, in-memory queue |
+| JSON codec | `github.com/ashtonian/mqttv5/codec/json` | `Codec[T]` for `Typed[T]` (stdlib only) |
+| msgpack codec | `github.com/ashtonian/mqttv5/codec/msgpack` | `Codec[T]` via `vmihailenco/msgpack/v5` |
+| File session store | `github.com/ashtonian/mqttv5/store/file` | Crash-safe in-flight QoS 1/2 state |
+| File publish queue | `github.com/ashtonian/mqttv5/queue/file` | Crash-safe outbound publish queue for `QueuePublisher` |
+| WebSocket transport | `github.com/ashtonian/mqttv5/transport/ws` | ws:// and wss:// — `WithDialFunc(ws.DialFunc(ws.DialOpts{...}))` |
+
+Every module is released with the same version tag (`store/file/v0.11.0`
+alongside `v0.11.0`); install a submodule at the version of the core you
+use:
+
+```bash
+go get github.com/ashtonian/mqttv5@v0.11.0 github.com/ashtonian/mqttv5/store/file@v0.11.0
+```
+
+`store/file` and `queue/file` bring in `internal/filedb`, the bbolt layer
+they share, at the same version.
 
 ---
 
@@ -423,6 +423,102 @@ contract with `github.com/ashtonian/mqttv5/queuetest`.
 
 ---
 
+## Authentication
+
+`WithCredentials(user, pass)` sends a fixed username and password.
+For credentials that change, rotate them per connection attempt or
+re-authenticate the live connection; `WithAuthenticator` adds MQTT v5
+enhanced authentication (challenge/response such as SCRAM).
+
+### Credentials per connection attempt
+
+`WithConnectPacketBuilder(fn)` runs immediately before each CONNECT is
+serialised. Use it to refresh an OAuth token, fetch a SigV4-signed
+CONNECT credential, or rotate any other per-attempt secret. The context
+is bounded by `ConnectTimeout`.
+
+```go
+mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOptions) error {
+    tok, err := oauth.FetchToken(ctx)
+    if err != nil {
+        return err // fails this attempt; supervisor retries after backoff
+    }
+    opts.Username = "service-account"
+    opts.Password = []byte(tok)
+    return nil
+}),
+```
+
+`WithOnConnectError` reports each failed attempt with its error. See
+[`examples/oauth`](examples/oauth).
+
+### Re-authentication without reconnecting
+
+`Client.Reauthenticate(ctx)` drives MQTT v5 re-authentication ([§4.12]) on
+the *live* connection — no reconnect, no QoS-state churn:
+
+1. Sends an AUTH `0x19` carrying a fresh `Authenticator.Begin(ctx)` payload.
+2. Services any broker challenges via `Continue`.
+3. Returns when the broker concludes with `0x00` Success.
+
+Use it on a long-lived connection whose bearer token (OAuth, JWT)
+expires: start a timer from the token's lifetime and call
+`Reauthenticate` ahead of expiry.
+
+```go
+// e.g. 30s before the JWT `exp`:
+if err := cli.Reauthenticate(ctx); err != nil {
+    // ErrReauthRejected → broker refused the new credential;
+    // the supervisor is already reconnecting with a fresh CONNECT.
+}
+```
+
+Behaviour:
+
+- `ctx` bounds the whole operation, including the token fetch in `Begin`.
+- Calls are single-flighted per connection.
+- A broker rejection returns `ErrReauthRejected` and tears the
+  connection down, so the supervisor reconnects through the normal
+  CONNECT path.
+- `WithOnReauthenticated` observes every successful refresh in one
+  place.
+
+### Mutual authentication
+
+For mechanisms with mutual authentication (e.g. SCRAM), an
+`Authenticator` may also implement the optional `ServerFinalVerifier`
+interface (`VerifyServerFinal([]byte) error`).
+
+The client hands it the server's concluding `AuthenticationData` — the
+CONNACK on connect, the AUTH `0x00` on re-auth — so it can verify the
+server proved knowledge of the credential.
+
+A verification failure aborts the connect, or fails `Reauthenticate`
+and tears the connection down.
+
+---
+
+## WebSocket
+
+```go
+import (
+    "github.com/ashtonian/mqttv5"
+    "github.com/ashtonian/mqttv5/transport/ws"
+)
+
+cli, _ := mqttv5.New(
+    mqttv5.WithBroker("wss://broker.example.com/mqtt"),
+    mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg})),
+)
+```
+
+Without `TLSConfig`, `wss://` verifies the broker against the system
+roots with the URL's host as server name, the same default as
+`mqtts://`. `ws://` and `wss://` URLs need `WithDialFunc`; `New` rejects
+them otherwise.
+
+---
+
 ## Multiple brokers
 
 Three patterns, each its own API:
@@ -567,102 +663,6 @@ ordering. A group is used once: after `Disconnect` its methods return
 
 Use `g.Members()` or `g.Member(name)` for direct per-member access
 (per-member `Stats()`, etc.).
-
----
-
-## WebSocket
-
-```go
-import (
-    "github.com/ashtonian/mqttv5"
-    "github.com/ashtonian/mqttv5/transport/ws"
-)
-
-cli, _ := mqttv5.New(
-    mqttv5.WithBroker("wss://broker.example.com/mqtt"),
-    mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg})),
-)
-```
-
-Without `TLSConfig`, `wss://` verifies the broker against the system
-roots with the URL's host as server name, the same default as
-`mqtts://`. `ws://` and `wss://` URLs need `WithDialFunc`; `New` rejects
-them otherwise.
-
----
-
-## Authentication
-
-`WithCredentials(user, pass)` sends a fixed username and password.
-For credentials that change, rotate them per connection attempt or
-re-authenticate the live connection; `WithAuthenticator` adds MQTT v5
-enhanced authentication (challenge/response such as SCRAM).
-
-### Credentials per connection attempt
-
-`WithConnectPacketBuilder(fn)` runs immediately before each CONNECT is
-serialised. Use it to refresh an OAuth token, fetch a SigV4-signed
-CONNECT credential, or rotate any other per-attempt secret. The context
-is bounded by `ConnectTimeout`.
-
-```go
-mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOptions) error {
-    tok, err := oauth.FetchToken(ctx)
-    if err != nil {
-        return err // fails this attempt; supervisor retries after backoff
-    }
-    opts.Username = "service-account"
-    opts.Password = []byte(tok)
-    return nil
-}),
-```
-
-`WithOnConnectError` reports each failed attempt with its error. See
-[`examples/oauth`](examples/oauth).
-
-### Re-authentication without reconnecting
-
-`Client.Reauthenticate(ctx)` drives MQTT v5 re-authentication ([§4.12]) on
-the *live* connection — no reconnect, no QoS-state churn:
-
-1. Sends an AUTH `0x19` carrying a fresh `Authenticator.Begin(ctx)` payload.
-2. Services any broker challenges via `Continue`.
-3. Returns when the broker concludes with `0x00` Success.
-
-Use it on a long-lived connection whose bearer token (OAuth, JWT)
-expires: start a timer from the token's lifetime and call
-`Reauthenticate` ahead of expiry.
-
-```go
-// e.g. 30s before the JWT `exp`:
-if err := cli.Reauthenticate(ctx); err != nil {
-    // ErrReauthRejected → broker refused the new credential;
-    // the supervisor is already reconnecting with a fresh CONNECT.
-}
-```
-
-Behaviour:
-
-- `ctx` bounds the whole operation, including the token fetch in `Begin`.
-- Calls are single-flighted per connection.
-- A broker rejection returns `ErrReauthRejected` and tears the
-  connection down, so the supervisor reconnects through the normal
-  CONNECT path.
-- `WithOnReauthenticated` observes every successful refresh in one
-  place.
-
-### Mutual authentication
-
-For mechanisms with mutual authentication (e.g. SCRAM), an
-`Authenticator` may also implement the optional `ServerFinalVerifier`
-interface (`VerifyServerFinal([]byte) error`).
-
-The client hands it the server's concluding `AuthenticationData` — the
-CONNACK on connect, the AUTH `0x00` on re-auth — so it can verify the
-server proved knowledge of the credential.
-
-A verification failure aborts the connect, or fails `Reauthenticate`
-and tears the connection down.
 
 ---
 
@@ -1139,124 +1139,6 @@ timeout.
 
 ---
 
-## Operations
-
-### Health and metrics
-
-`Client.Connected()` reports a live connection, and
-`Client.ServerInfo()` what the broker granted. The
-[lifecycle callbacks](#lifecycle-callbacks) report connection events as
-they happen.
-
-`Client.Stats()` returns a snapshot of in-memory counters. Opt in via
-`WithStats()` — when off, the hot path skips every atomic increment and
-`Stats()` returns the zero value.
-
-```go
-cli, _ := mqttv5.New(
-    mqttv5.WithBroker(broker),
-    mqttv5.WithStats(),
-)
-// ...
-s := cli.Stats()
-fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
-    s.PublishesSent, s.PublishesAcked, s.PublishesInflight,
-    s.Connects, s.ConnectFailures)
-```
-
-The counters cover connects and disconnects, publishes and
-subscriptions, inbound drops, pool fallbacks, ping timeouts, ignored
-acks, session store errors and broker protocol violations; the
-[`Stats`](https://pkg.go.dev/github.com/ashtonian/mqttv5#Stats) godoc
-lists every field. The library has no metrics dependency: export the
-fields to Prometheus, OpenTelemetry or expvar on a timer (see
-[`examples/stats`](examples/stats)).
-
-### Logs
-
-Structured `log/slog` through `WithLogger` (default `slog.Default()`).
-Normal message traffic logs nothing.
-
-- **Info:** connects and disconnects.
-- **Warn:** recoverable problems: reconnects, refused filters, stray
-  acknowledgements, typed decode failures, a teardown waiting on a
-  handler.
-- **Error:** protocol violations and store failures.
-
-### Troubleshooting
-
-| Symptom | Check | Then |
-|---|---|---|
-| `Connect` returns `ErrConnectRefused` | `errors.As(err, &rce)` for the CONNACK reason code | 0x86/0x87: credentials or authorization; 0x9C/0x9D: the broker redirects, see `WithFollowServerRedirects` |
-| Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
-| `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
-| `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
-| Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream: raise `SubBuffer` / `SubMaxQueueSize`, consume faster, or use a callback (backpressure) |
-| Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
-| `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
-| Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
-| Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
-| `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
-| Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
-
-### Store failures
-
-Every packet that depends on a `WithStore` record waits until the
-record is written: a PUBLISH for its record, a PUBREL for the
-AwaitPubcomp phase, a PUBREC for the inbound AwaitPubrel record and a
-PUBCOMP for that record's deletion. One flow's writes reach the store in
-the order the client decided them, also across a reconnect.
-
-A failed write of a new message's record fails that `Publish` with a
-`*StoreError`. Any other failed write means the store no longer holds
-what the session has done, so the client stops instead of carrying on
-without the guarantee the store is there for, much as a crash would
-stop it:
-
-1. it drops the session state it holds in memory and sends nothing more
-   that depends on it;
-2. it sends DISCONNECT 0x80 (the broker publishes the Will) and ends as
-   `Disconnect` would;
-3. QoS 1/2 `Publish` calls still waiting return the `*StoreError`
-   (`errors.Is(err, ErrStoreFailed)`); their messages stay in the store;
-4. `WithOnStoreFailure` fires;
-5. the next `Connect` reloads the session from the store and continues
-   every exchange from the phase it holds.
-
-The client treats every store error as final. A `session.Store` over a
-backend with transient failures (a network database, say) retries them
-itself within the ctx it is given. `store/file` returns an error only
-when the file system does: check free space and the Error log, then
-`Connect` again.
-
----
-
-## Security
-
-- **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
-  broker against the system roots by default; `WithTLSConfig` supplies
-  CAs, client certificates or a server name. Never set
-  `InsecureSkipVerify` outside tests.
-- **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
-  (per-attempt rotation) keep secrets in memory only; the client never
-  logs them. Enhanced authentication (`WithAuthenticator`) supports
-  SCRAM-style challenge/response and re-authentication
-  (`Reauthenticate`).
-- **Untrusted input.** Every packet from the broker is validated
-  before it is acted on, and a violation closes the connection (see
-  [Reliability semantics](#reliability-semantics)). Memory a broker can
-  make the client hold is bounded: per packet by `WithMaximumPacketSize`
-  (unset: the decoder holds at most eight times the bytes actually
-  received until a packet is complete), per subscription by `SubBuffer`
-  / `SubMaxQueueSize`, and in flight by `WithReceiveMaximum`.
-- **Persistence.** `store/file` and `queue/file` write message payloads
-  to disk unencrypted, with 0600 permissions by default under a 0700
-  directory; encrypt the volume if payloads are sensitive.
-- **Reporting.** Report vulnerabilities privately through GitHub
-  security advisories on this repository.
-
----
-
 ## Performance
 
 Measured with the [benchmark suite](benchmarks/): mqttv5 against
@@ -1428,6 +1310,124 @@ broker (`BenchmarkReceive`, 64-byte payloads):
 
 `WithStats` is off in these runs; its counters are atomic adds behind a
 nil check.
+
+---
+
+## Operations
+
+### Health and metrics
+
+`Client.Connected()` reports a live connection, and
+`Client.ServerInfo()` what the broker granted. The
+[lifecycle callbacks](#lifecycle-callbacks) report connection events as
+they happen.
+
+`Client.Stats()` returns a snapshot of in-memory counters. Opt in via
+`WithStats()` — when off, the hot path skips every atomic increment and
+`Stats()` returns the zero value.
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBroker(broker),
+    mqttv5.WithStats(),
+)
+// ...
+s := cli.Stats()
+fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
+    s.PublishesSent, s.PublishesAcked, s.PublishesInflight,
+    s.Connects, s.ConnectFailures)
+```
+
+The counters cover connects and disconnects, publishes and
+subscriptions, inbound drops, pool fallbacks, ping timeouts, ignored
+acks, session store errors and broker protocol violations; the
+[`Stats`](https://pkg.go.dev/github.com/ashtonian/mqttv5#Stats) godoc
+lists every field. The library has no metrics dependency: export the
+fields to Prometheus, OpenTelemetry or expvar on a timer (see
+[`examples/stats`](examples/stats)).
+
+### Logs
+
+Structured `log/slog` through `WithLogger` (default `slog.Default()`).
+Normal message traffic logs nothing.
+
+- **Info:** connects and disconnects.
+- **Warn:** recoverable problems: reconnects, refused filters, stray
+  acknowledgements, typed decode failures, a teardown waiting on a
+  handler.
+- **Error:** protocol violations and store failures.
+
+### Troubleshooting
+
+| Symptom | Check | Then |
+|---|---|---|
+| `Connect` returns `ErrConnectRefused` | `errors.As(err, &rce)` for the CONNACK reason code | 0x86/0x87: credentials or authorization; 0x9C/0x9D: the broker redirects, see `WithFollowServerRedirects` |
+| Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
+| `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
+| `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
+| Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream: raise `SubBuffer` / `SubMaxQueueSize`, consume faster, or use a callback (backpressure) |
+| Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
+| `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
+| Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
+| Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
+| `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
+| Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
+
+### Store failures
+
+Every packet that depends on a `WithStore` record waits until the
+record is written: a PUBLISH for its record, a PUBREL for the
+AwaitPubcomp phase, a PUBREC for the inbound AwaitPubrel record and a
+PUBCOMP for that record's deletion. One flow's writes reach the store in
+the order the client decided them, also across a reconnect.
+
+A failed write of a new message's record fails that `Publish` with a
+`*StoreError`. Any other failed write means the store no longer holds
+what the session has done, so the client stops instead of carrying on
+without the guarantee the store is there for, much as a crash would
+stop it:
+
+1. it drops the session state it holds in memory and sends nothing more
+   that depends on it;
+2. it sends DISCONNECT 0x80 (the broker publishes the Will) and ends as
+   `Disconnect` would;
+3. QoS 1/2 `Publish` calls still waiting return the `*StoreError`
+   (`errors.Is(err, ErrStoreFailed)`); their messages stay in the store;
+4. `WithOnStoreFailure` fires;
+5. the next `Connect` reloads the session from the store and continues
+   every exchange from the phase it holds.
+
+The client treats every store error as final. A `session.Store` over a
+backend with transient failures (a network database, say) retries them
+itself within the ctx it is given. `store/file` returns an error only
+when the file system does: check free space and the Error log, then
+`Connect` again.
+
+---
+
+## Security
+
+- **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
+  broker against the system roots by default; `WithTLSConfig` supplies
+  CAs, client certificates or a server name. Never set
+  `InsecureSkipVerify` outside tests.
+- **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
+  (per-attempt rotation) keep secrets in memory only; the client never
+  logs them. Enhanced authentication (`WithAuthenticator`) supports
+  SCRAM-style challenge/response and re-authentication
+  (`Reauthenticate`).
+- **Untrusted input.** Every packet from the broker is validated
+  before it is acted on, and a violation closes the connection (see
+  [Reliability semantics](#reliability-semantics)). Memory a broker can
+  make the client hold is bounded: per packet by `WithMaximumPacketSize`
+  (unset: the decoder holds at most eight times the bytes actually
+  received until a packet is complete), per subscription by `SubBuffer`
+  / `SubMaxQueueSize`, and in flight by `WithReceiveMaximum`.
+- **Persistence.** `store/file` and `queue/file` write message payloads
+  to disk unencrypted, with 0600 permissions by default under a 0700
+  directory; encrypt the volume if payloads are sensitive.
+- **Reporting.** Report vulnerabilities privately through GitHub
+  security advisories on this repository.
 
 ---
 
