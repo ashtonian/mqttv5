@@ -16,7 +16,8 @@ import (
 type SubscribeOption func(*subscribeConfig)
 
 // DefaultSubscribeBuffer is the channel buffer size used by Subscribe
-// when SubBuffer is not called.
+// when SubBuffer is not called: how many QoS 0 messages the channel
+// holds before it drops one.
 const DefaultSubscribeBuffer = 64
 
 // sharedSubPrefix is the MQTT v5 §4.8.2 shared-subscription marker.
@@ -40,6 +41,7 @@ var ErrNilHandler = errors.New("mqttv5: subscribe handler must not be nil")
 type subscribeConfig struct {
 	bufferSize         int            // chan flavour only
 	maxQueueSize       int            // queue flavour only (< 0 = unbounded)
+	room               int            // room for QoS 1/2 beyond the buffer or cap (see qosRoom)
 	dropPolicy         DropPolicy     // queue flavour honors both; chan rejects explicit DropOldest
 	dropPolicyExplicit bool           // SubDropPolicy was called for this Subscribe
 	onDrop             func(*Message) // optional: fires before a dropped message is acked
@@ -55,7 +57,9 @@ func newSubscribeConfig(c *Client) subscribeConfig {
 	}
 }
 
-// SubBuffer sets [Client.Subscribe]'s channel buffer size. Default
+// SubBuffer sets [Client.Subscribe]'s channel buffer size: how many
+// QoS 0 messages the channel holds before it drops one. QoS 1 and 2
+// messages have room beyond it (see [Client.Subscribe]). Default
 // [DefaultSubscribeBuffer]. Ignored by [Client.SubscribeQueue] and
 // [Client.SubscribeCallback].
 func SubBuffer(n int) SubscribeOption {
@@ -67,8 +71,10 @@ func SubBuffer(n int) SubscribeOption {
 }
 
 // SubMaxQueueSize caps [Client.SubscribeQueue]'s length for this
-// subscription. [UnboundedQueue] removes the cap; 0 keeps the client
-// default from [WithMaxSubscribeQueueSize] ([DefaultMaxSubscribeQueueSize]).
+// subscription. QoS 1 and 2 messages have room beyond the cap (see
+// [Client.SubscribeQueue]). [UnboundedQueue] removes the cap; 0 keeps
+// the client default from [WithMaxSubscribeQueueSize]
+// ([DefaultMaxSubscribeQueueSize]).
 func SubMaxQueueSize(n int) SubscribeOption {
 	return func(cfg *subscribeConfig) {
 		if n != 0 {
@@ -85,7 +91,9 @@ func SubMaxQueueSize(n int) SubscribeOption {
 //     ErrChanDropOldestUnsupported — peek-and-pop on a consumer-owned
 //     channel would race the receiver. Use SubscribeQueue for
 //     DropOldest semantics.
-//   - SubscribeQueue: both policies are honored.
+//   - SubscribeQueue: both policies are honored. DropOldest keeps the
+//     newest messages up to the cap whatever their QoS, so it may drop
+//     QoS 1 and 2 messages too.
 //   - SubscribeCallback: ignored (callback never drops; slow handler
 //     stalls the connection instead).
 //
@@ -98,7 +106,7 @@ func SubDropPolicy(p DropPolicy) SubscribeOption {
 }
 
 // SubOnDrop fires when a message is dropped by [Client.Subscribe]
-// (channel full) or [Client.SubscribeQueue] (cap reached). It runs on the
+// (buffer full) or [Client.SubscribeQueue] (cap reached). It runs on the
 // read goroutine before the dropped message is acknowledged, so every field
 // is readable; it must not block, nor call [Client.Disconnect]. On a
 // [SubZeroCopy] subscription the fields must not be retained past return.
@@ -126,8 +134,10 @@ func SubZeroCopy() SubscribeOption {
 //
 // Auto-ack gives up at-least-once processing: a consumer that crashes
 // between delivery and processing has nothing to replay, because the
-// broker already considers the message delivered. Use it for QoS 0 or
-// observational consumers; keep manual ack for ledger-style workloads.
+// broker already considers the message delivered. It also gives up the
+// broker's flow control, so a full buffer or queue drops QoS 1 and 2
+// messages as it drops QoS 0. Use it for QoS 0 or observational
+// consumers; keep manual ack for ledger-style workloads.
 //
 // Ignored by [Client.SubscribeCallback] (already auto-acks).
 func SubAutoAck() SubscribeOption {
@@ -150,15 +160,23 @@ func SubAutoAck() SubscribeOption {
 // client with the same filter share it, each receives every message for
 // it, and the options of the most recent Subscribe apply to all of them.
 //
-// Full-buffer messages are dropped + acked (DropNewest); observe drops
-// via [SubOnDrop]. Returns [ErrChanDropOldestUnsupported] when called
-// with explicit [SubDropPolicy] of [DropOldest].
+// A consumer that falls behind loses QoS 0 messages, never QoS 1 or 2:
+// once the channel holds [SubBuffer] messages, a QoS 0 message is
+// dropped and acked (observe drops via [SubOnDrop]), while QoS 1 and 2
+// messages have room for [WithReceiveMaximum] more. That is as many as
+// the broker sends before the consumer acks one, so the broker's flow
+// control holds the rest back. The exceptions: with [SubAutoAck], QoS 1
+// and 2 messages are dropped as QoS 0 ones are, and messages left
+// unread from a session the broker discarded take room of their own.
+// Returns [ErrChanDropOldestUnsupported] when called with explicit
+// [SubDropPolicy] of [DropOldest].
 func (c *Client) Subscribe(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (<-chan *Message, SubscriptionToken, error) {
 	cfg, err := c.chanSubscribeConfig(opts)
 	if err != nil {
 		return nil, SubscriptionToken{}, err
 	}
-	ch := make(chan *Message, cfg.bufferSize)
+	cfg.room = c.qosRoom(cfg, filters)
+	ch := make(chan *Message, cfg.bufferSize+cfg.room)
 	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(c, cfg, ch, ownMessage)}
 	token, err := c.subscribe(ctx, filters, r, func() { close(ch) })
 	if token.sub == nil {
@@ -172,13 +190,15 @@ func (c *Client) Subscribe(ctx context.Context, filters []TopicFilter, opts ...S
 // SubscribeQueue sends one SUBSCRIBE and returns a [Queue] of
 // matching messages, capped at [DefaultMaxSubscribeQueueSize] unless
 // [WithMaxSubscribeQueueSize] or [SubMaxQueueSize] say otherwise. On
-// overflow, [SubDropPolicy] decides:
-// [DropNewest] acks + drops the inbound; [DropOldest] dequeues +
-// acks the head and admits the new one. Closes on
-// [Client.Unsubscribe] or [Client.Disconnect]. Refusals and reconnects
-// behave as for [Client.Subscribe].
+// overflow, [SubDropPolicy] decides: [DropNewest] acks and drops the
+// inbound message, except that QoS 1 and 2 messages have room for
+// [WithReceiveMaximum] more beyond the cap, as on [Client.Subscribe];
+// [DropOldest] dequeues and acks the head, whatever its QoS, and admits
+// the new one. Closes on [Client.Unsubscribe] or [Client.Disconnect].
+// Refusals and reconnects behave as for [Client.Subscribe].
 func (c *Client) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (*Queue[*Message], SubscriptionToken, error) {
 	cfg := c.subscribeConfigFrom(opts)
+	cfg.room = c.qosRoom(cfg, filters)
 	q := NewQueue[*Message]()
 	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(c, cfg, q, ownMessage, func(m *Message) *Message { return m })}
 	token, err := c.subscribe(ctx, filters, r, q.Close)
@@ -216,11 +236,33 @@ func (c *Client) chanSubscribeConfig(opts []SubscribeOption) (subscribeConfig, e
 // SubAutoAck acks before delivery and so needs an owned copy.
 func (cfg subscribeConfig) zeroCopyDelivery() bool { return cfg.zeroCopy && !cfg.autoAck }
 
+// qosRoom is the room a channel or queue subscription keeps beyond its
+// buffer or cap for QoS 1 and 2 messages, so that none is dropped. A
+// message stays unacknowledged until its consumer acks it, and the
+// broker sends at most Receive Maximum unacknowledged ones, so that much
+// room always suffices. A subscription that acks on receipt has no flow
+// control to rely on, and one that asks only for QoS 0 needs none.
+func (c *Client) qosRoom(cfg subscribeConfig, filters []TopicFilter) int {
+	if cfg.autoAck {
+		return 0
+	}
+	for _, f := range filters {
+		if f.QoS > 0 {
+			return int(c.cfg.ReceiveMaximum)
+		}
+	}
+	return 0
+}
+
+// usesRoom reports whether m may take the room beyond the buffer or cap.
+func (cfg subscribeConfig) usesRoom(m *Message) bool { return cfg.room > 0 && m.QoS > 0 }
+
 // chanDeliver hands each message, converted by wrap, to ch without
-// blocking the read loop: when ch is full the message is dropped and
-// acked. wrap returning false drops and acks the message too (it
-// reports why itself). Like every delivery function, it runs on the
-// read loop.
+// blocking the read loop. ch holds cfg.bufferSize messages plus
+// cfg.room: a message that may not use the room is dropped and acked
+// once ch holds cfg.bufferSize, and any message when ch is full. wrap
+// returning false drops and acks the message too (it reports why
+// itself). Like every delivery function, it runs on the read loop.
 func chanDeliver[T any](c *Client, cfg subscribeConfig, ch chan<- T, wrap func(*Message) (T, bool)) HandlerFunc {
 	return func(m *Message) {
 		v, ok := wrap(m)
@@ -231,6 +273,10 @@ func chanDeliver[T any](c *Client, cfg subscribeConfig, ch chan<- T, wrap func(*
 		if cfg.autoAck {
 			m.ackOnReader()
 		}
+		if !cfg.usesRoom(m) && len(ch) >= cfg.bufferSize {
+			c.dropInbound(cfg, m)
+			return
+		}
 		select {
 		case ch <- v:
 		default:
@@ -240,8 +286,9 @@ func chanDeliver[T any](c *Client, cfg subscribeConfig, ch chan<- T, wrap func(*
 }
 
 // queueDeliver appends each message, converted by wrap, to q within
-// cfg's bound and drop policy; message recovers the *Message an evicted
-// element carries so it can be acked.
+// cfg's bound, raised by cfg.room for a message that may use it, and
+// drop policy; message recovers the *Message an evicted element carries
+// so it can be acked.
 func queueDeliver[T any](c *Client, cfg subscribeConfig, q *Queue[T], wrap func(*Message) (T, bool), message func(T) *Message) HandlerFunc {
 	return func(m *Message) {
 		v, ok := wrap(m)
@@ -252,7 +299,11 @@ func queueDeliver[T any](c *Client, cfg subscribeConfig, q *Queue[T], wrap func(
 		if cfg.autoAck {
 			m.ackOnReader()
 		}
-		evicted, wasEvicted, accepted := q.push(v, cfg.maxQueueSize, cfg.dropPolicy == DropOldest)
+		limit := cfg.maxQueueSize
+		if limit > 0 && cfg.dropPolicy == DropNewest && cfg.usesRoom(m) {
+			limit += cfg.room
+		}
+		evicted, wasEvicted, accepted := q.push(v, limit, cfg.dropPolicy == DropOldest)
 		if wasEvicted {
 			c.dropInbound(cfg, message(evicted))
 		}

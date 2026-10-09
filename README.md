@@ -115,8 +115,10 @@ supervisor:
 - **Messages you can keep.** A delivered `*Message` owns its topic,
   payload and properties, so it is safe to retain, and `Ack` may be
   called more than once. `SubZeroCopy()` skips the copy on hot paths.
-- **Backpressure per subscription.** `DropNewest` or `DropOldest`, and a
-  dropped message is acknowledged so the broker stops resending it.
+- **Backpressure per subscription.** A consumer that falls behind loses
+  QoS 0 messages, never QoS 1 or 2: the broker's flow control holds
+  those back. A dropped message is acknowledged so the broker stops
+  resending it.
 - **Several brokers, three distinct patterns.** Failover
   (`WithBrokers`), parallel sessions (`ClientGroup`) and a publish pool
   (`WithPublisherPool`), each its own API, and they compose
@@ -265,8 +267,15 @@ for m := range msgs {
 _ = cli.Unsubscribe(ctx, token) // closes msgs
 ```
 
-If the buffer fills, the incoming message is **auto-ack'd and dropped**
-so the broker stops retrying. Observe drops via `SubOnDrop(...)`.
+A consumer that falls behind loses QoS 0 messages, never QoS 1 or 2.
+Once the channel holds `SubBuffer` messages, an incoming QoS 0 message
+is **acked and dropped**; observe drops via `SubOnDrop(...)`. QoS 1
+and 2 messages have room for `WithReceiveMaximum` more (default 256):
+as many as the broker sends before the consumer acks one, so the
+broker holds the rest back. Two exceptions: `SubAutoAck()` acks on
+receipt, which gives up that flow control, so QoS 1 and 2 messages are
+dropped as QoS 0 ones are; and messages still unread from a session
+the broker discarded take room of their own.
 
 ### Queue — bounded, optional `DropOldest`
 
@@ -289,8 +298,10 @@ for {
 Queues hold at most `DefaultMaxSubscribeQueueSize` (65,536) messages
 unless `WithMaxSubscribeQueueSize` / `SubMaxQueueSize` say otherwise;
 `mqttv5.UnboundedQueue` removes the cap. When full, `DropNewest` (the
-default) acks and drops the incoming message; `DropOldest` evicts the
-queue head and acks it before enqueueing.
+default) acks and drops an incoming QoS 0 message, while QoS 1 and 2
+messages have the same room beyond the cap as on a channel;
+`DropOldest` evicts the queue head, whatever its QoS, and acks it
+before enqueueing.
 
 Only the queue variant supports `DropOldest` — channels can't
 peek-and-pop without racing the consumer.
@@ -730,7 +741,7 @@ See [`examples/disconnect`](examples/disconnect).
 | `WithSessionExpiry(seconds)` | 300 (5 min) | Session Expiry Interval ([§3.1.2.11.2]). Pass 0 to end the session with the connection. A broker override in CONNACK is honoured. |
 | `WithSessionLossPolicy(p)` | `SessionLossRepublish` | What happens to unacknowledged QoS 1/2 publishes when a connection starts without the session (Session Present = 0): `SessionLossRepublish` sends them again as new messages in their original order; `SessionLossFail` completes them with `ErrSessionLost`. |
 | `WithStore(s)` | none (in memory) | `session.Store` that persists session state across restarts (use `store/file`). Without it, state survives reconnects only. A failed write of a new message's record fails that `Publish`; any other failed write stops the client (see [Store failures](#store-failures)). |
-| `WithReceiveMaximum(n)` | unset (65535) | Cap on concurrent inbound QoS 1/2. A broker that exceeds it is disconnected with reason 0x93. |
+| `WithReceiveMaximum(n)` | 256 (`DefaultReceiveMaximum`) | QoS 1/2 messages the broker may send unacknowledged, and so how many a subscription whose consumer falls behind holds beyond its buffer. A broker that exceeds it is disconnected with reason 0x93. |
 | `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property [§3.1.2.11.4] — caps the largest packet the broker may send. See note below. |
 | `WithInboundTopicAliasMaximum(n)` | 0 (no inbound aliases) | CONNECT property [§3.1.2.11.5] — opt into wire compression on inbound PUBLISHes. An alias the broker sends outside 1..n closes the connection (`0x94`). |
 | `WithOutboundTopicAliases()` | off | Replace repeated QoS 0 topics with topic aliases within the broker's Topic Alias Maximum. |
@@ -851,11 +862,11 @@ after five seconds.
 
 | Option | Effect |
 |---|---|
-| `SubBuffer(n)` | Channel buffer size (Subscribe only). Default `DefaultSubscribeBuffer` (64). |
-| `SubMaxQueueSize(n)` | Queue cap (SubscribeQueue only). 0 keeps the client default; `UnboundedQueue` removes the cap. |
-| `SubDropPolicy(p)` | `DropNewest` / `DropOldest`. SubscribeQueue honours both; chan-based `Subscribe` returns `ErrChanDropOldestUnsupported` when DropOldest is set explicitly. |
+| `SubBuffer(n)` | Channel buffer size (Subscribe only): the QoS 0 messages held before one is dropped; QoS 1/2 have room for Receive Maximum more. Default `DefaultSubscribeBuffer` (64). |
+| `SubMaxQueueSize(n)` | Queue cap (SubscribeQueue only); under `DropNewest`, QoS 1/2 have room for Receive Maximum more. 0 keeps the client default; `UnboundedQueue` removes the cap. |
+| `SubDropPolicy(p)` | `DropNewest` / `DropOldest`. SubscribeQueue honours both, and `DropOldest` evicts whatever the QoS; chan-based `Subscribe` returns `ErrChanDropOldestUnsupported` when DropOldest is set explicitly. |
 | `SubOnDrop(fn)` | Hook run on the read goroutine before a dropped message is acked; every field is readable. Must not block or call `Disconnect`. |
-| `SubAutoAck()` | Opt-in: the dispatcher acks each delivery before handing it to the consumer. See note below. Ignored by `SubscribeCallback`. |
+| `SubAutoAck()` | Opt-in: the dispatcher acks each delivery before handing it to the consumer, so a full buffer or queue drops QoS 1/2 messages too. See note below. Ignored by `SubscribeCallback`. |
 | `SubZeroCopy()` | Deliver messages whose Topic / Payload / Properties alias the network frame (valid until every receiving subscription has acked; for callbacks, until return). Saves the copy: one allocation per message at QoS 0. Also accepted by `SubscribeCallback`. |
 
 > **`SubAutoAck` trade-offs.**
@@ -1039,6 +1050,13 @@ unknown or mismatched packet identifiers are ignored and counted in
 **Acknowledgement order.** A QoS 1 PUBACK is held until `m.Ack()` and
 flushed in [§4.6] arrival order. A QoS 2 PUBREC is held until `m.Ack()`;
 PUBCOMP goes out automatically when PUBREL arrives.
+
+**A consumer that falls behind.** Holding the acknowledgement until
+`m.Ack()` is also the flow control: the broker sends at most Receive
+Maximum QoS 1/2 messages the client has not acknowledged, so a channel
+or queue subscription keeps room for that many beyond its buffer and
+drops none of them. QoS 0 messages beyond the buffer are dropped and
+acked (see [Subscribing](#subscribing)).
 
 **One message, several subscriptions.** A PUBLISH matching several
 subscriptions gives each its own `*Message` handle over the same bytes.
@@ -1364,7 +1382,7 @@ Normal message traffic logs nothing.
 | Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
 | `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
 | `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
-| Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream: raise `SubBuffer` / `SubMaxQueueSize`, consume faster, or use a callback (backpressure) |
+| Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream. Only QoS 0 messages are dropped, unless `SubAutoAck` or `DropOldest` is set: raise `SubBuffer` / `SubMaxQueueSize`, subscribe at QoS 1, consume faster, or use a callback (backpressure) |
 | Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
 | `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
 | Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
@@ -1421,7 +1439,8 @@ when the file system does: check free space and the Error log, then
   make the client hold is bounded: per packet by `WithMaximumPacketSize`
   (unset: the decoder holds at most eight times the bytes actually
   received until a packet is complete), per subscription by `SubBuffer`
-  / `SubMaxQueueSize`, and in flight by `WithReceiveMaximum`.
+  / `SubMaxQueueSize` for QoS 0 messages and by `WithReceiveMaximum`
+  for QoS 1/2 ones.
 - **Persistence.** `store/file` and `queue/file` write message payloads
   to disk unencrypted, with 0600 permissions by default under a 0700
   directory; encrypt the volume if payloads are sensitive.

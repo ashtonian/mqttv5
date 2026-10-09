@@ -6,6 +6,7 @@ package mqttv5
 
 import (
 	"context"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -79,8 +80,10 @@ func TestFullSendBufferDoesNotStopReading(t *testing.T) {
 		}
 		return uc, nil
 	}
+	// The broker never reads the acknowledgements, so it sends more
+	// unacknowledged messages than the default Receive Maximum allows.
 	cli, err := New(WithBroker("mqtt://broker"), WithDialFunc(dial), WithClientID("backpressure"),
-		WithoutKeepAlive(), WithLogger(quietLogger()))
+		WithReceiveMaximum(math.MaxUint16), WithoutKeepAlive(), WithLogger(quietLogger()))
 	if err != nil {
 		t.Fatal(err)
 	}

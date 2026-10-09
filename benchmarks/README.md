@@ -124,7 +124,7 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
 | `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule plus the wait for the last deliveries, over N: about the schedule interval; read the `p50-ns` … `max-ns` metrics |
 | `BenchmarkE2E_Reconnect` | 20 QoS 1 publishes vanish in a proxy, the connection is cut; time until a subscriber has all 20 after the client reconnects with its session and resends them | one cut-and-recover cycle |
-| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst; `peak-heap-B` is the largest growth of the process's heap objects over the burst's start, sampled every millisecond, `delivered-%` how many messages reached the consumer intact; the library dropped, and counted, the rest | not meaningful |
+| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst at QoS 0 or 1; `peak-heap-B` is the largest growth of the process's heap objects over the burst's start, sampled every millisecond, `delivered-%` how many messages reached the consumer intact; the library dropped, and counted, the rest | not meaningful |
 | `BenchmarkDecodePublish`, `BenchmarkDecodePublishRead`, `BenchmarkEncodePublish` | the codecs alone, no network (`props=none` or a content type and five user properties) | one packet |
 | `BenchmarkReceive`, `BenchmarkReceiveWindow`, `BenchmarkReceiveFilters` (core package) | mqttv5's inbound path against an in-process feed: decode, route, deliver, ack | one delivered message |
 
@@ -482,9 +482,12 @@ What each library does with the backlog:
   blocks the handler; autopaho's channel then fills the same way.
 - **mqttv5 chan and queue** — the subscription keeps its bound (64
   messages for a channel, 65,536 for a queue, by default) and drops the
-  newest messages beyond it, acknowledging them and counting them in
-  `Stats().InboundDropped` (`SubOnDrop` sees each one). A full queue
-  holds about as much memory as autopaho's channel.
+  newest QoS 0 messages beyond it, acknowledging them and counting them
+  in `Stats().InboundDropped` (`SubOnDrop` sees each one). A full queue
+  holds about as much memory as autopaho's channel. QoS 1 and 2
+  messages are never dropped: the subscription has room for the
+  client's Receive Maximum more (256 by default), and the broker holds
+  the rest back until the consumer acks.
 
 `peak-heap-B` is the largest increase, over its value when the burst
 started, of the process's heap-object bytes

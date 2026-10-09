@@ -73,6 +73,10 @@ const (
 	// messages holds about 13 MiB plus payloads.
 	DefaultMaxSubscribeQueueSize = 65536
 
+	// DefaultReceiveMaximum is the Receive Maximum the client advertises
+	// when [WithReceiveMaximum] is not called.
+	DefaultReceiveMaximum = 256
+
 	// UnboundedQueue, passed to [WithMaxSubscribeQueueSize] or
 	// [SubMaxQueueSize], removes the queue cap. A consumer that falls
 	// behind then grows memory without limit.
@@ -541,8 +545,14 @@ func WithSessionExpiry(s uint32) Option {
 	}
 }
 
-// WithReceiveMaximum bounds concurrent inbound QoS 1/2 publishes
-// (§3.1.2.11.3). Also sizes the packet-ID pool.
+// WithReceiveMaximum sets the Receive Maximum (§3.1.2.11.3): how many
+// QoS 1/2 messages the broker may send that the client has not yet
+// acknowledged. A delivered message is acknowledged once the
+// application acks it, so this is also how many QoS 1/2 messages a
+// subscription whose consumer falls behind can hold beyond its buffer,
+// and what that costs in memory (see [Client.Subscribe]). A broker that
+// sends more is disconnected with reason 0x93. Default
+// [DefaultReceiveMaximum]; 0 keeps the default.
 func WithReceiveMaximum(n uint16) Option {
 	return func(c *Config) error {
 		c.ReceiveMaximum = n
@@ -1138,6 +1148,9 @@ func (c *Config) defaults() {
 	}
 	if c.MaxSubscribeQueueSize == 0 {
 		c.MaxSubscribeQueueSize = DefaultMaxSubscribeQueueSize
+	}
+	if c.ReceiveMaximum == 0 {
+		c.ReceiveMaximum = DefaultReceiveMaximum
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()

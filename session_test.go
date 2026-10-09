@@ -505,6 +505,25 @@ func waitLog(t *testing.T, conn *testbroker.Conn, pt wire.PacketType, n int) {
 	t.Fatalf("fewer than %d %s recorded", n, pt)
 }
 
+// Unless told otherwise the client advertises DefaultReceiveMaximum,
+// which bounds what a subscription whose consumer falls behind holds.
+func TestDefaultReceiveMaximumAdvertised(t *testing.T) {
+	got := make(chan uint16, 1)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		info := c.AcceptConnect(wire.ConnackOpts{})
+		if info == nil {
+			return
+		}
+		v, _ := info.Properties().Uint16(wire.PropReceiveMaximum)
+		got <- v
+		c.Hold(0)
+	})
+	tbClient(t, b)
+	if v := <-got; v != DefaultReceiveMaximum {
+		t.Fatalf("Receive Maximum = %d, want %d", v, DefaultReceiveMaximum)
+	}
+}
+
 // §3.3.4: a broker that sends more unacknowledged QoS > 0
 // PUBLISHes than the client's Receive Maximum is disconnected with 0x93.
 func TestInboundReceiveMaximumEnforced(t *testing.T) {

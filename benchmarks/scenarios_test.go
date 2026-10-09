@@ -114,7 +114,7 @@ func TestBrokerScenariosRejectCorruption(t *testing.T) {
 				onMsg(p)
 			})
 		}
-		res := testing.Benchmark(func(b *testing.B) { runSlowConsumer(b, corrupting, modeCallback, 1024) })
+		res := testing.Benchmark(func(b *testing.B) { runSlowConsumer(b, corrupting, modeCallback, 0, 1024) })
 		if res.N > 0 {
 			t.Fatal("a run with corrupted deliveries was accepted")
 		}

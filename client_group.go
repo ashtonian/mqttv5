@@ -444,7 +444,8 @@ func (g *ClientGroup) publishStartingAt(ctx context.Context, opts PublishOptions
 // Subscribe subscribes on every member and merges their messages into
 // one channel; Ack on a message goes back to the member that delivered
 // it. The channel's buffer and drop rules are those of
-// [Client.Subscribe], applied as each member delivers. It closes once
+// [Client.Subscribe], applied as each member delivers, with room for
+// every member's QoS 1 and 2 messages. It closes once
 // every member's subscription has ended: after [ClientGroup.UnsubscribeAll],
 // an Unsubscribe of each member, or Disconnect.
 //
@@ -461,7 +462,13 @@ func (g *ClientGroup) Subscribe(ctx context.Context, filters []TopicFilter, opts
 	if err != nil {
 		return nil, nil, err
 	}
-	merged := make(chan *Message, cfg.bufferSize)
+	cfg.room = g.qosRoom(cfg, filters)
+	if cfg.room > 0 {
+		// Members deliver concurrently, so QoS 0 messages can overrun
+		// the buffer by one for each other member.
+		cfg.room += len(g.members) - 1
+	}
+	merged := make(chan *Message, cfg.bufferSize+cfg.room)
 	tokens, err := g.subscribeAll(ctx, filters, func() { close(merged) }, func(m *Client) *route {
 		return &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(m, cfg, merged, ownMessage)}
 	})
@@ -479,6 +486,7 @@ func (g *ClientGroup) SubscribeQueue(ctx context.Context, filters []TopicFilter,
 		return nil, nil, ErrClosed
 	}
 	cfg := g.members[0].subscribeConfigFrom(opts)
+	cfg.room = g.qosRoom(cfg, filters)
 	merged := NewQueue[*Message]()
 	tokens, err := g.subscribeAll(ctx, filters, merged.Close, func(m *Client) *route {
 		return &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(m, cfg, merged, ownMessage, func(m *Message) *Message { return m })}
@@ -487,6 +495,16 @@ func (g *ClientGroup) SubscribeQueue(ctx context.Context, filters []TopicFilter,
 		return nil, nil, err
 	}
 	return merged, tokens, nil
+}
+
+// qosRoom is the room a merged output keeps for QoS 1 and 2 messages:
+// every member's (see [Client.qosRoom]).
+func (g *ClientGroup) qosRoom(cfg subscribeConfig, filters []TopicFilter) int {
+	room := 0
+	for _, m := range g.members {
+		room += m.qosRoom(cfg, filters)
+	}
+	return room
 }
 
 // subscribeAll subscribes every member with the route newRoute builds

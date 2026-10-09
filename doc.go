@@ -11,9 +11,10 @@
 // replay, and resubscribe are always on. Channel-native subscribe:
 // <-chan *[Message] ([Client.Subscribe]), [Queue] of *[Message]
 // ([Client.SubscribeQueue]), or a sync callback ([Client.SubscribeCallback]).
-// Backpressure is a first-class concept — per-subscription
-// [DropNewest] / [DropOldest] auto-ack the dropped message so the
-// broker stops retransmitting.
+// Backpressure is per subscription: a consumer that falls behind loses
+// QoS 0 messages, acknowledged so the broker stops retransmitting,
+// while the broker's flow control holds QoS 1 and 2 messages back
+// (see [Client.Subscribe]).
 //
 // Three multi-broker patterns are kept distinct:
 //

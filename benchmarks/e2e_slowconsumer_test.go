@@ -16,26 +16,30 @@ import (
 
 // BenchmarkE2E_SlowConsumer shows what a library holds in memory when
 // its consumer stops. The consumer blocks on its first message while the
-// raw publisher sends b.N QoS 0 messages; once the client has stopped
-// taking in data the consumer is released and drains. peak-heap-B is the
-// largest growth of the process's heap objects over the run,
-// delivered-% how many messages reached the consumer intact; the library
-// dropped, and counted, the rest.
+// raw publisher sends b.N messages at QoS 0 or 1; once the client has
+// stopped taking in data the consumer is released and drains.
+// peak-heap-B is the largest growth of the process's heap objects over
+// the run, delivered-% how many messages reached the consumer intact;
+// the library dropped, and counted, the rest.
 // A library whose consumer holds back its read loop stops reading, and
-// the backlog stays in the broker. Run with a fixed iteration count,
-// e.g. -benchtime=200000x; ns/op is not meaningful here.
+// the backlog stays in the broker; so does one that leaves QoS 1
+// messages unacknowledged until its consumer takes them. Run with a
+// fixed iteration count, e.g. -benchtime=200000x; ns/op is not
+// meaningful here.
 func BenchmarkE2E_SlowConsumer(b *testing.B) {
 	requireBroker(b)
 	for _, l := range libs {
 		for _, m := range l.modes {
-			b.Run(fmt.Sprintf("lib=%s/mode=%s/size=%s", l.name, m, size1KiB.name), func(b *testing.B) {
-				runSlowConsumer(b, l, m, size1KiB.bytes)
-			})
+			for _, qos := range []byte{0, 1} {
+				b.Run(fmt.Sprintf("lib=%s/mode=%s/qos=%d/size=%s", l.name, m, qos, size1KiB.name), func(b *testing.B) {
+					runSlowConsumer(b, l, m, qos, size1KiB.bytes)
+				})
+			}
 		}
 	}
 }
 
-func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
+func runSlowConsumer(b *testing.B, l lib, m mode, qos byte, size int) {
 	topic := "bench/slow/" + uniqueID("")
 	release := make(chan struct{})
 	// The library may drop what does not fit; the rest must arrive once
@@ -43,7 +47,7 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	s := newSink(size, b.N)
 	s.allowDrops = true
 	var delivered atomic.Int64
-	sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-slow")}, topic, 0, m, 1, func(p []byte) {
+	sub := subscribe(b, l, clientConfig{id: uniqueID(l.name + "-slow")}, topic, qos, m, 1, func(p []byte) {
 		if len(p) > 0 {
 			<-release
 			delivered.Add(1)
@@ -56,7 +60,7 @@ func runSlowConsumer(b *testing.B, l lib, m mode, size int) {
 	runtime.GC()
 	sampler := startHeapSampler(b)
 	b.ResetTimer()
-	if err := pub.publish(topic, 0, Payload(size), b.N); err != nil {
+	if err := pub.publish(topic, qos, Payload(size), b.N); err != nil {
 		b.Fatalf("raw publisher: %v", err)
 	}
 	// The client has stopped taking in data once neither its heap nor

@@ -58,7 +58,8 @@ func (t *Typed[T]) Subscribe(ctx context.Context, filters []TopicFilter, opts ..
 	if err != nil {
 		return nil, SubscriptionToken{}, err
 	}
-	ch := make(chan *TypedMessage[T], cfg.bufferSize)
+	cfg.room = t.client.qosRoom(cfg, filters)
+	ch := make(chan *TypedMessage[T], cfg.bufferSize+cfg.room)
 	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(t.client, cfg, ch, t.decode(cfg))}
 	token, err := t.client.subscribe(ctx, filters, r, func() { close(ch) })
 	if token.sub == nil {
@@ -71,6 +72,7 @@ func (t *Typed[T]) Subscribe(ctx context.Context, filters []TopicFilter, opts ..
 // by the codec, under the same bound and drop policy.
 func (t *Typed[T]) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (*Queue[*TypedMessage[T]], SubscriptionToken, error) {
 	cfg := t.client.subscribeConfigFrom(opts)
+	cfg.room = t.client.qosRoom(cfg, filters)
 	q := NewQueue[*TypedMessage[T]]()
 	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(t.client, cfg, q, t.decode(cfg),
 		func(m *TypedMessage[T]) *Message { return m.Message })}
