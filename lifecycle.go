@@ -138,7 +138,15 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 		c.stats.addConnectFailure()
 		c.redirectFrom(err)
 		c.connectError(err)
-		if !c.cfg.RetryInitialConnect || ctx.Err() != nil {
+		if !c.cfg.RetryInitialConnect {
+			return err
+		}
+		if ctx.Err() != nil {
+			// A callback reporting the failure may have ended the span,
+			// which cancels ctx too: that is what Connect reports.
+			if ended := life.endedErr(); ended != nil {
+				return ended
+			}
 			return err
 		}
 		c.cfg.Logger.Warn("mqttv5: initial connect failed; retrying in the background",
