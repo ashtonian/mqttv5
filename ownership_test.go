@@ -300,34 +300,26 @@ func TestRouteCloseRacingDispatch(t *testing.T) {
 }
 
 // End to end: Unsubscribe racing a QoS 0 stream on an overlapping filter.
-// The stream is paced so SUBACK/UNSUBACK are not queued behind a
-// saturated socket. Run with -race.
+// The broker follows every SUBACK and UNSUBACK with a burst on the
+// filter, so each Unsubscribe races the dispatch of messages for its
+// subscription, and the stream never outruns the client however fast
+// the machine is. Run with -race.
 func TestUnsubscribeRacingDispatch(t *testing.T) {
-	stop := make(chan struct{})
 	b := testbroker.New(t)
 	b.SetFallback(func(c *testbroker.Conn) {
 		c.AcceptConnect(wire.ConnackOpts{})
-		go func() {
-			tick := time.NewTicker(100 * time.Microsecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-stop:
-					return
-				case <-c.Gone():
-					return
-				case <-tick.C:
-				}
-				for k := 0; k < 8; k++ {
-					if c.Publish(wire.PublishOpts{Topic: "flood/x", Payload: []byte("f")}) != nil {
-						return
-					}
+		c.ServeAutoThen(func(p testbroker.Packet) error {
+			if p.Type != wire.SUBSCRIBE && p.Type != wire.UNSUBSCRIBE {
+				return nil
+			}
+			for range 8 {
+				if err := c.Publish(wire.PublishOpts{Topic: "flood/x", Payload: []byte("f")}); err != nil {
+					return err
 				}
 			}
-		}()
-		c.ServeAuto()
+			return nil
+		})
 	})
-	defer close(stop)
 	cli := tbClient(t, b)
 	ctx := context.Background()
 	if _, err := cli.SubscribeCallback(ctx, []TopicFilter{{Topic: "flood/#"}}, func(*Message) {}); err != nil {

@@ -810,3 +810,27 @@ func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
 		t.Fatal("a rejected registration left state behind")
 	}
 }
+
+// Drain returns only once a failed write's failure has been reported:
+// a caller that drains, as a disconnecting client does, never misses it.
+func TestDrainWaitsForTheFailureReport(t *testing.T) {
+	st := newFaultStore()
+	reporting, release := make(chan struct{}), make(chan struct{})
+	h := newHarness(t, Config{Store: st, OnFailure: func(error) {
+		close(reporting)
+		<-release
+	}})
+	h.connect(false, 10)
+	o := h.publish(1, "a")
+	h.collect()
+	st.failDelete.Store(true)
+	h.e.HandlePuback(o.PacketID(), 0, nil)
+	<-reporting
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := h.e.Drain(ctx); err == nil {
+		t.Fatal("Drain returned while OnFailure was still running")
+	}
+	close(release)
+	h.drain()
+}

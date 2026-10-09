@@ -312,35 +312,39 @@ func TestTeardownAnswersEveryQueuedRequest(t *testing.T) {
 		c.Hold(20 * time.Millisecond)
 	})
 	cli := tbClient(t, b, WithPublishMode(PublishWaitForFlush), WithWriteQueueSize(4))
-	stop := make(chan struct{})
+	running, stop := context.WithCancel(context.Background())
+	defer stop()
 	var wg sync.WaitGroup
 	for w := range 8 {
 		wg.Go(func() {
 			payload := make([]byte, 512)
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			for running.Err() == nil {
+				ctx, cancel := context.WithTimeout(running, 5*time.Second)
 				err := cli.Publish(ctx, PublishOptions{Topic: fmt.Sprint("race/", w), Payload: payload})
 				cancel()
-				if errors.Is(err, context.DeadlineExceeded) {
+				switch {
+				case errors.Is(err, context.DeadlineExceeded):
 					t.Error("a publish racing the teardown was never answered")
 					return
+				case errors.Is(err, ErrNotConnected):
+					// Between connections: wait for the next instead of
+					// spinning, which starves the reconnect on one CPU.
+					_ = cli.AwaitConnection(running)
 				}
 			}
 		})
 	}
+	// The broker drops each connection after 20 ms; watch six go by.
 	var dead []*connState
-	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(30 * time.Second); len(dead) < 6; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d connections in 30s; the broker drops them every 20ms", len(dead))
+		}
 		if cs := cli.cur.Load(); cs != nil && (len(dead) == 0 || dead[len(dead)-1] != cs) {
 			dead = append(dead, cs)
 		}
-		time.Sleep(time.Millisecond)
 	}
-	close(stop)
+	stop()
 	wg.Wait()
 	for _, cs := range dead[:len(dead)-1] {
 		<-cs.writerDone
@@ -350,9 +354,6 @@ func TestTeardownAnswersEveryQueuedRequest(t *testing.T) {
 		if len(cs.writeQueue) != 0 {
 			t.Fatalf("a closed connection's queue holds %d unanswered requests", len(cs.writeQueue))
 		}
-	}
-	if len(dead) < 5 {
-		t.Fatalf("only %d connections in 2s; the broker should drop them every 20ms", len(dead))
 	}
 }
 

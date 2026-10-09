@@ -146,10 +146,6 @@ func (e *Engine) run(j *job) {
 		} else {
 			delete(e.queues, j.key)
 		}
-		e.writes--
-		if e.writes == 0 {
-			close(e.writesIdle)
-		}
 		var dropped []func(context.Context, error) error
 		first := false
 		if failure != nil {
@@ -161,6 +157,14 @@ func (e *Engine) run(j *job) {
 		if first {
 			e.afterFailure(failure, dropped)
 		}
+		// The write counts until its failure, if any, has been reported,
+		// so Drain does not return before OnFailure has run.
+		e.mu.Lock()
+		e.writes--
+		if e.writes == 0 {
+			close(e.writesIdle)
+		}
+		e.mu.Unlock()
 		if l != nil {
 			l.Wake()
 		}
@@ -248,8 +252,8 @@ func (e *Engine) Failure() error {
 	return e.failure
 }
 
-// Drain waits until no store write is queued or running, or for ctx to
-// end.
+// Drain waits until no store write is queued or running, and the failure
+// of any that failed has been reported to OnFailure, or for ctx to end.
 func (e *Engine) Drain(ctx context.Context) error {
 	e.mu.Lock()
 	idle := e.writesIdle

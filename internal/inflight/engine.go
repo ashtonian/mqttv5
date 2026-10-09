@@ -104,7 +104,8 @@ type Config struct {
 	// engine has dropped its session state, as a crash would: unfinished
 	// outbound flows have completed with the error, nothing more is
 	// collected, and new flows are refused until Restore reloads what
-	// the store holds. It must not block.
+	// the store holds. Drain waits for it to return, so it must not block
+	// or call Drain.
 	OnFailure func(error)
 	// OnStrayAck observes acknowledgements for unknown or mismatched
 	// packet identifiers, which are ignored.

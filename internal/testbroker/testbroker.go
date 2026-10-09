@@ -386,7 +386,11 @@ func (c *Conn) ServeSubscribe(rc int) (Packet, bool) {
 // ServeAuto answers protocol traffic until the connection or broker closes:
 // SUBSCRIBE (granted QoS), UNSUBSCRIBE (success), PINGREQ, PUBLISH QoS 1
 // (PUBACK) and QoS 2 (PUBREC), PUBREL (PUBCOMP). It returns on DISCONNECT.
-func (c *Conn) ServeAuto() {
+func (c *Conn) ServeAuto() { c.ServeAutoThen(nil) }
+
+// ServeAutoThen is ServeAuto, calling then after it has answered each
+// packet; an error from then ends it.
+func (c *Conn) ServeAutoThen(then func(Packet) error) {
 	for {
 		p, ok, err := c.Next(time.Minute)
 		if !ok {
@@ -420,6 +424,9 @@ func (c *Conn) ServeAuto() {
 			err = c.Pubcomp(p.PacketID, wire.ReasonSuccess)
 		case wire.DISCONNECT:
 			return
+		}
+		if err == nil && then != nil {
+			err = then(p)
 		}
 		if err != nil {
 			return
