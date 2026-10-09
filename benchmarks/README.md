@@ -695,10 +695,19 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
   or the codec benchmarks, and keeps their history with
   [github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark):
   a chart per benchmark at `https://<owner>.github.io/<repo>/dev/bench/`
-  (enable GitHub Pages on the `gh-pages` branch once; the first push to
-  `main` creates it) and a comment on each pull request, flagged when a
-  benchmark is 1.5× slower than the last entry on `main`. A regression
-  never fails the build: shared runners are too noisy for that.
+  and a comment on each pull request, flagged when a benchmark is 1.5×
+  slower than the last entry on `master`. A regression never fails the
+  build: shared runners are too noisy for that. The history lives on the
+  `gh-pages` branch, which has to exist before the first run; until it
+  does, the workflow runs the benchmarks and says they are not tracked.
+  Create it once, then enable GitHub Pages on it for the chart:
+
+  ```bash
+  git switch --orphan gh-pages
+  git commit --allow-empty -m "Benchmark history"
+  git push origin gh-pages
+  git switch -
+  ```
 - [`bench.yml`](../.github/workflows/bench.yml) runs the four end-to-end
   recordings above on demand (`gh workflow run bench.yml`) and uploads
   `results/` as an artifact. Shared runners are not a quiet host; use

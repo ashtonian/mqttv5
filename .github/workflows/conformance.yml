@@ -12,6 +12,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The oldest Go minor go.mod accepts, at its newest patch: what a
+  # supported user builds with, standard-library security fixes included.
+  # govulncheck checks the standard library of the Go that runs it.
+  GO_VERSION: '1.26.x'
+
 jobs:
   conformance:
     name: broker-backed conformance suite
@@ -21,7 +27,8 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: conformance/go.sum
 
       - name: start brokers

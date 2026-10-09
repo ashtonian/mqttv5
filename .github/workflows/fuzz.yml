@@ -14,6 +14,10 @@ permissions:
   contents: read
 
 env:
+  # The oldest Go minor go.mod accepts, at its newest patch: what a
+  # supported user builds with, standard-library security fixes included.
+  # govulncheck checks the standard library of the Go that runs it.
+  GO_VERSION: '1.26.x'
   FUZZ_TIME: 10m
 
 jobs:
@@ -35,7 +39,8 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
 
       - name: go test -fuzz
         run: go test ./wire/ -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime ${{ env.FUZZ_TIME }}
