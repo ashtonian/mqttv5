@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/metrics"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,10 +16,11 @@ import (
 // BenchmarkE2E_SlowConsumer shows what a library holds in memory when
 // its consumer stops. The consumer blocks on its first message while the
 // raw publisher sends b.N messages at QoS 0 or 1; once the client has
-// stopped taking in data the consumer is released and drains.
-// peak-heap-B is the largest growth of the process's heap objects over
-// the run, delivered-% how many messages reached the consumer intact;
-// the library dropped, and counted, the rest.
+// stopped taking in data the consumer is released and drains. held-B
+// is what the library holds at that point: how far the process's live
+// heap, measured after a collection, has grown over its level before
+// the burst. delivered-% is how many messages reached the consumer
+// intact; the library dropped, and counted, the rest.
 // A library whose consumer holds back its read loop stops reading, and
 // the backlog stays in the broker; so does one that leaves QoS 1
 // messages unacknowledged until its consumer takes them. Run with a
@@ -58,14 +58,14 @@ func runSlowConsumer(b *testing.B, l lib, m mode, qos byte, size int) {
 	waitLive(b, s, func() error { return pub.publish(topic, 0, nil, 1) })
 
 	runtime.GC()
-	sampler := startHeapSampler(b)
+	base := heapBytes()
 	b.ResetTimer()
 	if err := pub.publish(topic, qos, Payload(size), b.N); err != nil {
 		b.Fatalf("raw publisher: %v", err)
 	}
 	// The client has stopped taking in data once neither its heap nor
 	// its drop count has grown for a while.
-	settled := func() (uint64, int64) { return sampler.current(), sub.dropped() }
+	settled := func() (uint64, int64) { return heapBytes(), sub.dropped() }
 	h, d := settled()
 	for still := 0; still < 5; {
 		time.Sleep(100 * time.Millisecond)
@@ -77,6 +77,10 @@ func runSlowConsumer(b *testing.B, l lib, m mode, qos byte, size int) {
 		}
 		h, d = h2, d2
 	}
+	// Garbage is collected first: what is left is what the library
+	// keeps, not how far the collector let the heap run.
+	runtime.GC()
+	held := max(int64(heapBytes())-int64(base), 0)
 	close(release)
 	deadline := time.Now().Add(2 * time.Minute)
 	for delivered.Load()+sub.dropped() < int64(b.N) {
@@ -91,21 +95,9 @@ func runSlowConsumer(b *testing.B, l lib, m mode, qos byte, size int) {
 		time.Sleep(time.Millisecond)
 	}
 	b.StopTimer()
-	peak := sampler.stop()
 	s.check(b, sub)
-	b.ReportMetric(float64(peak), "peak-heap-B")
+	b.ReportMetric(float64(held), "held-B")
 	b.ReportMetric(100*float64(s.got.Load())/float64(b.N), "delivered-%")
-}
-
-// heapSampler records the largest growth of the process's heap-object
-// bytes, live or not yet collected, over the level at which it started.
-type heapSampler struct {
-	base  uint64
-	peak  atomic.Uint64
-	last  atomic.Uint64
-	once  sync.Once
-	stopc chan struct{}
-	done  chan struct{}
 }
 
 const heapMetric = "/memory/classes/heap/objects:bytes"
@@ -114,38 +106,4 @@ func heapBytes() uint64 {
 	s := []metrics.Sample{{Name: heapMetric}}
 	metrics.Read(s)
 	return s[0].Value.Uint64()
-}
-
-// startHeapSampler starts sampling; the sampler stops when b ends, if
-// not before.
-func startHeapSampler(b *testing.B) *heapSampler {
-	h := &heapSampler{base: heapBytes(), stopc: make(chan struct{}), done: make(chan struct{})}
-	b.Cleanup(func() { h.stop() })
-	go func() {
-		defer close(h.done)
-		t := time.NewTicker(time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-h.stopc:
-				return
-			case <-t.C:
-				v := heapBytes()
-				h.last.Store(v)
-				if v > h.base && v-h.base > h.peak.Load() {
-					h.peak.Store(v - h.base)
-				}
-			}
-		}
-	}()
-	return h
-}
-
-func (h *heapSampler) current() uint64 { return h.last.Load() }
-
-// stop ends sampling and returns the peak growth.
-func (h *heapSampler) stop() uint64 {
-	h.once.Do(func() { close(h.stopc) })
-	<-h.done
-	return h.peak.Load()
 }

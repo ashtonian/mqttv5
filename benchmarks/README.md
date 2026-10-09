@@ -124,7 +124,7 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
 | `BenchmarkE2E_Latency` | open loop: messages published on a fixed schedule (`rate`/s); latency from the scheduled time to delivery, so a stall shows up as latency (no coordinated omission) | the schedule plus the wait for the last deliveries, over N: about the schedule interval; read the `p50-ns` … `max-ns` metrics |
 | `BenchmarkE2E_Reconnect` | 20 QoS 1 publishes vanish in a proxy, the connection is cut; time until a subscriber has all 20 after the client reconnects with its session and resends them | one cut-and-recover cycle |
-| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst at QoS 0 or 1; `peak-heap-B` is the largest growth of the process's heap objects over the burst's start, sampled every millisecond, `delivered-%` how many messages reached the consumer intact; the library dropped, and counted, the rest | not meaningful |
+| `BenchmarkE2E_SlowConsumer` | the consumer blocks while `rawClient` sends a burst at QoS 0 or 1; `held-B` is what the client holds once it stops taking in data (the growth of the live heap, read after a collection, over its level before the burst), `delivered-%` how many messages reached the consumer intact; the library dropped, and counted, the rest | not meaningful |
 | `BenchmarkDecodePublish`, `BenchmarkDecodePublishRead`, `BenchmarkEncodePublish` | the codecs alone, no network (`props=none` or a content type and five user properties) | one packet |
 | `BenchmarkReceive`, `BenchmarkReceiveWindow`, `BenchmarkReceiveFilters` (core package) | mqttv5's inbound path against an in-process feed: decode, route, deliver, ack | one delivered message |
 
@@ -436,7 +436,8 @@ although their message was delivered after the reconnect.
 
 ### Slow consumer
 
-A consumer that stops while 200,000 1 KiB QoS 0 messages arrive:
+A consumer that stops while 200,000 1 KiB messages arrive, at QoS 0
+and at QoS 1:
 
 <!-- benchtab file=results/2026-10-09-e2e-slowconsumer/e2e-slowconsumer.txt rows=lib,mode cols=size unit=peak-heap-B -->
 
@@ -484,20 +485,20 @@ What each library does with the backlog:
   messages for a channel, 65,536 for a queue, by default) and drops the
   newest QoS 0 messages beyond it, acknowledging them and counting them
   in `Stats().InboundDropped` (`SubOnDrop` sees each one). A full queue
-  holds about as much memory as autopaho's channel. QoS 1 and 2
-  messages are never dropped: the subscription has room for the
-  client's Receive Maximum more (256 by default), and the broker holds
-  the rest back until the consumer acks.
+  holds about as much memory as autopaho's channel.
+- **QoS 1, every library** — nothing is dropped, and a client that
+  keeps reading while its consumer is stalled holds what the broker has
+  in flight to it: up to the Receive Maximum the client advertised,
+  after which the broker holds the rest. mqttv5 advertises 256 by
+  default, which mosquitto honours; autopaho advertises none, and
+  mosquitto then keeps to its own limit of 20 (`max_inflight_messages`).
 
-`peak-heap-B` is the largest increase, over its value when the burst
-started, of the process's heap-object bytes
-(`/memory/classes/heap/objects:bytes`), sampled every millisecond. It
-counts live objects and those the garbage collector has not freed yet,
-from anywhere in the process. It is neither the backlog's size nor a
-bound on it: a collection that frees older objects during the burst
-offsets the backlog's growth, and a peak between two samples is
-missed. Read it as the scale of what a backlog costs, not as an exact
-figure.
+`held-B` is what the client holds once it has stopped taking in data:
+how far the process's live heap-object bytes
+(`/memory/classes/heap/objects:bytes`, read after a garbage
+collection) have grown over their level before the burst. Collecting
+first keeps out garbage the collector has not reached yet, which
+would measure the collector's pacing rather than the library.
 
 ### Codec
 
