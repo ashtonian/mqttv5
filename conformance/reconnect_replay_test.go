@@ -14,7 +14,6 @@ import (
 
 	"github.com/ashtonian/mqttv5"
 	"github.com/ashtonian/mqttv5/transport"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 // connCapture wraps the built-in dial path and records the most recent
@@ -65,12 +64,11 @@ func (cc *connCapture) dialCount() int {
 	return cc.dials
 }
 
-// TestReconnect_QoS1SurvivesConnectionDrop drives the headline QoS 1
-// durability guarantee against a real broker: a QoS 1 message published
-// across an ungraceful connection drop is replayed by the supervisor
-// after it reconnects, delivered exactly once to a separate subscriber
-// (payload byte-equal), and the publisher's Publish call ultimately
-// returns success (PUBACK received).
+// A QoS 1 message published across an ungraceful connection drop is
+// resent after the reconnect, delivered at least once, and its Publish
+// call returns success. The supervisor replays it from the resumed
+// session; the subscriber sees the payload byte for byte, and the
+// publisher's call returns once the PUBACK arrives.
 //
 // Mechanism: the publisher P keeps a non-expiring session
 // (WithSessionExpiry(300) + WithCleanStartOnReconnect(false)) so the
@@ -83,10 +81,12 @@ func (cc *connCapture) dialCount() int {
 // DUP=1 on the replayed copy is the strict MQTT v5 §4.4 expectation, but
 // whether the subscriber observes DUP depends on broker timing (a broker
 // that PUBACKs P before the drop, or that delivers to S before P's
-// replay lands, can surface the message with DUP=0). The strong,
-// broker-independent invariants asserted here are: the message is
-// delivered, exactly once, byte-equal, and P.Publish returns nil. See
-// broker_caveats for the DUP nuance.
+// replay lands, can surface the message with DUP=0). QoS 1 is
+// at-least-once: when the broker forwarded the first copy and the PUBACK
+// was lost with the connection, the replay is legitimately delivered
+// again. The broker-independent invariants asserted here are: the
+// message is delivered at least once, every copy is byte-equal, the
+// publisher reconnects, and P.Publish returns nil.
 func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 	requireBroker(t, brokerURL())
 
@@ -163,7 +163,7 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		pubDone <- pub.Publish(ctx, wire.PublishOpts{
+		pubDone <- pub.Publish(ctx, mqttv5.PublishOptions{
 			Topic:   topic,
 			Payload: want,
 			QoS:     1,
@@ -192,17 +192,34 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 		t.Errorf("QoS = %d, want 1", m.QoS)
 	}
 	// DUP is informational only — record it, don't gate on it (broker
-	// timing dependent; see broker_caveats / the doc comment).
+	// timing dependent; see the doc comment).
 	t.Logf("delivered copy: DUP=%v QoS=%d (DUP is broker-timing dependent)", m.Dup, m.QoS)
 	_ = m.Ack()
 
-	// Exactly-once: no duplicate of the same payload should follow. A
-	// replay that the broker forwarded twice (or a broken dedup) would
-	// surface a second copy here.
-	expectNoMessage(t, ch, 1*time.Second)
+	// At-least-once: a replayed duplicate is allowed (see the doc
+	// comment), but every copy must carry the same bytes.
+	dupes := 0
+	for collecting := true; collecting; {
+		select {
+		case d := <-ch:
+			dupes++
+			if string(d.Payload) != string(want) {
+				t.Errorf("duplicate payload = %q, want %q", d.Payload, want)
+			}
+			_ = d.Ack()
+		case <-time.After(time.Second):
+			collecting = false
+		}
+	}
+	t.Logf("duplicates delivered after the first copy: %d", dupes)
 
-	// The supervisor must actually have reconnected to deliver the
-	// PUBACK — i.e. it dialled more than once.
+	// The supervisor must actually have reconnected — i.e. dialled more
+	// than once. When P's PUBACK beat the forced drop the reconnect is
+	// still pending here, so wait for it rather than sampling once.
+	deadline := time.Now().Add(15 * time.Second)
+	for cc.dialCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
 	if got := cc.dialCount(); got < 2 {
 		t.Errorf("dialCount = %d, want >= 2 (supervisor should have reconnected)", got)
 	}

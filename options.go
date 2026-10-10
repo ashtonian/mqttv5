@@ -13,11 +13,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
 	"time"
 
+	"github.com/ashtonian/mqttv5/internal/clock"
+	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/session"
 	"github.com/ashtonian/mqttv5/transport"
 	"github.com/ashtonian/mqttv5/wire"
@@ -35,14 +38,12 @@ const (
 	// CONNECT/CONNACK) when WithConnectTimeout is not called.
 	DefaultConnectTimeout = 10 * time.Second
 
-	// DefaultPingTimeout is the budget for PINGRESP after a PINGREQ
-	// before the connection is declared dead. Chosen flat (not a
-	// multiple of KeepAlive) because PINGRESP is a tiny packet whose
-	// RTT does not scale with how often PINGREQ is sent. With
-	// DefaultKeepAlive (30 s) the total dead-detect time is 40 s —
-	// comfortably inside every common broker's 1.5×KeepAlive (~45 s)
-	// disconnect window, so the client drives the reconnect rather
-	// than getting cut.
+	// DefaultPingTimeout caps how long the client waits for any packet
+	// after a PINGREQ before declaring the connection dead. The default
+	// is the smaller of this and half the keep-alive, so a dead
+	// connection is always detected before the next PINGREQ would be
+	// due. With DefaultKeepAlive (30 s) the dead-detect time is 40 s,
+	// inside a broker's 1.5×KeepAlive (45 s) disconnect window.
 	DefaultPingTimeout = 10 * time.Second
 
 	// DefaultSessionExpiry is the Session Expiry Interval (§3.1.2.11.2)
@@ -59,6 +60,27 @@ const (
 	// will wait for the DISCONNECT packet to flush before the
 	// connection is forcibly torn down.
 	DefaultDisconnectFlushTimeout = 500 * time.Millisecond
+
+	// DefaultReadBufferSize is the per-connection read window used when
+	// [WithReadBufferSize] is not called. 16 KiB cuts read syscalls for
+	// streams of small messages fourfold against 4 KiB; larger windows
+	// gain little (BenchmarkReceiveWindow).
+	DefaultReadBufferSize = 16 << 10
+
+	// DefaultMaxSubscribeQueueSize caps each [Client.SubscribeQueue]
+	// when no cap is configured. At roughly 200 B of overhead plus the
+	// payload per queued message, a full default queue of small
+	// messages holds about 13 MiB plus payloads.
+	DefaultMaxSubscribeQueueSize = 65536
+
+	// DefaultReceiveMaximum is the Receive Maximum the client advertises
+	// when [WithReceiveMaximum] is not called.
+	DefaultReceiveMaximum = 256
+
+	// UnboundedQueue, passed to [WithMaxSubscribeQueueSize] or
+	// [SubMaxQueueSize], removes the queue cap. A consumer that falls
+	// behind then grows memory without limit.
+	UnboundedQueue = -1
 )
 
 // DefaultReconnectBackoff is used when WithReconnectBackoff is not
@@ -80,8 +102,43 @@ type Config struct {
 	KeepAlive  uint16
 
 	// CleanStart sets the CleanStart flag on the initial CONNECT
-	// (§3.1.2.4). Default true.
+	// (§3.1.2.4). When not set explicitly it is true unless there is
+	// session state to resume (see [WithStore]).
 	CleanStart bool
+
+	// cleanStartSet records an explicit WithCleanStart.
+	cleanStartSet bool
+
+	// SessionLossPolicy decides what happens to unacknowledged QoS 1/2
+	// publishes when a connection starts without the old session.
+	// Default [SessionLossRepublish].
+	SessionLossPolicy SessionLossPolicy
+
+	// OutboundTopicAliases replaces repeated QoS 0 topics with topic
+	// aliases. Default false.
+	OutboundTopicAliases bool
+
+	// LenientDecoding tolerates the harmless broker violations listed at
+	// [WithLenientDecoding] instead of disconnecting. Default false.
+	LenientDecoding bool
+
+	// OnResubscribeError fires when the broker refuses filters the client
+	// re-subscribes after a session loss. Runs with the other lifecycle callbacks (see the package documentation).
+	OnResubscribeError func(SubscriptionToken, error)
+
+	// QoSDowngrade lowers a publish's QoS to the broker's Maximum QoS
+	// instead of failing it with [ErrQoSNotSupported]. Default false.
+	QoSDowngrade bool
+
+	// OnServerRedirect fires when the broker redirects the client (§4.11).
+	OnServerRedirect func(ServerRedirect)
+	// FollowServerRedirects makes the client connect where a redirect
+	// points.
+	FollowServerRedirects bool
+
+	// RetryInitialConnect makes Connect hand a failed first handshake
+	// to the supervisor's reconnect loop instead of returning its error.
+	RetryInitialConnect bool
 
 	// CleanStartOnReconnect sets CleanStart on every CONNECT after
 	// the first. Default false (preserve broker session for QoS 1/2
@@ -96,8 +153,14 @@ type Config struct {
 	ReceiveMaximum uint16
 
 	// MaximumPacketSize caps the largest packet the broker may send
-	// to this client (§3.1.2.11.4). Zero advertises no limit.
+	// to this client (§3.1.2.11.4). Zero advertises no limit. A larger
+	// packet closes the connection with DISCONNECT 0x95.
 	MaximumPacketSize uint32
+
+	// ReadBufferSize is the per-connection read window in bytes: how
+	// much one read syscall can bring in. Default
+	// [DefaultReadBufferSize].
+	ReadBufferSize int
 
 	// InboundTopicAliasMaximum is the inbound TopicAliasMaximum
 	// (§3.1.2.11.5). Zero (default) tells the broker not to alias
@@ -134,15 +197,15 @@ type Config struct {
 	WriteOverflowPolicy WriteOverflowPolicy
 
 	// WriteBatchMax caps how many pre-encoded packets the writer
-	// goroutine coalesces into one writev. 0 disables batching.
-	// Worth enabling only for sustained concurrent publishers; see
+	// goroutine coalesces into one writev. 0 disables batching. See
 	// [WithWriteBatch].
 	WriteBatchMax int
 
-	WillMessage *wire.WillOpts
+	WillMessage *WillOptions
 
-	// MaxSubscribeQueueSize caps the per-subscription buffer.
-	// Zero = unbounded.
+	// MaxSubscribeQueueSize caps each SubscribeQueue's length.
+	// 0 means [DefaultMaxSubscribeQueueSize]; [UnboundedQueue] (any
+	// negative value) removes the cap.
 	MaxSubscribeQueueSize int
 
 	// DropPolicy sets the default policy for full subscription
@@ -167,24 +230,25 @@ type Config struct {
 	// always wait for the broker's ack.
 	PublishMode PublishMode
 
-	// OnConnectionUp fires on each successful CONNECT/CONNACK after
-	// pending replays and resubscribes. The supplied *wire.Connack
-	// is a detached clone safe to retain. Must not block.
-	OnConnectionUp func(*wire.Connack)
+	// OnConnectionUp fires on each successful CONNECT/CONNACK with
+	// what the broker granted, possibly after Connect has returned.
+	// Runs with the other lifecycle callbacks (see the package documentation).
+	OnConnectionUp func(ConnackInfo)
 
 	// OnConnectionDown fires on unexpected connection loss (not on
 	// user-initiated Disconnect). Return false to stop the
-	// supervisor; a subsequent Connect restarts it. Must not block.
+	// supervisor, which waits for the answer; a subsequent Connect
+	// restarts it. Runs with the other lifecycle callbacks (see the package documentation).
 	OnConnectionDown func() bool
 
 	// OnConnectError fires per failed CONNECT attempt (dial failure,
 	// CONNACK refusal, AUTH-loop error). Observability only; the
-	// supervisor retries regardless. Must not block.
+	// supervisor retries regardless. Runs with the other lifecycle callbacks (see the package documentation).
 	OnConnectError func(err error)
 
-	// OnReconnectAttempt fires immediately before each reconnect
-	// dial (not the initial Connect). attempt starts at 1. Must not
-	// block.
+	// OnReconnectAttempt fires before each reconnect dial (not the
+	// initial Connect), which waits for it. attempt starts at 1.
+	// Runs with the other lifecycle callbacks (see the package documentation).
 	OnReconnectAttempt func(attempt int, brokerURL string)
 
 	// StatsEnabled toggles the [Client.Stats] counter set. Default
@@ -193,37 +257,45 @@ type Config struct {
 	StatsEnabled bool
 
 	// OnServerDisconnect fires when the broker sends a DISCONNECT
-	// (§3.14) — the supplied *wire.Disconnect is a detached clone.
+	// (§3.14).
 	// Fires after the connection is marked down and before
 	// OnConnectionDown. May call [Client.SetBrokers] to honour a
 	// ServerMoved / UseAnotherServer redirect on the next attempt.
-	OnServerDisconnect func(*wire.Disconnect)
+	// Runs with the other lifecycle callbacks (see the package documentation).
+	OnServerDisconnect func(DisconnectInfo)
 
 	// Authenticator drives MQTT v5 enhanced authentication when set.
 	Authenticator Authenticator
 
-	// OnReauthenticated fires when an MQTT v5 re-authentication (§4.12)
-	// concludes successfully (broker AUTH 0x00 Success) — for either a
-	// client-initiated Reauthenticate or a broker-driven exchange. Runs
-	// on the read loop; must not block. Observability only: a
-	// client-initiated success is also reported by Reauthenticate's
-	// return value.
+	// OnReauthenticated fires when a re-authentication (§4.12) the
+	// client started with Reauthenticate concludes successfully (broker
+	// AUTH 0x00 Success), possibly after Reauthenticate has returned.
+	// Observability only: the success is also Reauthenticate's return
+	// value. Runs with the other lifecycle callbacks (see the package documentation).
 	OnReauthenticated func()
 
 	// ConnectPacketBuilder is invoked immediately before each CONNECT
-	// is serialised. The callback may mutate any field of opts —
-	// typical use is rotating Username/Password per attempt for
-	// OAuth refresh. ctx is the per-attempt context bounded by
+	// is serialised and may change its credentials and user
+	// properties — typically rotating Username/Password per attempt
+	// for OAuth refresh. ctx is the per-attempt context bounded by
 	// ConnectTimeout. A non-nil error fails the attempt; the
 	// supervisor retries after backoff and fires OnConnectError.
-	ConnectPacketBuilder func(ctx context.Context, opts *wire.ConnectOpts) error
+	ConnectPacketBuilder func(ctx context.Context, opts *ConnectOptions) error
 
 	// ReconnectBackoff returns the delay before retry attempt N.
 	// Defaults to [DefaultReconnectBackoff].
 	ReconnectBackoff Backoff
 
 	Logger *slog.Logger
-	Store  session.Store
+
+	// Store persists session state across process restarts. Nil (the
+	// default) keeps it in memory: in-flight QoS 1/2 messages survive
+	// reconnects but not a restart.
+	Store session.Store
+
+	// OnStoreFailure fires once when a Store write fails and the client
+	// has stopped because of it (see [WithStore]). Runs with the other lifecycle callbacks (see the package documentation).
+	OnStoreFailure func(err error)
 
 	TLSConfig *tls.Config
 	Dialer    *net.Dialer
@@ -233,6 +305,10 @@ type Config struct {
 	// WebSocket (see transport/ws) / in-memory test transports.
 	// When set, broker URL scheme validation is skipped.
 	DialFunc transport.DialFunc
+
+	// clock is the time source for keep-alive, backoff and queue draining.
+	// Tests inject a fake through withClock; production uses clock.Real.
+	clock clock.Clock
 }
 
 // Option mutates a [Config] during [New]; a non-nil return aborts
@@ -252,6 +328,10 @@ func WithBroker(url string) Option {
 // WithBrokers sets the ordered broker URL list. The supervisor
 // rotates through it across reconnect attempts; [Client.SetBrokers]
 // replaces it at runtime.
+//
+// Brokers that do not share session state answer a failover CONNECT
+// with Session Present = 0: unacknowledged QoS 1/2 publishes then
+// follow [WithSessionLossPolicy] and subscriptions are re-issued.
 func WithBrokers(urls ...string) Option {
 	return func(c *Config) error {
 		if len(urls) == 0 {
@@ -305,10 +385,141 @@ func WithoutKeepAlive() Option {
 }
 
 // WithCleanStart sets the CleanStart flag on the initial CONNECT.
-// Default true. Reconnects use [WithCleanStartOnReconnect].
+// Without it the first CONNECT starts clean unless there is session
+// state to resume — state left by an earlier Connect on this Client or
+// loaded from [WithStore] — in which case it resumes (CleanStart=0).
+// WithCleanStart(true) always starts a new session and discards that
+// state. Reconnects use [WithCleanStartOnReconnect].
 func WithCleanStart(b bool) Option {
 	return func(c *Config) error {
 		c.CleanStart = b
+		c.cleanStartSet = true
+		return nil
+	}
+}
+
+// SessionLossPolicy decides what happens to unacknowledged QoS 1/2
+// publishes when a connection starts without the old session: the
+// broker answered CONNACK with Session Present = 0 (restart without
+// persistence, session expiry, failover to another broker in
+// [WithBrokers]) or the client connected with CleanStart=1.
+type SessionLossPolicy uint8
+
+const (
+	// SessionLossRepublish sends them again as new messages (DUP=0) in
+	// their original order; their Publish calls keep waiting for the new
+	// acknowledgement. Delivery stays at-least-once, and a message the
+	// old broker had already forwarded is delivered twice — including
+	// QoS 2, whose exactly-once guarantee cannot survive a session loss.
+	// Messages whose Message Expiry Interval ran out complete with
+	// [ErrMessageExpired]; the rest are sent with the remaining interval.
+	SessionLossRepublish SessionLossPolicy = SessionLossPolicy(inflight.Republish)
+
+	// SessionLossFail completes them with [ErrSessionLost] and leaves
+	// any retry to the caller.
+	SessionLossFail SessionLossPolicy = SessionLossPolicy(inflight.Fail)
+)
+
+func (p SessionLossPolicy) valid() bool { return p == SessionLossRepublish || p == SessionLossFail }
+
+// WithOutboundTopicAliases makes QoS 0 publishes replace a repeated
+// topic with a topic alias (§3.3.2.3.4) while the broker's Topic Alias
+// Maximum lasts: the first publish to a topic registers the alias, later
+// ones send only the alias. It saves bandwidth for long topics. QoS 1/2
+// publishes always carry their topic, since they may be resent on a
+// connection where the alias is unknown. Off by default.
+func WithOutboundTopicAliases() Option {
+	return func(c *Config) error {
+		c.OutboundTopicAliases = true
+		return nil
+	}
+}
+
+// WithLenientDecoding tolerates two harmless protocol violations seen
+// from real brokers — a non-minimally encoded Remaining Length and
+// reserved flag bits on PINGRESP — logging each at Warn instead of
+// disconnecting. Every other violation still closes the connection with
+// the spec's reason code (0x81 Malformed Packet, 0x82 Protocol Error, or
+// a more specific one) and counts in [Stats].ProtocolErrors.
+func WithLenientDecoding() Option {
+	return func(c *Config) error {
+		c.LenientDecoding = true
+		return nil
+	}
+}
+
+// WithOnResubscribeError observes filters the broker refuses when the
+// client re-subscribes after a session loss (Session Present = 0). A
+// subscription that loses every filter closes, and its token's Err
+// reports why; one that keeps some carries on with those. Runs with the
+// other lifecycle callbacks (see the package documentation).
+func WithOnResubscribeError(fn func(SubscriptionToken, error)) Option {
+	return func(c *Config) error {
+		c.OnResubscribeError = fn
+		return nil
+	}
+}
+
+// WithQoSDowngrade sends a publish whose QoS is above the broker's
+// Maximum QoS (CONNACK, §3.2.2.3.4) at that maximum instead of failing
+// it with [ErrQoSNotSupported]. It weakens the delivery guarantee the
+// caller asked for — QoS 2 becomes at-least-once — so it is off by
+// default. Brokers such as AWS IoT Core advertise Maximum QoS 1.
+func WithQoSDowngrade() Option {
+	return func(c *Config) error {
+		c.QoSDowngrade = true
+		return nil
+	}
+}
+
+// WithSessionLossPolicy sets the [SessionLossPolicy]. Default
+// [SessionLossRepublish].
+func WithSessionLossPolicy(p SessionLossPolicy) Option {
+	return func(c *Config) error {
+		if !p.valid() {
+			return fmt.Errorf("mqttv5: invalid SessionLossPolicy %d", p)
+		}
+		c.SessionLossPolicy = p
+		return nil
+	}
+}
+
+// WithOnServerRedirect calls fn when the broker refuses a CONNECT, or
+// ends the connection, with reason 0x9C Use another server or 0x9D
+// Server moved and a Server Reference (§4.11). May call
+// [Client.SetBrokers]: the next attempt waits for it. Runs with the other lifecycle callbacks (see the
+// package documentation).
+func WithOnServerRedirect(fn func(ServerRedirect)) Option {
+	return func(c *Config) error {
+		c.OnServerRedirect = fn
+		return nil
+	}
+}
+
+// WithFollowServerRedirects makes the client connect where the broker
+// redirects it: after 0x9D Server moved the reference replaces the
+// broker list ([Client.SetBrokers]); after 0x9C Use another server only
+// the next connection attempt uses it. A reference that is a host or
+// host:port keeps the current URL's scheme and path. Off by default:
+// a redirect is reported ([WithOnServerRedirect]) and otherwise
+// ignored.
+func WithFollowServerRedirects() Option {
+	return func(c *Config) error {
+		c.FollowServerRedirects = true
+		return nil
+	}
+}
+
+// WithRetryInitialConnect lets the client start while the broker is
+// unreachable: when the first CONNECT fails, Connect reports the error to
+// [WithOnConnectError], returns nil, and the supervisor retries with
+// [WithReconnectBackoff] as after a lost connection. Publish and
+// Subscribe return ErrNotConnected until then ([QueuePublisher] queues);
+// [Client.AwaitConnection] waits for the connection. Without it,
+// Connect returns the first failure.
+func WithRetryInitialConnect() Option {
+	return func(c *Config) error {
+		c.RetryInitialConnect = true
 		return nil
 	}
 }
@@ -334,8 +545,14 @@ func WithSessionExpiry(s uint32) Option {
 	}
 }
 
-// WithReceiveMaximum bounds concurrent inbound QoS 1/2 publishes
-// (§3.1.2.11.3). Also sizes the packet-ID pool.
+// WithReceiveMaximum sets the Receive Maximum (§3.1.2.11.3): how many
+// QoS 1/2 messages the broker may send that the client has not yet
+// acknowledged. A delivered message is acknowledged once the
+// application acks it, so this is also how many QoS 1/2 messages a
+// subscription whose consumer falls behind can hold beyond its buffer,
+// and what that costs in memory (see [Client.Subscribe]). A broker that
+// sends more is disconnected with reason 0x93. Default
+// [DefaultReceiveMaximum]; 0 keeps the default.
 func WithReceiveMaximum(n uint16) Option {
 	return func(c *Config) error {
 		c.ReceiveMaximum = n
@@ -344,10 +561,25 @@ func WithReceiveMaximum(n uint16) Option {
 }
 
 // WithMaximumPacketSize caps the largest packet the broker may send
-// to this client (§3.1.2.11.4). Zero advertises no limit.
+// to this client (§3.1.2.11.4). Zero advertises no limit. A broker that
+// sends a larger packet is disconnected with reason 0x95.
 func WithMaximumPacketSize(n uint32) Option {
 	return func(c *Config) error {
 		c.MaximumPacketSize = n
+		return nil
+	}
+}
+
+// WithReadBufferSize sets the per-connection read window in bytes: how
+// much one read syscall can bring in. A larger window cuts syscalls for
+// streams of small messages at the cost of that much memory per
+// connection. Default [DefaultReadBufferSize].
+func WithReadBufferSize(n int) Option {
+	return func(c *Config) error {
+		if n < 512 {
+			return fmt.Errorf("mqttv5: read buffer size %d below 512 bytes", n)
+		}
+		c.ReadBufferSize = n
 		return nil
 	}
 }
@@ -376,7 +608,8 @@ func WithRequestResponseInformation(b bool) Option {
 // UserProperties on error responses (§3.1.2.11.7). Default true —
 // debugging a CONNECT or PUBLISH refusal without these is "why was
 // this rejected?" with no answer; the wire cost is a handful of
-// bytes on the error path only. Pass false to opt out.
+// bytes on the error path only. Pass false to opt out: the CONNECT
+// then carries Request Problem Information = 0.
 func WithRequestProblemInformation(b bool) Option {
 	return func(c *Config) error {
 		c.RequestProblemInformation = b
@@ -412,10 +645,14 @@ func WithConnectTimeout(d time.Duration) Option {
 	}
 }
 
-// WithPingTimeout sets the budget for a PINGRESP after a PINGREQ.
-// Exceeding it forces a reconnect. Default [DefaultPingTimeout]
-// (10 s). Override only on links where PINGRESP round-trip exceeds a
-// few seconds (LEO satellite, severely congested cellular).
+// WithPingTimeout sets how long the client waits for any packet after a
+// PINGREQ before declaring the connection dead and reconnecting. It
+// must be shorter than the keep-alive ([New] rejects it otherwise);
+// when the broker grants a shorter keep-alive than requested, half the
+// granted keep-alive is used instead. Default: the smaller of
+// [DefaultPingTimeout] and half the keep-alive. Raise it only on links
+// whose round trip exceeds a few seconds (satellite, congested
+// cellular).
 func WithPingTimeout(d time.Duration) Option {
 	return func(c *Config) error {
 		c.PingTimeout = d
@@ -442,10 +679,11 @@ func WithWriteQueueSize(n int) Option {
 	}
 }
 
-// WithWriteBatch coalesces up to n pre-encoded packets per writev
-// syscall. Off by default (n=0 or 1). Wins under sustained concurrent
-// [Client.Publish] (~40% at 256B with n=16 on loopback); regresses
-// for single-publisher or large-payload workloads. Measure first.
+// WithWriteBatch coalesces up to n queued packets into one writev
+// syscall. Off by default (n=0 or 1). It saves syscalls when many
+// goroutines publish concurrently and packets queue behind the writer;
+// with one publisher or large payloads there is little to coalesce.
+// Measure with your workload before enabling it.
 func WithWriteBatch(n int) Option {
 	return func(c *Config) error {
 		if n < 0 {
@@ -458,18 +696,20 @@ func WithWriteBatch(n int) Option {
 
 // WithWill attaches a will message to be published by the broker if
 // this client disconnects ungracefully.
-func WithWill(w *wire.WillOpts) Option {
+func WithWill(w *WillOptions) Option {
 	return func(c *Config) error {
 		c.WillMessage = w
 		return nil
 	}
 }
 
-// WithOnConnectionUp fires on each successful CONNECT/CONNACK after
-// pending replays and resubscribes. fn receives a detached
-// *wire.Connack clone safe to retain (assigned ClientID, server
-// keepalive, MaximumQoS, ResponseInformation, ...). Must not block.
-func WithOnConnectionUp(fn func(*wire.Connack)) Option {
+// WithOnConnectionUp fires on each successful CONNECT/CONNACK with what
+// the broker granted (session present, limits, assigned ClientID,
+// effective keep-alive, ...); [Client.ServerInfo] returns the same for
+// the current connection. It may run after [Client.Connect] has
+// returned. Runs with the other lifecycle callbacks (see the package
+// documentation).
+func WithOnConnectionUp(fn func(ConnackInfo)) Option {
 	return func(c *Config) error {
 		c.OnConnectionUp = fn
 		return nil
@@ -478,9 +718,10 @@ func WithOnConnectionUp(fn func(*wire.Connack)) Option {
 
 // WithOnConnectionDown registers a callback fired when the connection
 // is lost. Does NOT fire on user-initiated Disconnect. Return false
-// to terminate the supervisor — no further reconnect attempts. A
-// subsequent Connect on the same Client re-starts the lifecycle.
-// Must not block.
+// to terminate the supervisor — no further reconnect attempts; the
+// supervisor waits for the answer. A subsequent Connect on the same
+// Client re-starts the lifecycle. Runs with the other lifecycle
+// callbacks (see the package documentation).
 func WithOnConnectionDown(fn func() bool) Option {
 	return func(c *Config) error {
 		c.OnConnectionDown = fn
@@ -490,7 +731,8 @@ func WithOnConnectionDown(fn func() bool) Option {
 
 // WithOnConnectError fires per failed CONNECT attempt (dial err,
 // CONNACK refusal, AUTH-loop err). Observability only — the
-// supervisor retries regardless. Must not block.
+// supervisor retries regardless. Runs with the other lifecycle
+// callbacks (see the package documentation).
 func WithOnConnectError(fn func(error)) Option {
 	return func(c *Config) error {
 		c.OnConnectError = fn
@@ -498,9 +740,12 @@ func WithOnConnectError(fn func(error)) Option {
 	}
 }
 
-// WithOnReconnectAttempt fires immediately before each reconnect
-// dial (not the initial [Client.Connect]); attempt starts at 1.
-// Must not block.
+// WithOnReconnectAttempt fires before each reconnect dial (not the
+// initial [Client.Connect]), which waits for it. attempt starts at 1
+// after a connection that lasted, and keeps counting across
+// connections that dropped sooner than the reconnect delay before them
+// (see [WithReconnectBackoff]). Runs with the other lifecycle callbacks
+// (see the package documentation).
 func WithOnReconnectAttempt(fn func(attempt int, brokerURL string)) Option {
 	return func(c *Config) error {
 		c.OnReconnectAttempt = fn
@@ -509,24 +754,25 @@ func WithOnReconnectAttempt(fn func(attempt int, brokerURL string)) Option {
 }
 
 // WithOnServerDisconnect fires when the broker sends a DISCONNECT
-// (§3.14). fn receives a detached *wire.Disconnect clone safe to
-// retain. Fires after the connection is marked down and before
+// (§3.14), with its reason, reason string, server reference and user
+// properties. Fires after the connection is marked down and before
 // OnConnectionDown; may call [Client.SetBrokers] to honour a
-// ServerMoved / UseAnotherServer redirect on the next attempt. Not
-// fired for socket-level errors or client-initiated Disconnect.
-// Must not block.
-func WithOnServerDisconnect(fn func(*wire.Disconnect)) Option {
+// ServerMoved / UseAnotherServer redirect on the next attempt, which
+// waits for it. Not fired for socket-level errors or client-initiated
+// Disconnect. Runs with the other lifecycle callbacks (see the package
+// documentation).
+func WithOnServerDisconnect(fn func(DisconnectInfo)) Option {
 	return func(c *Config) error {
 		c.OnServerDisconnect = fn
 		return nil
 	}
 }
 
-// WithOnReauthenticated registers a callback fired when an MQTT v5
-// re-authentication (§4.12) concludes successfully (broker AUTH 0x00
-// Success), whether the exchange was client-initiated (Reauthenticate)
-// or broker-driven. Observability only — runs on the read loop and must
-// not block.
+// WithOnReauthenticated registers a callback fired when a
+// re-authentication (§4.12) the client started with Reauthenticate
+// concludes successfully (broker AUTH 0x00 Success), possibly after
+// Reauthenticate has returned. Observability only. Runs with the other
+// lifecycle callbacks (see the package documentation).
 func WithOnReauthenticated(fn func()) Option {
 	return func(c *Config) error {
 		c.OnReauthenticated = fn
@@ -534,19 +780,23 @@ func WithOnReauthenticated(fn func()) Option {
 	}
 }
 
-// WithConnectPacketBuilder mutates *wire.ConnectOpts immediately
-// before each CONNECT is serialised — canonical OAuth token-refresh
-// hook. ctx is the per-attempt context bounded by ConnectTimeout.
-// A non-nil error fails the attempt; the supervisor retries after
-// backoff and fires OnConnectError.
-func WithConnectPacketBuilder(fn func(ctx context.Context, opts *wire.ConnectOpts) error) Option {
+// WithConnectPacketBuilder lets fn change the CONNECT's credentials
+// and user properties immediately before each attempt — canonical
+// OAuth token-refresh hook. ctx is the per-attempt context bounded by
+// ConnectTimeout. A non-nil error fails the attempt; the supervisor
+// retries after backoff and fires OnConnectError.
+func WithConnectPacketBuilder(fn func(ctx context.Context, opts *ConnectOptions) error) Option {
 	return func(c *Config) error {
 		c.ConnectPacketBuilder = fn
 		return nil
 	}
 }
 
-// WithReconnectBackoff sets the supervisor's reconnect backoff. See
+// WithReconnectBackoff sets the supervisor's reconnect backoff: the
+// delay before each reconnect attempt, by attempt number. The count
+// starts over only once a connection has outlived the delay before it,
+// so a broker that drops connections right after accepting them is
+// retried at the growing interval rather than at the first one. See
 // [ConstantBackoff] and [ExponentialBackoff]; default
 // [DefaultReconnectBackoff].
 func WithReconnectBackoff(b Backoff) Option {
@@ -556,8 +806,10 @@ func WithReconnectBackoff(b Backoff) Option {
 	}
 }
 
-// WithMaxSubscribeQueueSize caps each subscription's buffer.
-// 0 = unbounded. Per-call override via [SubMaxQueueSize].
+// WithMaxSubscribeQueueSize caps each [Client.SubscribeQueue]'s length.
+// Default [DefaultMaxSubscribeQueueSize]; [UnboundedQueue] removes the
+// cap. When a queue is full its [DropPolicy] applies. Per-call override
+// via [SubMaxQueueSize].
 func WithMaxSubscribeQueueSize(n int) Option {
 	return func(c *Config) error {
 		c.MaxSubscribeQueueSize = n
@@ -664,8 +916,15 @@ const (
 	// are not surfaced.
 	PublishFireAndForget PublishMode = iota
 
-	// PublishWaitForFlush makes Publish block until conn.Write
-	// returns and surfaces transport errors. Useful as a
+	// PublishWaitForFlush makes Publish block until the packet is
+	// written to the connection and surfaces transport errors. On a TCP
+	// or Unix connection with nothing queued for the writer goroutine the
+	// caller writes the packet itself: the header and the caller's
+	// payload go out in one writev, and the payload is not copied. ctx
+	// bounds the call either way. A write it interrupts is finished by
+	// the writer goroutine, which copies what is left, so the packet may
+	// still reach the broker after Publish returned ctx's error; one
+	// interrupted before its first byte is not sent. Useful as a
 	// connection-health probe.
 	PublishWaitForFlush
 )
@@ -788,11 +1047,40 @@ func WithStats() Option {
 	}
 }
 
-// WithStore overrides the [session.Store]. Default is in-memory; use
-// the store/file submodule for crash safety.
+// WithStore persists session state in s so a restarted process resumes
+// its QoS 1/2 flows: unacknowledged publishes are resent, QoS 2
+// exchanges continue at the phase they reached, and a broker-assigned
+// ClientID is reused. Each state change is written to s before the
+// packet that depends on it is sent (see package session). Without a
+// store the same state is kept in memory and survives reconnects only.
+//
+// A failed write of a new message's record fails that Publish. Any
+// other failed write means the store no longer holds what the session
+// has done, so the client stops rather than go on without the guarantee
+// the store exists for: it sends DISCONNECT 0x80 (the broker publishes
+// the Will), ends as [Client.Disconnect] would, and fires
+// [WithOnStoreFailure]. QoS 1/2 Publish calls still waiting return the
+// failure, a [*StoreError] matching [ErrStoreFailed]; their messages stay
+// in the store. The next [Client.Connect] reloads the session from s, as
+// a restarted process would.
+//
+// The client does not close s. Use the store/file submodule for a
+// file-backed store, or session.MemoryStore in tests.
 func WithStore(s session.Store) Option {
 	return func(c *Config) error {
 		c.Store = s
+		return nil
+	}
+}
+
+// WithOnStoreFailure registers a callback fired once when a session
+// store write failed and the client has stopped because of it (see
+// [WithStore]); err is a [*StoreError]. Call [Client.Connect], from the
+// callback or later, to start again from what the store holds. Runs
+// with the other lifecycle callbacks (see the package documentation).
+func WithOnStoreFailure(fn func(err error)) Option {
+	return func(c *Config) error {
+		c.OnStoreFailure = fn
 		return nil
 	}
 }
@@ -845,6 +1133,9 @@ func (c *Config) defaults() {
 	}
 	if c.PingTimeout == 0 {
 		c.PingTimeout = DefaultPingTimeout
+		if half := time.Duration(c.KeepAlive) * time.Second / 2; c.KeepAlive > 0 && half < c.PingTimeout {
+			c.PingTimeout = half
+		}
 	}
 	if c.DisconnectFlushTimeout == 0 {
 		c.DisconnectFlushTimeout = DefaultDisconnectFlushTimeout
@@ -852,17 +1143,26 @@ func (c *Config) defaults() {
 	if c.WriteQueueSize == 0 {
 		c.WriteQueueSize = DefaultWriteQueueSize
 	}
+	if c.ReadBufferSize == 0 {
+		c.ReadBufferSize = DefaultReadBufferSize
+	}
+	if c.MaxSubscribeQueueSize == 0 {
+		c.MaxSubscribeQueueSize = DefaultMaxSubscribeQueueSize
+	}
+	if c.ReceiveMaximum == 0 {
+		c.ReceiveMaximum = DefaultReceiveMaximum
+	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
-	}
-	if c.Store == nil {
-		c.Store = session.NewMemoryStore()
 	}
 	if c.ReconnectBackoff == nil {
 		c.ReconnectBackoff = DefaultReconnectBackoff
 	}
 	if c.PublisherPoolClientIDFn == nil {
 		c.PublisherPoolClientIDFn = defaultPoolClientIDFn
+	}
+	if c.clock == nil {
+		c.clock = clock.Real{}
 	}
 	// CleanStart defaults to true for safety; sessions are explicit.
 	// (Zero-value bool is false, so we cannot detect "user set it
@@ -880,17 +1180,13 @@ var ErrMissingBroker = errors.New("mqttv5: missing broker URL (use WithBroker)")
 var ErrInvalidBrokerURL = errors.New("mqttv5: invalid broker URL")
 
 // builtinSchemes is the set of URL schemes handled by transport.Dial.
-// ws:// and wss:// require WithDialFunc(ws.DialFunc(...)) — they're
-// listed here so SetBrokers / validateBrokerURLs accept them at
-// construct time when a DialFunc is also configured.
+// ws:// and wss:// need WithDialFunc(ws.DialFunc(...)).
 var builtinSchemes = map[string]bool{
 	"mqtt":  true,
 	"tcp":   true,
 	"mqtts": true,
 	"tls":   true,
 	"ssl":   true,
-	"ws":    true,
-	"wss":   true,
 }
 
 // validateBrokerURLs sanity-checks urls. When dialFuncSet is true the
@@ -915,6 +1211,10 @@ func validateBrokerURLs(urls []string, dialFuncSet bool) error {
 		if dialFuncSet {
 			continue
 		}
+		if u.Scheme == "ws" || u.Scheme == "wss" {
+			return fmt.Errorf("%w: urls[%d] = %q: WebSocket needs WithDialFunc (see the transport/ws submodule)",
+				ErrInvalidBrokerURL, i, raw)
+		}
 		if !builtinSchemes[u.Scheme] {
 			return fmt.Errorf("%w: urls[%d] = %q: unsupported scheme %q",
 				ErrInvalidBrokerURL, i, raw, u.Scheme)
@@ -931,11 +1231,46 @@ func (c *Config) validate() error {
 	if !c.DropPolicy.valid() {
 		return fmt.Errorf("mqttv5: invalid DropPolicy %d", c.DropPolicy)
 	}
+	if !c.SessionLossPolicy.valid() {
+		return fmt.Errorf("mqttv5: invalid SessionLossPolicy %d", c.SessionLossPolicy)
+	}
+	if keep := time.Duration(c.KeepAlive) * time.Second; c.KeepAlive > 0 && c.PingTimeout >= keep {
+		return fmt.Errorf("mqttv5: PingTimeout %v must be shorter than KeepAlive %v", c.PingTimeout, keep)
+	}
+	if c.PingTimeout < 0 {
+		return fmt.Errorf("mqttv5: negative PingTimeout %v", c.PingTimeout)
+	}
 	if !c.PublishMode.valid() {
 		return fmt.Errorf("mqttv5: invalid PublishMode %d", c.PublishMode)
 	}
 	if !c.PublisherPoolRouting.valid() {
 		return fmt.Errorf("mqttv5: invalid PoolRoutingPolicy %d", c.PublisherPoolRouting)
+	}
+	for _, d := range []struct {
+		name string
+		v    time.Duration
+	}{{"ConnectTimeout", c.ConnectTimeout}, {"DisconnectFlushTimeout", c.DisconnectFlushTimeout}} {
+		if d.v < 0 {
+			return fmt.Errorf("mqttv5: negative %s %v", d.name, d.v)
+		}
+	}
+	for _, n := range []struct {
+		name string
+		v    int
+	}{{"WriteQueueSize", c.WriteQueueSize}, {"PublisherPoolSize", c.PublisherPoolSize}} {
+		if n.v < 0 {
+			return fmt.Errorf("mqttv5: negative %s %d", n.name, n.v)
+		}
+	}
+	// Encode the CONNECT this configuration produces, so an invalid
+	// client ID, user name, user property or Will fails here rather than
+	// on every connection attempt.
+	probe := wire.ConnectOpts{
+		ClientID: c.ClientID, KeepAlive: c.KeepAlive, Username: c.Username, Password: c.Password,
+		Will: c.WillMessage.wire(), UserProperties: c.ConnectUserProperties,
+	}
+	if _, err := wire.WriteConnect(io.Discard, probe); err != nil {
+		return fmt.Errorf("mqttv5: CONNECT from these options: %w", err)
 	}
 	return nil
 }

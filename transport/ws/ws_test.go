@@ -5,6 +5,8 @@ package ws
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -78,15 +80,34 @@ func TestDialAndRoundTrip(t *testing.T) {
 	}
 }
 
-func TestWssRequiresTLSConfig(t *testing.T) {
-	u, _ := url.Parse("wss://example.com/")
-	_, err := Dial(context.Background(), u, DialOpts{})
-	if err == nil {
-		t.Fatal("expected ErrMissingTLSConfig, got nil")
+// Without a TLSConfig, wss:// verifies the broker against the system
+// roots, as mqtts:// does: a certificate they do not trust is refused,
+// and one trusted through TLSConfig is accepted.
+func TestWssVerifiesByDefault(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+	ctx := context.Background()
+	if conn, err := Dial(ctx, u, DialOpts{}); err == nil {
+		conn.Close()
+		t.Fatal("wss:// to an untrusted certificate succeeded")
 	}
-	if err != ErrMissingTLSConfig {
-		t.Fatalf("got %v, want ErrMissingTLSConfig", err)
+	conn, err := Dial(ctx, u, DialOpts{TLSConfig: &tls.Config{RootCAs: certPool(srv.Certificate())}})
+	if err != nil {
+		t.Fatalf("wss:// with the certificate trusted: %v", err)
 	}
+	conn.Close()
+}
+
+func certPool(c *x509.Certificate) *x509.CertPool {
+	p := x509.NewCertPool()
+	p.AddCert(c)
+	return p
 }
 
 func TestRejectUnsupportedScheme(t *testing.T) {

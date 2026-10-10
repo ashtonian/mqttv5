@@ -3,11 +3,14 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 )
 
@@ -37,7 +40,8 @@ type Publish struct {
 func (*Publish) Type() PacketType { return PUBLISH }
 
 // Release returns the packet and its frame buffer to their pools. Every
-// []byte and string field becomes invalid after this returns.
+// []byte and string field becomes invalid after this returns, unless
+// Pooled reports false.
 func (p *Publish) Release() {
 	if p.frame != nil {
 		releaseBuf(p.frame)
@@ -51,6 +55,71 @@ func (p *Publish) Release() {
 	p.Dup = false
 	p.PacketID = 0
 	publishPool.Put(p)
+}
+
+// Pooled reports whether Release recycles the packet's frame, which
+// invalidates the Topic, Payload and Properties views. A frame larger
+// than the biggest pool class is never recycled: those views stay valid
+// after Release for as long as they are referenced.
+func (p *Publish) Pooled() bool { return p.frame != nil && pooled(*p.frame) }
+
+// Clone returns a deep copy of o: no slice or pointed-to value is
+// shared with o, and nil stays nil.
+func (o PublishOpts) Clone() PublishOpts {
+	c := o
+	c.Payload = bytes.Clone(o.Payload)
+	c.CorrelationData = bytes.Clone(o.CorrelationData)
+	c.UserProperties = slices.Clone(o.UserProperties)
+	if o.PayloadFormatIndicator != nil {
+		v := *o.PayloadFormatIndicator
+		c.PayloadFormatIndicator = &v
+	}
+	if o.MessageExpiryInterval != nil {
+		v := *o.MessageExpiryInterval
+		c.MessageExpiryInterval = &v
+	}
+	return c
+}
+
+// Opts returns options that encode this PUBLISH again: topic, payload,
+// QoS, flags, packet identifier and every property a client may send,
+// with optional properties present exactly when they are here (an
+// empty Correlation Data stays non-nil; an empty payload is nil). Subscription Identifiers, which
+// only a server sends, are left out. The result owns copies of its
+// fields and stays valid after Release.
+func (p *Publish) Opts() PublishOpts {
+	o := PublishOpts{
+		Topic:    strings.Clone(p.Topic),
+		QoS:      p.QoS,
+		Retain:   p.Retain,
+		Dup:      p.Dup,
+		PacketID: p.PacketID,
+	}
+	if len(p.Payload) > 0 {
+		o.Payload = bytes.Clone(p.Payload)
+	}
+	if v, ok := p.Properties.Byte(PropPayloadFormat); ok {
+		o.PayloadFormatIndicator = &v
+	}
+	if v, ok := p.Properties.Uint32(PropMessageExpiryInterval); ok {
+		o.MessageExpiryInterval = &v
+	}
+	if v, ok := p.Properties.String(PropContentType); ok {
+		o.ContentType = strings.Clone(v)
+	}
+	if v, ok := p.Properties.String(PropResponseTopic); ok {
+		o.ResponseTopic = strings.Clone(v)
+	}
+	if v, ok := p.Properties.Binary(PropCorrelationData); ok {
+		o.CorrelationData = append([]byte{}, v...)
+	}
+	if v, ok := p.Properties.Uint16(PropTopicAlias); ok {
+		o.TopicAlias = v
+	}
+	for k, v := range p.Properties.UserProperties() {
+		o.UserProperties = append(o.UserProperties, UserProperty{Key: strings.Clone(k), Value: strings.Clone(v)})
+	}
+	return o
 }
 
 var publishPool = sync.Pool{
@@ -163,54 +232,43 @@ func decodePublish(frame *[]byte, flags byte) (*Publish, error) {
 	return p, nil
 }
 
-// WritePublish encodes a PUBLISH packet and writes it to w. Uses
-// net.Buffers so writers that support vectored I/O (*net.TCPConn,
-// *net.UnixConn) coalesce the fixed header, variable header, and payload
-// into one writev syscall.
-//
-// Allocations: one allocation for the variable-header buffer (from
-// bufpool, so amortized away after the first call) plus the unavoidable
-// 3-element [][]byte literal that escapes into net.Buffers.WriteTo.
-//
-// On the client's hot path, prefer EncodePublish + a direct Write —
-// it pools the entire packet as a single contiguous buffer and avoids
-// the net.Buffers escape.
+// WritePublish encodes a PUBLISH packet and writes it to w as its
+// header (AppendPublishHeader) followed by the payload, which is not
+// copied. Writers that support vectored I/O (*net.TCPConn,
+// *net.UnixConn) send both in one writev.
 func WritePublish(w io.Writer, opts PublishOpts) (int64, error) {
-	if opts.QoS > 2 {
-		return 0, ErrInvalidQoS
-	}
-	if opts.QoS > 0 && opts.PacketID == 0 {
-		return 0, ErrPacketIDRequired
-	}
-
-	// Compute sizes top-down.
-	propsLen := publishPropsLen(&opts)
-	propsLenVBI := VarintSize(uint32(propsLen))
-	varHdrSize := 2 + len(opts.Topic) + propsLenVBI + propsLen
-	if opts.QoS > 0 {
-		varHdrSize += 2
-	}
-	remaining := varHdrSize + len(opts.Payload)
-
-	// Fixed header: stack-allocated, max 1 + 4 bytes.
-	var fixedHdr [5]byte
-	fixedHdr[0] = byte(PUBLISH)<<4 | publishFlags(&opts)
-	vbiN, err := EncodeVarint(fixedHdr[1:], uint32(remaining))
+	bp := acquireBuf(0)
+	defer releaseBuf(bp)
+	hdr, err := AppendPublishHeader((*bp)[:0], opts)
 	if err != nil {
 		return 0, err
 	}
-
-	// Variable header + properties: pooled buffer.
-	bp := acquireBuf(varHdrSize)
-	defer releaseBuf(bp)
-	encodePublishVarHdr(*bp, &opts, propsLen, propsLenVBI)
-
-	bufs := net.Buffers{
-		fixedHdr[:1+vbiN],
-		*bp,
-		opts.Payload,
+	*bp = hdr
+	if len(opts.Payload) == 0 {
+		n, err := w.Write(hdr)
+		return int64(n), err
 	}
+	bufs := net.Buffers{hdr, opts.Payload}
 	return bufs.WriteTo(w)
+}
+
+// AppendPublishHeader appends to dst the PUBLISH packet opts describes,
+// up to its payload: the fixed header, whose Remaining Length counts the
+// payload, the variable header and the properties. The header followed
+// by opts.Payload is the whole packet, so a caller that writes the two
+// together — one writev through net.Buffers — sends the packet without
+// copying the payload.
+func AppendPublishHeader(dst []byte, opts PublishOpts) ([]byte, error) {
+	if err := validatePublishOpts(&opts); err != nil {
+		return dst, err
+	}
+	l := publishLayoutOf(&opts)
+	start := len(dst)
+	dst = slices.Grow(dst, l.headerSize())[:start+l.headerSize()]
+	if err := l.encodeHeader(dst[start:], &opts); err != nil {
+		return dst[:start], err
+	}
+	return dst, nil
 }
 
 // EncodePublish encodes a PUBLISH into a pooled []byte and returns a
@@ -224,35 +282,78 @@ func WritePublish(w io.Writer, opts PublishOpts) (int64, error) {
 //
 // Returned slice contents are valid until ReleaseBuf is called.
 func EncodePublish(opts PublishOpts) (*[]byte, error) {
-	if opts.QoS > 2 {
-		return nil, ErrInvalidQoS
+	if err := validatePublishOpts(&opts); err != nil {
+		return nil, err
 	}
-	if opts.QoS > 0 && opts.PacketID == 0 {
-		return nil, ErrPacketIDRequired
-	}
-
-	propsLen := publishPropsLen(&opts)
-	propsLenVBI := VarintSize(uint32(propsLen))
-	varHdrSize := 2 + len(opts.Topic) + propsLenVBI + propsLen
-	if opts.QoS > 0 {
-		varHdrSize += 2
-	}
-	remaining := varHdrSize + len(opts.Payload)
-	vbiSize := VarintSize(uint32(remaining))
-	total := 1 + vbiSize + varHdrSize + len(opts.Payload)
-
-	bp := acquireBuf(total)
-	buf := *bp
-	buf[0] = byte(PUBLISH)<<4 | publishFlags(&opts)
-	if _, err := EncodeVarint(buf[1:1+vbiSize], uint32(remaining)); err != nil {
+	l := publishLayoutOf(&opts)
+	bp := acquireBuf(l.total)
+	if err := l.encode(*bp, &opts); err != nil {
 		releaseBuf(bp)
 		return nil, err
 	}
-	off := 1 + vbiSize
-	encodePublishVarHdr(buf[off:off+varHdrSize], &opts, propsLen, propsLenVBI)
-	off += varHdrSize
-	copy(buf[off:], opts.Payload)
 	return bp, nil
+}
+
+// MarshalPublish encodes a PUBLISH into a new, exactly-sized slice owned
+// by the caller. Use it for packets that outlive a write, such as QoS 1/2
+// publishes kept for retransmission; EncodePublish is the pooled variant
+// for packets released right after the write.
+func MarshalPublish(opts PublishOpts) ([]byte, error) {
+	if err := validatePublishOpts(&opts); err != nil {
+		return nil, err
+	}
+	l := publishLayoutOf(&opts)
+	out := make([]byte, l.total)
+	if err := l.encode(out, &opts); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// publishLayout is the size of each part of an encoded PUBLISH.
+type publishLayout struct {
+	propsLen, propsLenVBI int
+	varHdrSize            int
+	remaining, vbiSize    int
+	total                 int
+}
+
+func publishLayoutOf(o *PublishOpts) publishLayout {
+	var l publishLayout
+	l.propsLen = publishPropsLen(o)
+	l.propsLenVBI = VarintSize(uint32(l.propsLen))
+	l.varHdrSize = 2 + len(o.Topic) + l.propsLenVBI + l.propsLen
+	if o.QoS > 0 {
+		l.varHdrSize += 2
+	}
+	l.remaining = l.varHdrSize + len(o.Payload)
+	l.vbiSize = VarintSize(uint32(l.remaining))
+	l.total = 1 + l.vbiSize + l.remaining
+	return l
+}
+
+// headerSize is the length of the packet without its payload.
+func (l publishLayout) headerSize() int { return 1 + l.vbiSize + l.varHdrSize }
+
+// encodeHeader writes everything but the payload into buf, which holds
+// at least l.headerSize() bytes.
+func (l publishLayout) encodeHeader(buf []byte, o *PublishOpts) error {
+	buf[0] = byte(PUBLISH)<<4 | publishFlags(o)
+	if _, err := EncodeVarint(buf[1:1+l.vbiSize], uint32(l.remaining)); err != nil {
+		return err
+	}
+	off := 1 + l.vbiSize
+	encodePublishVarHdr(buf[off:off+l.varHdrSize], o, l.propsLen, l.propsLenVBI)
+	return nil
+}
+
+// encode writes the packet into buf, which holds exactly l.total bytes.
+func (l publishLayout) encode(buf []byte, o *PublishOpts) error {
+	if err := l.encodeHeader(buf, o); err != nil {
+		return err
+	}
+	copy(buf[l.headerSize():], o.Payload)
+	return nil
 }
 
 // ReleaseBuf returns a buffer obtained from EncodePublish (or any other
@@ -321,4 +422,68 @@ func encodePublishVarHdr(buf []byte, o *PublishOpts, propsLen, _ int) {
 	off = writePropertyBinary(buf, off, PropCorrelationData, o.CorrelationData)
 	off = writeProperty2(buf, off, PropTopicAlias, o.TopicAlias)
 	_ = writePropertyUserProps(buf, off, o.UserProperties)
+}
+
+// WithMessageExpiry returns a copy of the encoded PUBLISH frame with its
+// Message Expiry Interval set to seconds. Frames that carry no expiry
+// property, or that cannot be parsed, are returned unchanged. Used when a
+// stored message is sent again later than it was first encoded
+// (§3.3.2.3.3).
+func WithMessageExpiry(frame []byte, seconds uint32) []byte {
+	off, ok := messageExpiryOffset(frame)
+	if !ok {
+		return frame
+	}
+	out := bytes.Clone(frame)
+	binary.BigEndian.PutUint32(out[off:], seconds)
+	return out
+}
+
+// messageExpiryOffset locates the 4-byte Message Expiry Interval value
+// inside an encoded PUBLISH frame.
+func messageExpiryOffset(frame []byte) (int, bool) {
+	if len(frame) < 2 || PacketType(frame[0]>>4) != PUBLISH {
+		return 0, false
+	}
+	qos := (frame[0] >> 1) & 0x03
+	_, n, err := DecodeVarint(frame[1:])
+	if err != nil {
+		return 0, false
+	}
+	off := 1 + n
+	if len(frame) < off+2 {
+		return 0, false
+	}
+	off += 2 + int(binary.BigEndian.Uint16(frame[off:]))
+	if qos > 0 {
+		off += 2
+	}
+	if len(frame) < off {
+		return 0, false
+	}
+	propsLen, n, err := DecodeVarint(frame[off:])
+	if err != nil {
+		return 0, false
+	}
+	off += n
+	end := off + int(propsLen)
+	if len(frame) < end {
+		return 0, false
+	}
+	for off < end {
+		id := frame[off]
+		off++
+		if id == PropMessageExpiryInterval {
+			if end-off < 4 {
+				return 0, false
+			}
+			return off, true
+		}
+		size, err := propValueSize(id, frame[off:end])
+		if err != nil {
+			return 0, false
+		}
+		off += size
+	}
+	return 0, false
 }

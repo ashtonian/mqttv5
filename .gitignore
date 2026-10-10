@@ -12,3 +12,7 @@ dist/
 # Add explicit names here as they appear — root should normally only
 # contain source files.
 /ws
+
+# Benchmark recordings (scripts/run.sh) stay out of the repository; the
+# bench workflow uploads them as artifacts.
+benchmarks/results/

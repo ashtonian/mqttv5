@@ -1,16 +1,20 @@
 name: bench
 
-# End-to-end benchmarks vs autopaho. Slow (~5-10 min), needs mosquitto
-# in docker, and shows enough loop variance on shared runners that
-# automated regression alerts would be noise. So this workflow is
-# manual: dispatch it before/after a perf-relevant change, download
-# the artifacts, run `benchstat` locally to compare.
+# End-to-end benchmarks against autopaho and paho.mqtt.golang through the
+# pinned benchmark broker (benchmarks/docker-compose.yml). Manual: shared
+# runners are too noisy for timing comparisons to gate anything. The raw
+# results directory is uploaded with the conditions it ran under; compare
+# runs with benchstat, and publish numbers only from a documented quiet
+# host (see benchmarks/README.md).
 #
-# The fast codec micro-benchmarks (always-on with PR comments + a live
-# dashboard) live in bench-codec.yml.
+# The codec micro-benchmarks run on every change in bench-codec.yml.
 
 on:
   workflow_dispatch:
+    inputs:
+      runs:
+        description: interleaved repetitions of the whole sweep
+        default: '10'
 
 concurrency:
   group: bench-${{ github.workflow }}-${{ github.ref }}
@@ -19,50 +23,50 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The oldest Go minor go.mod accepts, at its newest patch: what a
+  # supported user builds with, standard-library security fixes included.
+  # govulncheck checks the standard library of the Go that runs it.
+  GO_VERSION: '1.26.x'
+
 jobs:
   e2e-bench:
-    name: end-to-end benchmarks (vs autopaho)
+    name: end-to-end benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: benchmarks/go.sum
 
-      - name: start mosquitto
-        run: docker compose -f conformance/docker-compose.yml up -d mosquitto
+      - name: start the benchmark broker
+        run: docker compose -f benchmarks/docker-compose.yml up -d --wait
 
-      - name: wait for mosquitto
-        timeout-minutes: 2
-        run: until bash -c "</dev/tcp/127.0.0.1/1883" 2>/dev/null; do sleep 1; done
-
-      - name: run e2e benchmarks
+      # The same recordings as "Recording results for publication" in
+      # benchmarks/README.md, one results directory each.
+      - name: run
+        env:
+          RUNS: ${{ inputs.runs }}
         run: |
-          go test -tags e2e -bench='^BenchmarkE2E_' -run=^$ -benchmem \
-            -benchtime=3s -count=5 -timeout 20m ./... | tee e2e_results.txt
+          scripts/run.sh e2e . -tags e2e -run '^$' \
+            -bench '^BenchmarkE2E_(Publish|PublishConcurrent|Receive|ReceiveStream|RoundTrip)$' -benchmem -timeout 3h
+          scripts/run.sh e2e-reconnect . -tags e2e -run '^$' \
+            -bench '^BenchmarkE2E_Reconnect$' -benchmem -benchtime 100x -timeout 1h
+          scripts/run.sh e2e-latency . -tags e2e -run '^$' \
+            -bench '^BenchmarkE2E_Latency$' -benchtime 10000x -timeout 2h
+          scripts/run.sh e2e-slowconsumer . -tags e2e -run '^$' \
+            -bench '^BenchmarkE2E_SlowConsumer$' -benchtime 200000x -timeout 1h
         working-directory: benchmarks
-
-      - name: post bench summary
-        if: always()
-        run: |
-          {
-            echo "## End-to-end benchmarks vs autopaho"
-            echo ""
-            echo "Compare locally with \`benchstat\` — see benchmarks/README.md."
-            echo ""
-            echo '```'
-            cat benchmarks/e2e_results.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-bench-${{ github.run_id }}
-          path: benchmarks/e2e_results.txt
+          path: benchmarks/results/
 
-      - name: stop mosquitto
+      - name: stop the broker
         if: always()
-        run: docker compose -f conformance/docker-compose.yml down -v
+        run: docker compose -f benchmarks/docker-compose.yml down -v

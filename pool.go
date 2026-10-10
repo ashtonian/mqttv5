@@ -9,14 +9,18 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sync/atomic"
-
-	"github.com/ashtonian/mqttv5/wire"
 )
 
-// ErrNoHealthyPublishers is returned by publisherPool.publish when
-// every pool member is disconnected. The Client falls back to the
-// main connection in this case (and increments PoolFallbacks).
+// ErrNoHealthyPublishers is returned by publisherPool.publish when no
+// pool member could send the message. The Client falls back to the main
+// connection in this case (and increments PoolFallbacks).
 var ErrNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
+
+// notSent reports whether a Publish error guarantees the message never
+// reached the network, so another connection may send it instead.
+func notSent(err error) bool {
+	return errors.Is(err, ErrNotConnected) || errors.Is(err, ErrWriteQueueFull)
+}
 
 // publisherPool is a set of N publish-only Clients. Each member has
 // its own session and supervisor, so QoS 1/2 acks land on the member
@@ -44,7 +48,11 @@ var ErrNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
 //     RequestProblemInformation, ConnectUserProperties.
 //   - Timing & sizing: KeepAlive (or WithoutKeepAlive),
 //     ConnectTimeout, PingTimeout, DisconnectFlushTimeout,
-//     WriteQueueSize, ReconnectBackoff, PublishMode.
+//     ReadBufferSize, WriteQueueSize, WriteBatch, WriteOverflowPolicy,
+//     ReconnectBackoff, PublishMode, RetryInitialConnect.
+//   - Publish behaviour: QoSDowngrade, SessionLossPolicy,
+//     OutboundTopicAliases, LenientDecoding, FollowServerRedirects
+//     (each member follows a redirect on its own connection).
 //   - ConnectPacketBuilder (so per-attempt credential rotation
 //     covers pool members too).
 //   - StatsEnabled (pool-member Stats() reports independently).
@@ -54,7 +62,8 @@ var ErrNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
 //   - Will. WithWill on the parent is only emitted from the parent's
 //     session.
 //   - Lifecycle callbacks: OnConnectionUp, OnConnectionDown,
-//     OnConnectError, OnReconnectAttempt, OnServerDisconnect.
+//     OnConnectError, OnReconnectAttempt, OnServerDisconnect,
+//     OnServerRedirect.
 //     Members manage their own reconnect silently; observe the
 //     parent for application-visible lifecycle events.
 //   - CleanStartOnReconnect — pool members force CleanStart=true on
@@ -93,7 +102,11 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 			WithReconnectBackoff(parent.ReconnectBackoff),
 			WithLogger(logger.With("component", "publisher-pool", "member", i)),
 			WithPublishMode(parent.PublishMode),
+			WithSessionLossPolicy(parent.SessionLossPolicy),
+			WithReadBufferSize(parent.ReadBufferSize),
 			WithWriteQueueSize(parent.WriteQueueSize),
+			WithWriteBatch(parent.WriteBatchMax),
+			WithWriteOverflowPolicy(parent.WriteOverflowPolicy),
 			WithMaximumPacketSize(parent.MaximumPacketSize),
 			WithInboundTopicAliasMaximum(parent.InboundTopicAliasMaximum),
 			WithRequestResponseInformation(parent.RequestResponseInformation),
@@ -134,6 +147,25 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 		if parent.StatsEnabled {
 			opts = append(opts, WithStats())
 		}
+		if parent.RetryInitialConnect {
+			opts = append(opts, WithRetryInitialConnect())
+		}
+		if parent.QoSDowngrade {
+			opts = append(opts, WithQoSDowngrade())
+		}
+		if parent.OutboundTopicAliases {
+			opts = append(opts, WithOutboundTopicAliases())
+		}
+		if parent.LenientDecoding {
+			opts = append(opts, WithLenientDecoding())
+		}
+		if parent.FollowServerRedirects {
+			opts = append(opts, WithFollowServerRedirects())
+		}
+		opts = append(opts, func(c *Config) error {
+			c.clock = parent.clock
+			return nil
+		})
 		m, err := New(opts...)
 		if err != nil {
 			return nil, fmt.Errorf("mqttv5: pool member %d: %w", i, err)
@@ -160,40 +192,32 @@ func (p *publisherPool) connect(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// publish picks a starting member per the routing policy and probes
-// linearly from there, trying each member at most once. Returns
-// ErrNoHealthyPublishers if no member accepts.
-func (p *publisherPool) publish(ctx context.Context, opts wire.PublishOpts) error {
+// publish picks a starting member per the routing policy and tries
+// members from there until one sends the message. It moves on only
+// when a member could not send it at all (see notSent): any other
+// outcome, a broker refusal or ctx ending included, is the caller's, so
+// one Publish never puts the message on two connections. Returns
+// ErrNoHealthyPublishers when no member could send it.
+func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error {
 	n := len(p.members)
-	if n == 0 {
-		return ErrNoHealthyPublishers
-	}
 	start := p.startIndex(opts)
 	var lastErr error
 	for i := range n {
 		m := p.members[(start+uint64(i))%uint64(n)]
-		if !m.Connected() {
-			continue
+		err := m.Publish(ctx, opts)
+		if !notSent(err) {
+			return err
 		}
-		if err := m.Publish(ctx, opts); err == nil {
-			return nil
-		} else {
-			lastErr = err
-			p.logger.Warn("mqttv5: pool member publish failed",
-				slog.String("client_id", m.ClientID()),
-				slog.Any("error", err),
-			)
-		}
+		lastErr = err
+		p.logger.Debug("mqttv5: pool member could not send; trying the next",
+			slog.String("client_id", m.ClientID()), slog.Any("error", err))
 	}
-	if lastErr != nil {
-		return fmt.Errorf("%w: %w", ErrNoHealthyPublishers, lastErr)
-	}
-	return ErrNoHealthyPublishers
+	return fmt.Errorf("%w: %w", ErrNoHealthyPublishers, lastErr)
 }
 
 // startIndex returns the member-index to start the probe loop at,
 // chosen per the configured routing policy.
-func (p *publisherPool) startIndex(opts wire.PublishOpts) uint64 {
+func (p *publisherPool) startIndex(opts PublishOptions) uint64 {
 	switch p.routing {
 	case PoolRoutingHashByTopic:
 		h := fnv.New32a()

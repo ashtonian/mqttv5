@@ -1,9 +1,9 @@
 services:
   mosquitto:
-    image: eclipse-mosquitto:2.0
+    image: eclipse-mosquitto:2.1.2-alpine
     container_name: mqttv5-conformance-mosquitto
     ports:
-      - "1883:1883"
+      - "127.0.0.1:1883:1883"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     healthcheck:
@@ -15,10 +15,10 @@ services:
   # emqx covers the cases mosquitto handles differently (e.g.,
   # AssignedClientIdentifier policy, shared subscriptions).
   emqx:
-    image: emqx/emqx:6.2.0
+    image: emqx/emqx:6.3.1
     container_name: mqttv5-conformance-emqx
     ports:
-      - "1884:1883"
+      - "127.0.0.1:1884:1883"
     environment:
       - EMQX_ALLOW_ANONYMOUS=true
     healthcheck:
@@ -34,11 +34,11 @@ services:
   # provisioned at test time via the REST API (see reauth_test.go), using
   # the API key bootstrapped from ./emqx/api_key.bootstrap.
   emqx-scram:
-    image: emqx/emqx:6.2.0
+    image: emqx/emqx:6.3.1
     container_name: mqttv5-conformance-emqx-scram
     ports:
-      - "1885:1883"   # MQTT listener (SCRAM-authenticated)
-      - "18084:18083" # REST API, for provisioning the SCRAM user
+      - "127.0.0.1:1885:1883"   # MQTT listener (SCRAM-authenticated)
+      - "127.0.0.1:18084:18083" # REST API, for provisioning the SCRAM user
     environment:
       - EMQX_API_KEY__BOOTSTRAP_FILE=/opt/emqx/etc/api_key.bootstrap
     volumes:
@@ -48,3 +48,38 @@ services:
       interval: 5s
       timeout: 5s
       retries: 15
+
+  # HiveMQ CE runs in the nightly conformance job, not on every
+  # push: start it with `docker compose --profile hivemq up -d`.
+  # `hivemq` keeps the defaults (Receive Maximum 10, five topic aliases)
+  # and runs the whole suite; `hivemq-strict` announces tight limits for
+  # strict_test.go (see hivemq/strict.xml).
+  hivemq:
+    image: hivemq/hivemq-ce:2026.5
+    container_name: mqttv5-conformance-hivemq
+    profiles: ["hivemq"]
+    ports:
+      - "127.0.0.1:1886:1883"
+    environment:
+      - HIVEMQ_LOG_LEVEL=WARN
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/1883'"]
+      interval: 3s
+      timeout: 2s
+      retries: 40
+
+  hivemq-strict:
+    image: hivemq/hivemq-ce:2026.5
+    container_name: mqttv5-conformance-hivemq-strict
+    profiles: ["hivemq"]
+    ports:
+      - "127.0.0.1:1887:1883"
+    environment:
+      - HIVEMQ_LOG_LEVEL=WARN
+    volumes:
+      - ./hivemq/strict.xml:/opt/hivemq/conf/config.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/1883'"]
+      interval: 3s
+      timeout: 2s
+      retries: 40

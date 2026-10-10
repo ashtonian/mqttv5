@@ -1,8 +1,9 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
-// Package mqttv5 is a fast, ergonomic MQTT v5 client for Go. The
-// supervisor (reconnect, replay-in-flight, auto-resubscribe) is baked
-// into every [Client]; there is no separate "auto-reconnect" wrapper.
+// Package mqttv5 is an MQTT v5 client for Go that allocates little per
+// message, with an ergonomic API. The supervisor (reconnect, replay-in-flight,
+// auto-resubscribe) is baked into every [Client]; there is no separate
+// "auto-reconnect" wrapper.
 //
 // # Why this package
 //
@@ -10,9 +11,10 @@
 // replay, and resubscribe are always on. Channel-native subscribe:
 // <-chan *[Message] ([Client.Subscribe]), [Queue] of *[Message]
 // ([Client.SubscribeQueue]), or a sync callback ([Client.SubscribeCallback]).
-// Backpressure is a first-class concept — per-subscription
-// [DropNewest] / [DropOldest] auto-ack the dropped message so the
-// broker stops retransmitting.
+// Backpressure is per subscription: a consumer that falls behind loses
+// QoS 0 messages, acknowledged so the broker stops retransmitting,
+// while the broker's flow control holds QoS 1 and 2 messages back
+// (see [Client.Subscribe]).
 //
 // Three multi-broker patterns are kept distinct:
 //
@@ -28,15 +30,22 @@
 // Typed publish / subscribe goes through the generic [Codec] interface;
 // JSON and msgpack ship in separate submodules so the core stays
 // stdlib-only. The durable outbound [QueuePublisher] lets you enqueue
-// publishes while disconnected, drain on reconnect, and survive
-// process restart (when combined with the queue/file submodule).
+// publishes while disconnected, keeps a window of them in flight once
+// connected, and, with the queue/file and store/file submodules,
+// continues the exchanges in flight after a process crash instead of
+// publishing those messages again (a lost broker session aside).
+//
+// With [WithStore], every packet that depends on a session record is
+// sent only once the record is written, and a failed write stops the
+// client as a crash would: the next [Client.Connect] reloads the
+// session from the store (see [WithOnStoreFailure]).
 //
 // Operator surface:
 //
 //   - [Client.Stats] returns a snapshot of in-memory counters
 //     (connects, publishes sent/acked, inbound dropped, pool
-//     fallbacks, ping timeouts, ...). Opt in via [WithStats] — when
-//     off the hot path compiles to a single predicted nil-check.
+//     fallbacks, ping timeouts, ...). Opt in via [WithStats]; when
+//     off, each counter update is a nil check.
 //   - [Client.DisconnectWith] sends a custom DISCONNECT (reason code,
 //     ReasonString, SessionExpiry override).
 //   - [WithConnectPacketBuilder] mutates the CONNECT immediately
@@ -45,11 +54,34 @@
 //     and alerting per attempt; [WithOnConnectionDown] returns false
 //     to terminate the supervisor.
 //
-// Full MQTT v5 conformance: shared subscriptions, topic aliases
-// (in + out), session expiry, retained messages, will + will
-// properties, enhanced authentication (CONNECT and mid-session
-// §4.12), and CONNACK capability flags honoured before any matching
-// SUBSCRIBE traffic goes on the wire.
+// The MQTT v5 client feature set: shared subscriptions, Subscription
+// Identifiers, topic aliases (in and out), session expiry and
+// resumption, retained messages, the Will and its properties, server
+// redirects, enhanced authentication (CONNECT and mid-session, §4.12),
+// and the broker's CONNACK limits enforced before a packet is sent.
+// Every packet from the broker is validated before it is acted on.
+//
+// # Lifecycle callbacks
+//
+// The connection callbacks ([WithOnConnectionUp], [WithOnConnectionDown],
+// [WithOnConnectError], [WithOnReconnectAttempt],
+// [WithOnServerDisconnect], [WithOnServerRedirect],
+// [WithOnResubscribeError], [WithOnReauthenticated] and
+// [WithOnStoreFailure]) run one at a time, in the order of the events
+// they report, on a goroutine of the client's own. They may call
+// [Client.Disconnect], [Client.Connect] and [Client.SetBrokers]. Before
+// each reconnect attempt the client waits for the callbacks posted so
+// far, so a SetBrokers call from one applies to that attempt, and a
+// slow callback delays it. Because they run apart from the calls that
+// cause them, OnConnectionUp may run after Connect returns, and a
+// callback for an event before Disconnect may run after Disconnect
+// returns.
+//
+// Message handlers are different: [Client.SubscribeCallback] handlers
+// and [SubOnDrop] hooks run on the connection's read loop, which
+// Disconnect waits for, so they must not call Disconnect themselves;
+// start it on another goroutine. A teardown held up by one logs a
+// warning after five seconds.
 //
 // # Quick start
 //
@@ -75,7 +107,7 @@
 //	}()
 //
 //	// QoS 1 publish — supervisor replays with DUP=1 across drops.
-//	_ = cli.Publish(ctx, wire.PublishOpts{
+//	_ = cli.Publish(ctx, PublishOptions{
 //	    Topic:   "events/example",
 //	    Payload: []byte("hello"),
 //	    QoS:     1,
@@ -100,7 +132,7 @@
 //
 //   - codec/json     — JSON [Codec] implementation, wired into [Typed].
 //   - codec/msgpack  — MessagePack [Codec] via vmihailenco/msgpack/v5.
-//   - queue/file     — Durable outbound publish queue (filesystem WAL).
+//   - queue/file     — Crash-safe outbound queue for [QueuePublisher].
 //   - store/file     — Crash-safe session store for in-flight QoS 1/2.
 //   - transport/ws   — WebSocket transport via gobwas/ws; wire it in
 //     with [WithDialFunc].
@@ -109,22 +141,33 @@
 //
 // One goroutine per connection drives the read path
 // (read -> decode -> trie match -> handler) with handlers running
-// synchronously on the reader. A second goroutine drains a
-// many-producer-single-consumer write channel: concurrent publishers
-// hand off their packets without contending on a write lock, instead
-// of serialising behind a mutex around [net.Conn.Write]. Cross-core
-// write scaling comes from [WithPublisherPool], which runs N such
-// connections, each with its own writer goroutine.
+// synchronously on the reader. On a TCP or Unix connection, a publish
+// that waits for its write writes on its own goroutine when the
+// connection is idle; if its ctx ends mid-write, a deadline stops the
+// write and the writer goroutine finishes the packet. When publishers
+// overlap, and on TLS and WebSocket connections, a second goroutine
+// drains a many-producer-single-consumer write channel and coalesces
+// the queued packets, so they do not take turns on a write lock around
+// [net.Conn.Write]. On unix systems the reader writes the
+// acknowledgements it owes itself when the connection is idle, as far
+// as the socket takes them without waiting, and leaves the rest to the
+// writer goroutine. [WithPublisherPool] runs N such connections, each
+// with its own writer goroutine, so publishing is not limited to one
+// connection's writer.
 //
-// Packets and frame buffers come from per-type sync.Pools. Inbound
-// [Message] aliases the pooled frame for zero-copy Topic and
-// Payload; the frame returns to the pool only when refcounted
-// [Message.Ack] reaches the last handler. A supervisor goroutine
-// reconnects with configurable backoff, replays in-flight QoS 1/2
-// publishes with DUP=1, and re-issues every tracked subscription.
+// Packets and frame buffers up to 64 KiB come from sync.Pools. An
+// inbound [Message] owns a copy of its topic, payload and properties,
+// so a pooled frame goes back to its pool before any handler runs; a
+// larger frame is never pooled and becomes the message's own.
+// [SubZeroCopy] subscriptions alias the frame until every handle is
+// acked.
+//
+// A supervisor goroutine reconnects with configurable backoff, resumes
+// the session, replays unacknowledged QoS 1/2 publishes with DUP=1 in
+// their original order, and re-issues every tracked subscription.
 //
 // # Benchmarks
 //
-// See benchmarks/ for end-to-end and codec micro-benchmarks against
-// eclipse/paho.golang.
+// See benchmarks/ for end-to-end and codec benchmarks against
+// eclipse/paho.golang and eclipse/paho.mqtt.golang.
 package mqttv5

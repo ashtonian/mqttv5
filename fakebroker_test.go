@@ -82,6 +82,12 @@ func (b *fakeBroker) Done() <-chan struct{} { return b.closeCh }
 // per-connection handler.
 func acceptConnect(t *testing.T, c net.Conn, dec *wire.Decoder) {
 	t.Helper()
+	acceptConnectWith(t, c, dec, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess})
+}
+
+// acceptConnectWith reads CONNECT and replies with the given CONNACK.
+func acceptConnectWith(t *testing.T, c net.Conn, dec *wire.Decoder, opts wire.ConnackOpts) {
+	t.Helper()
 	pkt, err := dec.ReadPacket()
 	if err != nil {
 		t.Errorf("CONNECT read: %v", err)
@@ -91,7 +97,7 @@ func acceptConnect(t *testing.T, c net.Conn, dec *wire.Decoder) {
 		t.Errorf("got %s, want CONNECT", pkt.Type())
 	}
 	pkt.Release()
-	if _, err := wire.WriteConnack(c, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess}); err != nil {
+	if _, err := wire.WriteConnack(c, opts); err != nil {
 		t.Errorf("CONNACK write: %v", err)
 	}
 }

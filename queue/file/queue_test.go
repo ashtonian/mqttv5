@@ -5,161 +5,185 @@ package file
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
+	"github.com/ashtonian/mqttv5/queuetest"
 )
 
-func ent(b byte) mqttv5.QueueEntry {
-	return mqttv5.QueueEntry{
-		Publish: wire.PublishOpts{
-			Topic:   "t",
-			Payload: []byte{b},
-			QoS:     1,
+func factory(opts ...Option) queuetest.Factory {
+	return queuetest.Factory{
+		Open: func(t *testing.T) mqttv5.PublisherQueue {
+			q, err := Open(t.TempDir(), opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return q
 		},
-		EnqueuedAt: time.Now(),
+		Reopen: func(t *testing.T, q mqttv5.PublisherQueue) mqttv5.PublisherQueue {
+			fq := q.(*Queue)
+			if err := fq.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r, err := Open(dirOf(fq), opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return r
+		},
 	}
 }
 
-func TestEnqueuePeekAck(t *testing.T) {
+func dirOf(q *Queue) string { return q.Path()[:len(q.Path())-len(FileName)-1] }
+
+// The conformance round trip keeps an explicit zero Message Expiry
+// Interval apart from none.
+func TestConformanceGroupCommit(t *testing.T) { queuetest.Run(t, factory()) }
+
+func TestConformanceSyncEveryWrite(t *testing.T) {
+	queuetest.Run(t, factory(WithSyncPolicy(SyncEveryWrite)))
+}
+
+func TestConformanceSyncNone(t *testing.T) { queuetest.Run(t, factory(WithSyncPolicy(SyncNone))) }
+
+func entry(payload string) mqttv5.QueueEntry {
+	return mqttv5.QueueEntry{ID: "id-" + payload, Publish: mqttv5.PublishOptions{Topic: "t", QoS: 1, Payload: []byte(payload)}}
+}
+
+// A second handle on the same directory is refused instead of
+// overwriting the first one's entries.
+func TestSecondOpenIsLocked(t *testing.T) {
 	dir := t.TempDir()
 	q, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer q.Close()
+	if _, err := Open(dir, WithLockTimeout(10*time.Millisecond)); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open: %v, want ErrLocked", err)
+	}
+}
 
+// An empty path is an error, not a temporary directory.
+func TestOpenNeedsADirectory(t *testing.T) {
+	if _, err := Open(""); err == nil {
+		t.Fatal("Open(\"\") succeeded")
+	}
+}
+
+// A corrupt entry is quarantined and reported; the entries around
+// it keep flowing.
+func TestCorruptEntriesAreQuarantined(t *testing.T) {
+	var reported []uint64
+	q, err := Open(t.TempDir(), WithOnCorrupt(func(seq uint64, err error) {
+		if !errors.Is(err, ErrCorrupt) {
+			t.Errorf("reported %v", err)
+		}
+		reported = append(reported, seq)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
 	ctx := context.Background()
-
-	for i := 0; i < 3; i++ {
-		if err := q.Enqueue(ctx, ent(byte(i))); err != nil {
+	var seqs []uint64
+	for i := range 3 {
+		seq, _, err := q.Enqueue(ctx, entry(fmt.Sprint(i)), mqttv5.QueueLimit{})
+		if err != nil {
 			t.Fatal(err)
 		}
+		seqs = append(seqs, seq)
 	}
-
-	n, _ := q.Len(ctx)
-	if n != 3 {
-		t.Fatalf("Len = %d, want 3", n)
+	if err := q.db.Update(ctx, func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketEntries)
+		v := append([]byte(nil), b.Get(seqKey(seqs[1]))...)
+		v[len(v)/2] ^= 0xff
+		return b.Put(seqKey(seqs[1]), v)
+	}); err != nil {
+		t.Fatal(err)
 	}
-
-	entries, tokens, err := q.PeekBatch(ctx, 10)
+	got, err := q.Peek(ctx, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("PeekBatch returned %d, want 3", len(entries))
+	if len(got) != 2 || string(got[0].Publish.Payload) != "0" || string(got[1].Publish.Payload) != "2" {
+		t.Fatalf("Peek around a corrupt entry = %+v", got)
 	}
-	for i, e := range entries {
-		if e.Publish.Payload[0] != byte(i) {
-			t.Fatalf("entries[%d].Payload[0] = %d, want %d", i, e.Publish.Payload[0], i)
+	if n, _ := q.Len(ctx); n != 2 {
+		t.Fatalf("Len = %d after quarantine, want 2", n)
+	}
+	if len(reported) != 1 || reported[0] != seqs[1] || len(q.Corrupt()) != 1 {
+		t.Fatalf("reported %v, Corrupt() %v", reported, q.Corrupt())
+	}
+	if err := q.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketQuarantine).Get(seqKey(seqs[1])) == nil {
+			return errors.New("corrupt entry not kept in quarantine")
 		}
-	}
-
-	if err := q.Ack(ctx, tokens[1]); err != nil {
+		return nil
+	}); err != nil {
 		t.Fatal(err)
-	}
-	n, _ = q.Len(ctx)
-	if n != 2 {
-		t.Fatalf("Len after Ack = %d, want 2", n)
 	}
 }
 
-// TestRecoveryAfterReopen verifies the queue survives a process
-// restart: enqueue 3, close, reopen, peek — should see the same 3
-// entries in the same order.
-func TestRecoveryAfterReopen(t *testing.T) {
-	dir := t.TempDir()
-	q, err := Open(dir)
+// Len is constant-time.
+func BenchmarkLen(b *testing.B) {
+	q, err := Open(b.TempDir(), WithSyncPolicy(SyncNone))
 	if err != nil {
-		t.Fatal(err)
+		b.Fatal(err)
 	}
+	defer q.Close()
 	ctx := context.Background()
-	for i := 0; i < 3; i++ {
-		if err := q.Enqueue(ctx, ent(byte(i))); err != nil {
-			t.Fatal(err)
+	for i := range 50_000 {
+		if _, _, err := q.Enqueue(ctx, entry(fmt.Sprint(i)), mqttv5.QueueLimit{}); err != nil {
+			b.Fatal(err)
 		}
 	}
-	q.Close()
-
-	q2, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer q2.Close()
-
-	entries, _, err := q2.PeekBatch(ctx, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 3 {
-		t.Fatalf("after reopen, got %d entries, want 3", len(entries))
-	}
-	for i, e := range entries {
-		if e.Publish.Payload[0] != byte(i) {
-			t.Fatalf("entries[%d].Payload[0] = %d, want %d", i, e.Publish.Payload[0], i)
+	b.ReportAllocs()
+	for b.Loop() {
+		if n, _ := q.Len(ctx); n != 50_000 {
+			b.Fatalf("Len = %d", n)
 		}
 	}
-
-	// Enqueue more — sequence numbers must not collide with recovered ones.
-	if err := q2.Enqueue(ctx, ent(99)); err != nil {
-		t.Fatal(err)
-	}
-	entries, _, _ = q2.PeekBatch(ctx, 10)
-	if len(entries) != 4 {
-		t.Fatalf("after appending, got %d entries, want 4", len(entries))
-	}
-	if entries[3].Publish.Payload[0] != 99 {
-		t.Fatalf("appended entry payload[0] = %d, want 99", entries[3].Publish.Payload[0])
-	}
 }
 
-func TestClosedRejectsEnqueue(t *testing.T) {
-	q, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	q.Close()
-	err = q.Enqueue(context.Background(), ent(1))
-	if !errors.Is(err, mqttv5.ErrQueueClosed) {
-		t.Fatalf("got %v, want ErrQueueClosed", err)
-	}
-}
-
-// TestPartialFilesIgnored verifies the directory can contain non-queue
-// files (e.g., a stray *.tmp from an interrupted write) and Open
-// silently ignores them.
-func TestPartialFilesIgnored(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".tmp-stray"), []byte("garbage"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("hi"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	q, err := Open(dir)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer q.Close()
-	n, _ := q.Len(context.Background())
-	if n != 0 {
-		t.Fatalf("Len with stray files = %d, want 0", n)
-	}
-}
-
-func TestAckMissingIsNoop(t *testing.T) {
-	q, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer q.Close()
-	// Acking a nonexistent sequence must not error — matches
-	// MemoryPublisherQueue semantics.
-	if err := q.Ack(context.Background(), uint64(9999)); err != nil {
-		t.Fatalf("Ack missing: %v", err)
+// BenchmarkEnqueue reports enqueues per second by SyncPolicy, with one
+// writer and with 64 concurrent writers.
+func BenchmarkEnqueue(b *testing.B) {
+	for _, p := range []struct {
+		name   string
+		policy SyncPolicy
+	}{{"group-commit", SyncGroupCommit}, {"every-write", SyncEveryWrite}, {"none", SyncNone}} {
+		for _, writers := range []int{1, 64} {
+			b.Run(fmt.Sprintf("%s/writers=%d", p.name, writers), func(b *testing.B) {
+				q, err := Open(b.TempDir(), WithSyncPolicy(p.policy))
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer q.Close()
+				e := entry("payload-of-sixty-four-bytes-0123456789012345678901234567890123")
+				var next atomic.Int64
+				var wg sync.WaitGroup
+				b.ResetTimer()
+				start := time.Now()
+				for range writers {
+					wg.Go(func() {
+						for next.Add(1) <= int64(b.N) {
+							if _, _, err := q.Enqueue(context.Background(), e, mqttv5.QueueLimit{}); err != nil {
+								b.Error(err)
+								return
+							}
+						}
+					})
+				}
+				wg.Wait()
+				b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "enqueues/s")
+			})
+		}
 	}
 }

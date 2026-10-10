@@ -13,9 +13,12 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION_FILE: go.mod
-  GOLANGCI_LINT_VERSION: v2.12.2
-  GOVULNCHECK_VERSION: v1.1.4
+  # The oldest Go minor go.mod accepts, at its newest patch: what a
+  # supported user builds with, standard-library security fixes included.
+  # govulncheck checks the standard library of the Go that runs it.
+  GO_VERSION: '1.26.x'
+  GOLANGCI_LINT_VERSION: v2.14.0
+  GOVULNCHECK_VERSION: v1.8.0
 
 jobs:
   lint:
@@ -30,16 +33,18 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - uses: golangci/golangci-lint-action@v9
@@ -59,16 +64,18 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: go mod tidy
@@ -95,16 +102,18 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: go vet (untagged)
@@ -128,28 +137,42 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
+          - examples
+          - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: go test -race
-        run: go test -race -v -timeout 5m -count=1 ./...
+        run: go test -race -v -timeout 5m -count=1 -coverprofile=coverage.out ./...
+        working-directory: ${{ matrix.module }}
+
+      # Informational, not a gate.
+      - name: coverage summary
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            echo "### Coverage (${{ matrix.module }}): $(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')" >> "$GITHUB_STEP_SUMMARY"
+          fi
         working-directory: ${{ matrix.module }}
 
   build:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
 
       - name: build core
         run: go build ./...
@@ -170,16 +193,18 @@ jobs:
           - codec/msgpack
           - store/file
           - queue/file
+          - internal/filedb
           - transport/ws
           - examples
           - conformance
           - benchmarks
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ env.GO_VERSION_FILE }}
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: install govulncheck

@@ -112,6 +112,9 @@ var ErrInvalidProtocol = fmt.Errorf("mqttv5: invalid protocol name or version")
 
 // WriteConnect emits a CONNECT packet.
 func WriteConnect(w io.Writer, opts ConnectOpts) (int64, error) {
+	if err := validateConnectOpts(&opts); err != nil {
+		return 0, err
+	}
 	// --- size up the connect-level property section ---
 	propsLen := connectPropsLen(&opts)
 

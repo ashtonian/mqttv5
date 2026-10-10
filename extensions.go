@@ -38,6 +38,15 @@ type Authenticator interface {
 	Continue(brokerData []byte) (response []byte, done bool, err error)
 }
 
+// ContextAuthenticator is an optional interface an Authenticator may
+// implement so answering a broker challenge can be cancelled. The client
+// then calls ContinueContext instead of Continue, with a ctx bounded by
+// the connect timeout. Mechanisms that do I/O to answer (a token
+// service, a hardware key) should implement it.
+type ContextAuthenticator interface {
+	ContinueContext(ctx context.Context, brokerData []byte) (response []byte, done bool, err error)
+}
+
 // ServerFinalVerifier is an optional interface an Authenticator may also
 // implement to verify the server's concluding AuthenticationData — the
 // CONNACK on the initial handshake, or the AUTH 0x00 Success that ends a

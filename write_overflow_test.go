@@ -39,7 +39,7 @@ func TestPublish_WriteDropNewestSurfacesErrWriteQueueFull(t *testing.T) {
 	// fills before we exhaust the loop, so the writer ends up
 	// blocked in conn.Write and writeQueue cannot drain.
 	payload := make([]byte, 16*1024)
-	opts := wire.PublishOpts{Topic: "x", QoS: 0, Payload: payload}
+	opts := PublishOptions{Topic: "x", QoS: 0, Payload: payload}
 
 	var sawDrop bool
 	for range 500 {

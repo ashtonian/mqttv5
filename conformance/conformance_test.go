@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/ashtonian/mqttv5"
 	jsoncodec "github.com/ashtonian/mqttv5/codec/json"
+	"github.com/ashtonian/mqttv5/transport"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -65,6 +68,7 @@ func expectNoMessage(t *testing.T, ch <-chan *mqttv5.Message, d time.Duration) {
 
 // ---------------- Connect ----------------
 
+// Connect reaches the broker and reports the connection and client ID.
 func TestConnect_Disconnect(t *testing.T) {
 	cli := connect(t)
 	if !cli.Connected() {
@@ -75,6 +79,7 @@ func TestConnect_Disconnect(t *testing.T) {
 	}
 }
 
+// A connected client publishes and another receives it through the broker.
 func TestConnect_RoundTripsThroughBroker(t *testing.T) {
 	// The deepest "connected" check is that the broker actually
 	// dispatches a publish for us — that proves CONNECT, the
@@ -84,7 +89,7 @@ func TestConnect_RoundTripsThroughBroker(t *testing.T) {
 	ch, cleanup := withSubscriber(t, topic, 4)
 	defer cleanup()
 
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic:   topic,
 		Payload: []byte("ping"),
 		QoS:     0,
@@ -98,6 +103,8 @@ func TestConnect_RoundTripsThroughBroker(t *testing.T) {
 	_ = m.Ack()
 }
 
+// CleanStart=1 discards the session a previous connection with the same
+// client ID left, including its subscriptions.
 func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 	// CleanStart=true must discard any prior session for this
 	// ClientID — including server-side subscriptions.
@@ -146,7 +153,7 @@ func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 	}
 
 	pub := connect(t)
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic:   topic,
 		Payload: []byte("should-not-arrive"),
 		QoS:     0,
@@ -156,6 +163,7 @@ func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 	expectNoMessage(t, freshCh, 500*time.Millisecond)
 }
 
+// A CONNECT with a user name and password is accepted.
 func TestConnect_WithCredentials(t *testing.T) {
 	// allow_anonymous=true in mosquitto.conf, so any creds work.
 	// Verify by round-tripping a publish — proves the broker didn't
@@ -165,7 +173,7 @@ func TestConnect_WithCredentials(t *testing.T) {
 	ch, cleanup := withSubscriber(t, topic, 4)
 	defer cleanup()
 
-	if err := cli.Publish(context.Background(), wire.PublishOpts{
+	if err := cli.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic:   topic,
 		Payload: []byte("creds-ok"),
 		QoS:     0,
@@ -181,6 +189,7 @@ func TestConnect_WithCredentials(t *testing.T) {
 
 // ---------------- Publish QoS levels (with subscriber verification) ----------------
 
+// A QoS 0 publish arrives at QoS 0 with its payload.
 func TestPublish_QoS0_DeliveredToSubscriber(t *testing.T) {
 	pub := connect(t)
 	topic := "conformance/qos0/" + randSuffix()
@@ -188,7 +197,7 @@ func TestPublish_QoS0_DeliveredToSubscriber(t *testing.T) {
 	defer cleanup()
 
 	want := []byte("qos0-payload")
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic:   topic,
 		Payload: want,
 		QoS:     0,
@@ -202,6 +211,7 @@ func TestPublish_QoS0_DeliveredToSubscriber(t *testing.T) {
 	_ = m.Ack()
 }
 
+// A QoS 1 publish returns after PUBACK and arrives at QoS 1.
 func TestPublish_QoS1_DeliveredAndAcked(t *testing.T) {
 	pub := connect(t)
 	topic := "conformance/qos1/" + randSuffix()
@@ -211,7 +221,7 @@ func TestPublish_QoS1_DeliveredAndAcked(t *testing.T) {
 	want := []byte("qos1-payload")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := pub.Publish(ctx, wire.PublishOpts{
+	if err := pub.Publish(ctx, mqttv5.PublishOptions{
 		Topic: topic, Payload: want, QoS: 1,
 	}); err != nil {
 		// Publish returning nil here is itself proof of PUBACK — the
@@ -225,6 +235,8 @@ func TestPublish_QoS1_DeliveredAndAcked(t *testing.T) {
 	_ = m.Ack()
 }
 
+// A QoS 2 publish completes the PUBREC/PUBREL/PUBCOMP exchange and
+// arrives exactly once.
 func TestPublish_QoS2_ExactlyOnce(t *testing.T) {
 	pub := connect(t)
 	sub := connect(t)
@@ -244,7 +256,7 @@ func TestPublish_QoS2_ExactlyOnce(t *testing.T) {
 	want := []byte("exactly-once")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := pub.Publish(ctx, wire.PublishOpts{
+	if err := pub.Publish(ctx, mqttv5.PublishOptions{
 		Topic: topic, Payload: want, QoS: 2,
 	}); err != nil {
 		t.Fatal(err)
@@ -261,6 +273,7 @@ func TestPublish_QoS2_ExactlyOnce(t *testing.T) {
 
 // ---------------- Wildcards ----------------
 
+// "+" matches exactly one topic level.
 func TestSubscribe_PlusWildcard_MatchesOneLevel(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -276,7 +289,7 @@ func TestSubscribe_PlusWildcard_MatchesOneLevel(t *testing.T) {
 	wantMatches := []string{"alpha", "beta", "gamma"}
 	for _, level := range wantMatches {
 		topic := prefix + "/" + level + "/data"
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: topic, Payload: []byte(level), QoS: 1,
 		}); err != nil {
 			t.Fatal(err)
@@ -284,7 +297,7 @@ func TestSubscribe_PlusWildcard_MatchesOneLevel(t *testing.T) {
 	}
 	// Negative: a 2-level path must NOT match + (which is exactly one
 	// level).
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: prefix + "/two/levels/data", Payload: []byte("nope"), QoS: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -309,6 +322,7 @@ func TestSubscribe_PlusWildcard_MatchesOneLevel(t *testing.T) {
 	expectNoMessage(t, ch, 200*time.Millisecond)
 }
 
+// "#" matches the parent level and every level below it.
 func TestSubscribe_HashWildcard_MatchesParentAndChildren(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -328,7 +342,7 @@ func TestSubscribe_HashWildcard_MatchesParentAndChildren(t *testing.T) {
 		root + "/a/b/c",
 	}
 	for _, topic := range topics {
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: topic, Payload: []byte(topic), QoS: 1,
 		}); err != nil {
 			t.Fatal(err)
@@ -353,6 +367,8 @@ func TestSubscribe_HashWildcard_MatchesParentAndChildren(t *testing.T) {
 
 // ---------------- Properties (every value verified) ----------------
 
+// Content type, response topic, correlation data and user properties
+// arrive as published.
 func TestPubSub_AllPublishProperties(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -374,7 +390,7 @@ func TestPubSub_AllPublishProperties(t *testing.T) {
 	wantResponse := "rpc/responses/abc"
 	wantCorrelation := []byte{0x01, 0x02, 0x03, 0x04}
 
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic:           topic,
 		Payload:         []byte("with-props"),
 		QoS:             1,
@@ -389,13 +405,13 @@ func TestPubSub_AllPublishProperties(t *testing.T) {
 	m := expectMessage(t, ch, 3*time.Second)
 	defer m.Ack()
 
-	if ct, _ := m.Properties.String(wire.PropContentType); ct != wantContentType {
+	if ct := m.Properties.ContentType(); ct != wantContentType {
 		t.Errorf("ContentType = %q, want %q", ct, wantContentType)
 	}
-	if rt, _ := m.Properties.String(wire.PropResponseTopic); rt != wantResponse {
+	if rt := m.Properties.ResponseTopic(); rt != wantResponse {
 		t.Errorf("ResponseTopic = %q, want %q", rt, wantResponse)
 	}
-	if cd, _ := m.Properties.Binary(wire.PropCorrelationData); !bytes.Equal(cd, wantCorrelation) {
+	if cd := m.Properties.CorrelationData(); !bytes.Equal(cd, wantCorrelation) {
 		t.Errorf("CorrelationData = %x, want %x", cd, wantCorrelation)
 	}
 
@@ -414,12 +430,14 @@ func TestPubSub_AllPublishProperties(t *testing.T) {
 
 // ---------------- Retain ----------------
 
+// A retained message reaches a later subscriber with Retain set, and an
+// empty retained publish clears it.
 func TestPublish_Retain_DeliveredToLateSubscriber(t *testing.T) {
 	pub := connect(t)
 	topic := "conformance/retain/" + randSuffix()
 
 	want := []byte("retained-value")
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, Payload: want, QoS: 1, Retain: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -443,7 +461,7 @@ func TestPublish_Retain_DeliveredToLateSubscriber(t *testing.T) {
 
 	// Clear retain with an empty payload + Retain=true; a fresh
 	// late subscriber must now get nothing.
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, QoS: 1, Retain: true, Payload: nil,
 	}); err != nil {
 		t.Fatal(err)
@@ -461,6 +479,7 @@ func TestPublish_Retain_DeliveredToLateSubscriber(t *testing.T) {
 
 // ---------------- Queue subscribe (values + order) ----------------
 
+// SubscribeQueue delivers one publisher's QoS 1 messages in order.
 func TestSubscribeQueue_OrderedDelivery(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -477,7 +496,7 @@ func TestSubscribeQueue_OrderedDelivery(t *testing.T) {
 	want := make([]string, n)
 	for i := range n {
 		want[i] = "msg-" + string(rune('A'+i))
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: topic, Payload: []byte(want[i]), QoS: 1,
 		}); err != nil {
 			t.Fatal(err)
@@ -508,6 +527,7 @@ type reading struct {
 	Site     string  `json:"site"`
 }
 
+// Typed[T] with the JSON codec round-trips a struct.
 func TestTypedJSON_FullStructEquality(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -524,7 +544,7 @@ func TestTypedJSON_FullStructEquality(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	want := reading{DeviceID: "sensor-77", Temp: 21.5, Site: "us-west-2"}
-	if err := typedPub.Publish(context.Background(), wire.PublishOpts{
+	if err := typedPub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, QoS: 1,
 	}, want); err != nil {
 		t.Fatal(err)
@@ -543,6 +563,7 @@ func TestTypedJSON_FullStructEquality(t *testing.T) {
 
 // ---------------- Large payload (bytes equality) ----------------
 
+// A 64 KiB payload arrives byte for byte.
 func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -562,7 +583,7 @@ func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 		payload[i] = byte((i * 31) % 256)
 	}
 
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, Payload: payload, QoS: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -584,14 +605,27 @@ func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 
 // ---------------- Topic alias end-to-end ----------------
 
+// With WithOutboundTopicAliases a repeated QoS 0 topic is sent as an
+// alias, saving at least the topic's length, and the subscriber still
+// sees the full topic.
 func TestTopicAlias_OutboundReducesBytes(t *testing.T) {
-	// mosquitto advertises TopicAliasMaximum=10 by default. Publish
-	// the same topic twice; the second publish should arrive at the
-	// subscriber under the same topic (broker substitutes from its
-	// alias cache). Verify both arrive with full Topic resolved.
-	pub := connect(t)
+	var written atomic.Int64
+	pub := connect(t,
+		mqttv5.WithOutboundTopicAliases(),
+		mqttv5.WithPublishMode(mqttv5.PublishWaitForFlush),
+		mqttv5.WithDialFunc(func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+			var d net.Dialer
+			c, err := d.DialContext(ctx, "tcp", u.Host)
+			if err != nil {
+				return nil, err
+			}
+			return countingConn{Conn: c, n: &written}, nil
+		}))
+	if info, ok := pub.ServerInfo(); !ok || info.TopicAliasMaximum == 0 {
+		t.Skip("broker grants no topic aliases")
+	}
 	sub := connect(t)
-	topic := "conformance/alias-out/" + randSuffix()
+	topic := "conformance/alias-out/" + randSuffix() + "/a/long/enough/topic/to/notice"
 
 	ch, _, err := sub.Subscribe(context.Background(),
 		[]mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(4))
@@ -600,30 +634,49 @@ func TestTopicAlias_OutboundReducesBytes(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	for i := range 2 {
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+	sizes := make([]int64, 2)
+	for i := range sizes {
+		before := written.Load()
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic:   topic,
 			Payload: []byte("alias-msg-" + string(rune('A'+i))),
 			QoS:     0,
 		}); err != nil {
 			t.Fatal(err)
 		}
+		sizes[i] = written.Load() - before
 	}
-
-	got := []string{}
-	for len(got) < 2 {
+	// The first publish registers the alias (topic and alias), the
+	// second sends the alias alone.
+	if saved := sizes[0] - sizes[1]; saved < int64(len(topic)) {
+		t.Errorf("first publish %d bytes, second %d: the alias saved %d, want at least %d",
+			sizes[0], sizes[1], saved, len(topic))
+	}
+	for i := range sizes {
 		m := expectMessage(t, ch, 3*time.Second)
 		if m.Topic != topic {
-			t.Errorf("topic = %q, want %q (broker should have resolved alias)",
-				m.Topic, topic)
+			t.Errorf("message %d topic = %q, want %q (the broker resolves the alias)", i, m.Topic, topic)
 		}
-		got = append(got, string(m.Payload))
 		_ = m.Ack()
 	}
 }
 
+// countingConn counts the bytes written to the broker.
+type countingConn struct {
+	net.Conn
+	n *atomic.Int64
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
 // ---------------- Unsubscribe ----------------
 
+// Unsubscribe closes the subscription's channel and later publishes do
+// not arrive.
 func TestUnsubscribe_StopsDelivery(t *testing.T) {
 	sub := connect(t)
 	pub := connect(t)
@@ -637,7 +690,7 @@ func TestUnsubscribe_StopsDelivery(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Confirm baseline delivery first.
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, Payload: []byte("before"), QoS: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -655,7 +708,7 @@ func TestUnsubscribe_StopsDelivery(t *testing.T) {
 
 	// Publish again — must NOT arrive. The channel should also be
 	// closed by the runtime.
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, Payload: []byte("after"), QoS: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -673,6 +726,8 @@ func TestUnsubscribe_StopsDelivery(t *testing.T) {
 
 // ---------------- Multi-subscription dispatch ----------------
 
+// Two subscriptions of one client on the same filter each receive the
+// message.
 func TestSubscribe_MultipleHandlersDispatch(t *testing.T) {
 	cli := connect(t)
 	pub := connect(t)
@@ -691,7 +746,7 @@ func TestSubscribe_MultipleHandlersDispatch(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	want := []byte("fanout")
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, Payload: want, QoS: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -731,8 +786,48 @@ func TestSubscribe_MultipleHandlersDispatch(t *testing.T) {
 	}
 }
 
+// The broker holds one subscription per filter (§3.8.4): when one of two
+// subscriptions with the same filter unsubscribes, the other keeps
+// receiving.
+func TestSubscribe_SameFilterSurvivesUnsubscribe(t *testing.T) {
+	cli := connect(t)
+	pub := connect(t)
+	topic := "conformance/samefilter/" + randSuffix()
+	filters := []mqttv5.TopicFilter{{Topic: topic, QoS: 1}}
+	ctx := context.Background()
+
+	chA, tokA, err := cli.Subscribe(ctx, filters, mqttv5.SubBuffer(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chB, _, err := cli.Subscribe(ctx, filters, mqttv5.SubBuffer(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Unsubscribe(ctx, tokA); err != nil {
+		t.Fatal(err)
+	}
+	for range chA {
+		t.Fatal("unsubscribed channel delivered a message")
+	}
+	if err := pub.Publish(ctx, mqttv5.PublishOptions{Topic: topic, Payload: []byte("still"), QoS: 1}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case m := <-chB:
+		if string(m.Payload) != "still" {
+			t.Fatalf("payload %q", m.Payload)
+		}
+		_ = m.Ack()
+	case <-time.After(3 * time.Second):
+		t.Fatal("remaining subscription lost the broker subscription")
+	}
+}
+
 // ---------------- Shared subscriptions ----------------
 
+// A shared subscription ($share) delivers each message to exactly one
+// member of the group.
 func TestSubscribe_SharedSub_RoundRobinAcrossGroup(t *testing.T) {
 	// MQTT v5 §4.8.2: every PUBLISH matching $share/{group}/{filter}
 	// goes to exactly one subscriber in the group. The distribution
@@ -787,7 +882,7 @@ func TestSubscribe_SharedSub_RoundRobinAcrossGroup(t *testing.T) {
 
 	pub := connect(t)
 	for i := range msgs {
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic:   topic,
 			Payload: fmt.Appendf(nil, "msg-%d", i),
 			QoS:     1,
@@ -832,6 +927,7 @@ func TestSubscribe_SharedSub_RoundRobinAcrossGroup(t *testing.T) {
 
 // ---------------- ClientGroup ----------------
 
+// A ClientGroup broadcast publish reaches subscribers on both brokers.
 func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 	requireBroker(t, secondaryBrokerURL())
 
@@ -869,7 +965,7 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 	}
 	defer g.Disconnect(context.Background())
 
-	if err := g.Publish(context.Background(), wire.PublishOpts{
+	if _, err := g.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, Payload: want, QoS: 1,
 	}); err != nil {
 		t.Fatal(err)

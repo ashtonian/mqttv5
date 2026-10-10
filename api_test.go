@@ -267,7 +267,7 @@ func TestClientGroupPublishFanOut(t *testing.T) {
 	}
 	defer g.Disconnect(context.Background())
 
-	if err := g.Publish(context.Background(), wire.PublishOpts{
+	if _, err := g.Publish(context.Background(), PublishOptions{
 		Topic:   "alpha",
 		Payload: []byte("ping"),
 		QoS:     0,
@@ -326,7 +326,7 @@ func TestTopicAlias_OutboundAutoAllocation(t *testing.T) {
 		<-fb.Done()
 	})
 
-	cli, _ := New(WithBroker(fb.URL()))
+	cli, _ := New(WithBroker(fb.URL()), WithOutboundTopicAliases())
 	if err := cli.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestTopicAlias_OutboundAutoAllocation(t *testing.T) {
 
 	// Publish the same topic twice at QoS 0.
 	for i := range 2 {
-		if err := cli.Publish(context.Background(), wire.PublishOpts{
+		if err := cli.Publish(context.Background(), PublishOptions{
 			Topic:   "sensor/temp",
 			Payload: fmt.Appendf(nil, "msg-%d", i),
 			QoS:     0,
@@ -422,7 +422,7 @@ func TestTopicAlias_InboundSubstitution(t *testing.T) {
 		<-fb.Done()
 	})
 
-	cli, _ := New(WithBroker(fb.URL()))
+	cli, _ := New(WithBroker(fb.URL()), WithInboundTopicAliasMaximum(10))
 	if err := cli.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}

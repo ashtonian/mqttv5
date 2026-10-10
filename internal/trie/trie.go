@@ -5,24 +5,25 @@
 //
 // Wildcards (per §4.7):
 //
-//   - matches exactly one level
-//     #  matches zero or more trailing levels (only valid as the final level)
+//   - +  matches exactly one level
+//   - #  matches zero or more trailing levels (only valid as the final level)
 //
-// The Tree value is read-only after construction. Use Register/Unregister
-// on the parent Router (see router.go in the package consumer) for
-// copy-on-write updates with atomic.Pointer swap — readers do not lock.
+// Register and Unregister change the tree in place in O(depth) — the
+// cost does not depend on how many filters are registered — and
+// Unregister prunes the nodes it empties. Match takes a read lock, so
+// yield must not call back into the tree.
 package trie
 
 import (
 	"strings"
+	"sync"
 )
 
 // Handler is the registered callback. The trie does not interpret it;
 // it just carries the value through to Match.
 type Handler any
 
-// Node is one level in the trie. Exported for callers that want to
-// build a tree by hand (e.g. tests).
+// Node is one level in the trie.
 type Node struct {
 	children  map[string]*Node
 	plusChild *Node
@@ -30,58 +31,31 @@ type Node struct {
 	handlers  []entry
 }
 
+func (n *Node) empty() bool {
+	return len(n.children) == 0 && n.plusChild == nil && n.hashChild == nil && len(n.handlers) == 0
+}
+
 type entry struct {
-	id      uint64 // unique within the parent Tree, for Unregister
+	id      uint64 // unique within the Tree, for Unregister
 	handler Handler
 }
 
-// Tree is a copy-on-write topic filter trie. The zero value is an empty
-// tree; use NewTree for clarity at the call site.
+// Tree is a topic filter trie, safe for concurrent use.
 type Tree struct {
+	mu     sync.RWMutex
 	root   *Node
-	nextID uint64 // monotonic ID generator for entries
+	nextID uint64
 }
 
 // NewTree returns an empty Tree.
 func NewTree() *Tree { return &Tree{root: &Node{}} }
 
-// Clone returns a deep copy of the tree. Used by the atomic
-// copy-on-write registration path: callers Clone, mutate, then CAS.
-//
-// Allocations scale with total node count. Typical subscriber tables
-// have on the order of 10-100 nodes; subscription mutations are rare,
-// so this is the right trade-off for the lock-free Match path.
-func (t *Tree) Clone() *Tree {
-	return &Tree{
-		root:   cloneNode(t.root),
-		nextID: t.nextID,
-	}
-}
-
-func cloneNode(n *Node) *Node {
-	if n == nil {
-		return nil
-	}
-	cp := &Node{
-		plusChild: cloneNode(n.plusChild),
-		hashChild: cloneNode(n.hashChild),
-	}
-	if len(n.handlers) > 0 {
-		cp.handlers = append([]entry(nil), n.handlers...)
-	}
-	if len(n.children) > 0 {
-		cp.children = make(map[string]*Node, len(n.children))
-		for k, v := range n.children {
-			cp.children[k] = cloneNode(v)
-		}
-	}
-	return cp
-}
-
 // Register adds h under the given topic filter and returns an opaque
 // id. Pass that id to Unregister to remove this specific registration
 // (multiple handlers can share a filter).
 func (t *Tree) Register(filter string, h Handler) (id uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.nextID++
 	id = t.nextID
 	node := t.ensure(filter)
@@ -89,33 +63,103 @@ func (t *Tree) Register(filter string, h Handler) (id uint64) {
 	return id
 }
 
-// Unregister removes the handler registered with id under filter.
-// Returns true if the handler was found and removed.
+// Unregister removes the handler registered with id under filter and
+// prunes nodes left empty. It reports whether the handler was found.
 func (t *Tree) Unregister(filter string, id uint64) bool {
-	node := t.find(filter)
-	if node == nil {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	path := t.path(filter)
+	if path == nil {
 		return false
 	}
-	for i, e := range node.handlers {
+	leaf := path[len(path)-1].node
+	i := -1
+	for j, e := range leaf.handlers {
 		if e.id == id {
-			node.handlers = append(node.handlers[:i], node.handlers[i+1:]...)
-			return true
+			i = j
+			break
 		}
 	}
-	return false
+	if i < 0 {
+		return false
+	}
+	leaf.handlers = append(leaf.handlers[:i], leaf.handlers[i+1:]...)
+	if len(leaf.handlers) == 0 {
+		leaf.handlers = nil
+	}
+	// Remove empty nodes bottom-up; the root stays.
+	for k := len(path) - 1; k > 0 && path[k].node.empty(); k-- {
+		parent, step := path[k-1].node, path[k]
+		switch step.level {
+		case "+":
+			parent.plusChild = nil
+		case "#":
+			parent.hashChild = nil
+		default:
+			delete(parent.children, step.level)
+		}
+	}
+	return true
+}
+
+// Reset removes every registration.
+func (t *Tree) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.root = &Node{}
+}
+
+// Nodes reports the number of nodes, root included.
+func (t *Tree) Nodes() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return countNodes(t.root)
+}
+
+func countNodes(n *Node) int {
+	if n == nil {
+		return 0
+	}
+	c := 1 + countNodes(n.plusChild) + countNodes(n.hashChild)
+	for _, ch := range n.children {
+		c += countNodes(ch)
+	}
+	return c
 }
 
 // Match walks the tree for topic, invoking yield with every handler
-// whose filter matches. yield should not retain Handler past return —
-// the underlying entry slice may change after a subsequent CoW swap.
+// whose filter matches. It holds the read lock throughout: yield must
+// not call Register, Unregister or Reset.
 //
 // Zero-allocation: walks topic in place via byte indexing for '/'
 // rather than allocating a []string of levels. The substring slicing
 // is zero-copy; the map[string]*Node lookups with substring keys are
 // also zero-alloc thanks to the compiler-special-cased string-key
 // optimization.
+//
+// A topic starting with '$' (e.g. $SYS/...) is not matched by a filter
+// whose first level is a wildcard [MQTT-4.7.2-1]: "#" and "+/x" do not
+// receive $SYS traffic, "$SYS/#" does.
 func (t *Tree) Match(topic string, yield func(Handler)) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if strings.HasPrefix(topic, "$") {
+		matchDollar(t.root, topic, yield)
+		return
+	}
 	matchLevels(t.root, topic, 0, yield)
+}
+
+// matchDollar matches a '$' topic: its first level only matches
+// literally, deeper levels follow the normal rules.
+func matchDollar(root *Node, topic string, yield func(Handler)) {
+	level, next := topic, len(topic)+1
+	if i := strings.IndexByte(topic, '/'); i >= 0 {
+		level, next = topic[:i], i+1
+	}
+	if child, ok := root.children[level]; ok {
+		matchLevels(child, topic, next, yield)
+	}
 }
 
 // matchLevels recurses down the trie, slicing the next level out of
@@ -201,32 +245,37 @@ func (t *Tree) ensure(filter string) *Node {
 	return node
 }
 
-// find walks the tree without creating nodes. Returns nil if the
-// filter has no matching path.
-func (t *Tree) find(filter string) *Node {
+// step is one node on the path to a filter and the level that led to it.
+type step struct {
+	level string
+	node  *Node
+}
+
+// path returns the nodes from the root to filter's node, or nil when the
+// filter has no node.
+func (t *Tree) path(filter string) []step {
 	levels := splitLevels(filter)
+	path := make([]step, 1, len(levels)+1)
+	path[0] = step{node: t.root}
 	node := t.root
 	for _, level := range levels {
 		switch level {
 		case "+":
-			if node.plusChild == nil {
-				return nil
-			}
 			node = node.plusChild
 		case "#":
-			return node.hashChild
+			node = node.hashChild
 		default:
-			if node.children == nil {
-				return nil
-			}
-			child, ok := node.children[level]
-			if !ok {
-				return nil
-			}
-			node = child
+			node = node.children[level]
+		}
+		if node == nil {
+			return nil
+		}
+		path = append(path, step{level: level, node: node})
+		if level == "#" {
+			break
 		}
 	}
-	return node
+	return path
 }
 
 // splitLevels is a thin wrapper over strings.Split for consistency.

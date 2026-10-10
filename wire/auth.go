@@ -49,6 +49,9 @@ type AuthOpts struct {
 
 // WriteAuth emits an AUTH packet.
 func WriteAuth(w io.Writer, opts AuthOpts) (int64, error) {
+	if err := validateAuthOpts(&opts); err != nil {
+		return 0, err
+	}
 	propsLen := 0
 	if opts.AuthenticationMethod != "" {
 		propsLen += 1 + 2 + len(opts.AuthenticationMethod)
@@ -118,7 +121,10 @@ func decodeAuth(frame *[]byte, flags byte) (*Auth, error) {
 		reason = ReasonCode(buf[0])
 		buf = buf[1:]
 		if len(buf) > 0 {
-			p, _, err := readProperties(buf)
+			p, n, err := readProperties(buf)
+			if err == nil && n != len(buf) {
+				err = errTrailing
+			}
 			if err != nil {
 				releaseBuf(frame)
 				return nil, fmt.Errorf("%w: AUTH properties: %w", ErrInvalidPacket, err)

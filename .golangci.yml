@@ -65,6 +65,17 @@ linters:
         linters:
           - errcheck
           - gosec
+      # examples/readme is the README's Go snippets verbatim, compiled so
+      # they cannot drift from the API (TestREADMESnippets). It is
+      # documentation: its functions are never called, snippets shadow
+      # the shared variables they assume, and some show an empty branch
+      # with a comment where the reader's code goes.
+      - path: examples/readme/
+        linters:
+          - unused
+          - govet
+          - revive
+          - staticcheck
 
 formatters:
   enable:
@@ -74,3 +85,7 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/ashtonian/mqttv5
+  exclusions:
+    paths:
+      # Import blocks follow the README's snippets (see above).
+      - examples/readme/

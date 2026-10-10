@@ -3,6 +3,7 @@
 package trie
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 )
@@ -123,24 +124,65 @@ func TestTrieUnregisterMissing(t *testing.T) {
 	}
 }
 
-func TestTrieClone(t *testing.T) {
-	orig := NewTree()
-	orig.Register("a/+", 1)
-	orig.Register("b/#", 2)
+// Unregistering prunes the nodes it empties.
+func TestTriePrunes(t *testing.T) {
+	tree := NewTree()
+	filters := []string{"a/b/c", "a/b/+", "a/#", "+/x", "devices/1/t", "devices/2/t", "#"}
+	ids := make([]uint64, len(filters))
+	for i, f := range filters {
+		ids[i] = tree.Register(f, i)
+	}
+	shared := tree.Register("a/b/c", 99)
+	for i, f := range filters {
+		if !tree.Unregister(f, ids[i]) {
+			t.Fatalf("Unregister(%q) failed", f)
+		}
+	}
+	if got := collect(tree, "a/b/c"); !sliceEq(got, []int{99}) {
+		t.Fatalf("remaining handler: %v", got)
+	}
+	if !tree.Unregister("a/b/c", shared) {
+		t.Fatal("Unregister shared failed")
+	}
+	if n := tree.Nodes(); n != 1 {
+		t.Fatalf("%d nodes left after removing every filter, want only the root", n)
+	}
+}
 
-	clone := orig.Clone()
-	if got := collect(clone, "a/x"); !sliceEq(got, []int{1}) {
-		t.Errorf("clone missing 1: got %v", got)
+// Register cost depends on the filter's depth, not on how many filters
+// exist. Compare ns/op of the two sub-benchmarks.
+func BenchmarkTrieRegister(b *testing.B) {
+	for _, existing := range []int{100, 10000} {
+		b.Run(fmt.Sprintf("existing=%d", existing), func(b *testing.B) {
+			tree := NewTree()
+			for i := 0; i < existing; i++ {
+				tree.Register(fmt.Sprintf("devices/%d/telemetry", i), i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				f := fmt.Sprintf("devices/new-%d/telemetry", i%1024)
+				id := tree.Register(f, i)
+				tree.Unregister(f, id)
+			}
+		})
 	}
+}
 
-	// Mutating the clone must not affect the original.
-	clone.Register("c/d", 3)
-	if got := collect(orig, "c/d"); got != nil {
-		t.Errorf("original mutated by clone: got %v", got)
+func BenchmarkTrieMatch(b *testing.B) {
+	tree := NewTree()
+	for i := 0; i < 10000; i++ {
+		tree.Register(fmt.Sprintf("devices/%d/telemetry", i), i)
 	}
-	if got := collect(clone, "c/d"); !sliceEq(got, []int{3}) {
-		t.Errorf("clone missing 3: got %v", got)
+	tree.Register("devices/+/telemetry", -1)
+	tree.Register("#", -2)
+	b.ReportAllocs()
+	b.ResetTimer()
+	n := 0
+	for i := 0; i < b.N; i++ {
+		tree.Match("devices/4242/telemetry", func(Handler) { n++ })
 	}
+	_ = n
 }
 
 func sliceEq(a, b []int) bool {
@@ -154,3 +196,36 @@ func sliceEq(a, b []int) bool {
 	}
 	return true
 }
+
+// [MQTT-4.7.2-1]: wildcards at the first level do not match topics
+// starting with '$'.
+func TestDollarTopicsSkipLeadingWildcards(t *testing.T) {
+	tr := NewTree()
+	got := map[string]bool{}
+	for _, f := range []string{"#", "+/x", "+/+", "$SYS/#", "$SYS/x", "$SYS/+", "+"} {
+		f := f
+		tr.Register(f, handlerFunc(func() { got[f] = true }))
+	}
+	tr.Match("$SYS/x", func(h Handler) { h.(handlerFunc)() })
+	want := map[string]bool{"$SYS/#": true, "$SYS/x": true, "$SYS/+": true}
+	if len(got) != len(want) {
+		t.Fatalf("matched %v, want %v", got, want)
+	}
+	for f := range want {
+		if !got[f] {
+			t.Fatalf("matched %v, want %v", got, want)
+		}
+	}
+	clear(got)
+	tr.Match("$SYS", func(h Handler) { h.(handlerFunc)() })
+	if !got["$SYS/#"] || got["#"] || got["+"] {
+		t.Fatalf("$SYS matched %v", got)
+	}
+	clear(got)
+	tr.Match("a/x", func(h Handler) { h.(handlerFunc)() })
+	if !got["#"] || !got["+/x"] || !got["+/+"] {
+		t.Fatalf("ordinary topic matched %v", got)
+	}
+}
+
+type handlerFunc func()

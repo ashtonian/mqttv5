@@ -31,9 +31,8 @@ func main() {
 	broker := envOr("MQTT_BROKER", "ws://127.0.0.1:8083/mqtt")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	// For wss://, supply a *tls.Config. nil config + wss:// makes
-	// DialFunc fail with ErrMissingTLSConfig at the first Connect
-	// attempt — no implicit downgrade.
+	// For wss://, a nil *tls.Config verifies the broker against the
+	// system roots; set one for a private CA or client certificates.
 	var tlsCfg *tls.Config
 
 	cli, err := mqttv5.New(

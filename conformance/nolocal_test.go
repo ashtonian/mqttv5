@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 // TestSubscribe_NoLocal_SuppressesOwnPublishes verifies the MQTT v5
@@ -55,7 +54,7 @@ func TestSubscribe_NoLocal_SuppressesOwnPublishes(t *testing.T) {
 	want := []byte("nolocal-payload")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.Publish(ctx, wire.PublishOpts{
+	if err := c.Publish(ctx, mqttv5.PublishOptions{
 		Topic: topic, Payload: want, QoS: 1,
 	}); err != nil {
 		t.Fatalf("C publish: %v", err)

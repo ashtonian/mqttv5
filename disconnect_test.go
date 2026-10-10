@@ -47,7 +47,7 @@ func TestDisconnectWithCarriesOpts(t *testing.T) {
 	}
 
 	expiry := uint32(0)
-	if err := cli.DisconnectWith(context.Background(), wire.DisconnectOpts{
+	if err := cli.DisconnectWith(context.Background(), DisconnectOptions{
 		ReasonCode:            wire.ReasonAdministrativeAction,
 		ReasonString:          "test teardown",
 		SessionExpiryInterval: &expiry,

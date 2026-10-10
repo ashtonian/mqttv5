@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 func main() {
@@ -44,9 +43,9 @@ func main() {
 		mqttv5.WithReconnectBackoff(mqttv5.ExponentialBackoff(
 			500*time.Millisecond, 5*time.Second, 100*time.Millisecond,
 		)),
-		mqttv5.WithOnConnectionUp(func(ack *wire.Connack) {
+		mqttv5.WithOnConnectionUp(func(info mqttv5.ConnackInfo) {
 			fmt.Printf("UP    (reconnect #%d) session_present=%t\n",
-				reconnects.Load(), ack != nil && ack.SessionPresent)
+				reconnects.Load(), info.SessionPresent)
 		}),
 		mqttv5.WithOnConnectionDown(func() bool {
 			n := reconnects.Add(1)
@@ -90,7 +89,7 @@ func main() {
 	for i := 0; ; i++ {
 		select {
 		case <-t.C:
-			err := cli.Publish(ctx, wire.PublishOpts{
+			err := cli.Publish(ctx, mqttv5.PublishOptions{
 				Topic:   "reconnect/demo",
 				Payload: fmt.Appendf(nil, "tick %d", i),
 				QoS:     1,

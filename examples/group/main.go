@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 func main() {
@@ -79,13 +78,18 @@ func main() {
 	for i := 0; ; i++ {
 		select {
 		case <-t.C:
-			err := g.Publish(ctx, wire.PublishOpts{
+			results, err := g.Publish(ctx, mqttv5.PublishOptions{
 				Topic:   "ha/heartbeat",
 				Payload: fmt.Appendf(nil, "tick %d", i),
 				QoS:     1,
 			})
 			if err != nil {
 				fmt.Printf("publish err: %v\n", err)
+			}
+			for _, r := range results {
+				if r.Err != nil {
+					fmt.Printf("  %s: %v\n", r.Member, r.Err)
+				}
 			}
 		case <-ctx.Done():
 			return

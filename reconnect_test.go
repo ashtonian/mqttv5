@@ -187,8 +187,8 @@ func TestResubscribeOnReconnect(t *testing.T) {
 }
 
 // TestReplayQoS1OnReconnect verifies that a QoS 1 publish in-flight
-// when the broker drops gets replayed (with DUP) after reconnect and
-// the original Publish() call completes successfully.
+// when the connection drops is resent with DUP=1 when the broker resumes
+// the session, and the original Publish() call completes successfully.
 func TestReplayQoS1OnReconnect(t *testing.T) {
 	connNum := atomic.Int32{}
 	publishesSeen := make(chan *publishSeen, 8)
@@ -197,7 +197,7 @@ func TestReplayQoS1OnReconnect(t *testing.T) {
 		defer c.Close()
 		n := connNum.Add(1)
 		dec := wire.NewDecoder(c)
-		acceptConnect(t, c, dec)
+		acceptConnectWith(t, c, dec, wire.ConnackOpts{SessionPresent: n > 1})
 
 		for {
 			pkt, err := dec.ReadPacket()
@@ -238,7 +238,7 @@ func TestReplayQoS1OnReconnect(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		pubDone <- cli.Publish(ctx, wire.PublishOpts{
+		pubDone <- cli.Publish(ctx, PublishOptions{
 			Topic:   "events/important",
 			Payload: []byte("hello"),
 			QoS:     1,

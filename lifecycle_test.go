@@ -4,6 +4,8 @@ package mqttv5
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -11,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ashtonian/mqttv5/internal/testbroker"
+	"github.com/ashtonian/mqttv5/session"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -31,11 +35,11 @@ func TestOnConnectionUpReceivesConnack(t *testing.T) {
 		<-fb.Done()
 	})
 
-	received := make(chan *wire.Connack, 1)
+	received := make(chan ConnackInfo, 1)
 	cli, err := New(
 		WithBroker(fb.URL()),
-		WithOnConnectionUp(func(ack *wire.Connack) {
-			received <- ack
+		WithOnConnectionUp(func(info ConnackInfo) {
+			received <- info
 		}),
 	)
 	if err != nil {
@@ -47,17 +51,18 @@ func TestOnConnectionUpReceivesConnack(t *testing.T) {
 	defer cli.Disconnect(context.Background())
 
 	select {
-	case ack := <-received:
-		if ack == nil {
-			t.Fatal("OnConnectionUp received nil Connack")
+	case info := <-received:
+		if info.AssignedClientID != "broker-assigned-id" {
+			t.Errorf("AssignedClientID = %q, want broker-assigned-id", info.AssignedClientID)
 		}
-		assigned, _ := ack.Properties.String(wire.PropAssignedClientID)
-		if assigned != "broker-assigned-id" {
-			t.Errorf("AssignedClientIdentifier = %q, want broker-assigned-id", assigned)
+		if info.MaximumQoS != 1 {
+			t.Errorf("MaximumQoS = %d, want 1", info.MaximumQoS)
 		}
-		qos, ok := ack.Properties.Byte(wire.PropMaximumQoS)
-		if !ok || qos != 1 {
-			t.Errorf("MaximumQoS = (%d, %v), want (1, true)", qos, ok)
+		if info.ReceiveMaximum != 65535 || !info.RetainAvailable || !info.SharedSubscriptionAvailable {
+			t.Errorf("defaults not applied: %+v", info)
+		}
+		if got, ok := cli.ServerInfo(); !ok || got.AssignedClientID != info.AssignedClientID {
+			t.Errorf("ServerInfo() = %+v, %v", got, ok)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnConnectionUp not fired within 2s")
@@ -158,7 +163,7 @@ func TestOnConnectionDownReturnFalseStopsSupervisor(t *testing.T) {
 		t.Fatal("OnConnectionDown never fired")
 	}
 
-	cli.supWg.Wait()
+	cli.life.Load().running.Wait()
 	if cli.Connected() {
 		t.Fatal("Client still reports Connected after supervisor exit")
 	}
@@ -331,7 +336,7 @@ func TestClientGroupCallbacksFirePerMember(t *testing.T) {
 	group, err := NewClientGroup(members,
 		WithGroupSharedOpts(
 			WithClientID("group-callback-test"),
-			WithOnConnectionUp(func(_ *wire.Connack) { upCount.Add(1) }),
+			WithOnConnectionUp(func(ConnackInfo) { upCount.Add(1) }),
 		),
 	)
 	if err != nil {
@@ -391,12 +396,10 @@ func TestSetBrokersAfterServerMoved(t *testing.T) {
 		WithBroker(origin.URL()),
 		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
 		WithConnectTimeout(200*time.Millisecond),
-		WithOnServerDisconnect(func(d *wire.Disconnect) {
-			ref, ok := d.Properties.String(wire.PropServerReference)
-			if !ok {
-				return
+		WithOnServerDisconnect(func(d DisconnectInfo) {
+			if d.ServerReference != "" {
+				_ = cli.SetBrokers(d.ServerReference)
 			}
-			_ = cli.SetBrokers(ref)
 		}),
 		WithOnConnectionDown(func() bool { return true }),
 	)
@@ -416,4 +419,326 @@ func TestSetBrokersAfterServerMoved(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("client never reconnected to ServerReference target")
+}
+
+// A Disconnect racing Connect, started the moment the connection is up,
+// either lets the supervisor start first and waits for it, or keeps it
+// from starting: nothing of the span is left running either way.
+func TestDisconnectRacingConnectLeavesNothingRunning(t *testing.T) {
+	check := noLeaks(t)
+	b := testbroker.New(t)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 100 {
+				if !connectAndDisconnectAtOnce(t, b.URL()) {
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	b.Close()
+	check()
+}
+
+func connectAndDisconnectAtOnce(t *testing.T, url string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	var cli *Client
+	cli, err := New(WithBroker(url), WithoutKeepAlive(), WithLogger(quietLogger()),
+		WithOnConnectionUp(func(ConnackInfo) {
+			go func() { stopped <- cli.Disconnect(ctx) }()
+		}))
+	if err != nil {
+		t.Error(err)
+		return false
+	}
+	if err := cli.Connect(ctx); err != nil && !errors.Is(err, ErrClosed) {
+		t.Errorf("Connect: %v", err)
+		return false
+	}
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("Disconnect: %v", err)
+			return false
+		}
+	case <-ctx.Done():
+		t.Error("Disconnect did not return")
+		return false
+	}
+	select {
+	case <-cli.life.Load().finished:
+	default:
+		t.Error("Disconnect returned before the teardown finished")
+		return false
+	}
+	if cli.Connected() {
+		t.Error("connected after Disconnect")
+		return false
+	}
+	return true
+}
+
+// Disconnect does not wait out a reconnect's handshake: the attempt
+// ends with the span, and its failure is not reported as a connect error.
+func TestDisconnectEndsAReconnectAwaitingConnack(t *testing.T) {
+	stalled := make(chan struct{})
+	var once sync.Once
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		// Returning drops the connection.
+		c.AcceptConnect(wire.ConnackOpts{})
+	})
+	b.SetFallback(func(c *testbroker.Conn) {
+		c.Expect(wire.CONNECT, 0)
+		once.Do(func() { close(stalled) })
+		c.Hold(0)
+	})
+	var connectErrors atomic.Int32
+	cli, err := New(WithBroker(b.URL()), WithoutKeepAlive(), WithLogger(quietLogger()),
+		WithConnectTimeout(time.Minute), WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+		WithOnConnectError(func(error) { connectErrors.Add(1) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stalled:
+	case <-ctx.Done():
+		t.Fatal("no reconnect attempt")
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- cli.Disconnect(ctx) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Disconnect: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Disconnect waited for the reconnect handshake")
+	}
+	if n := connectErrors.Load(); n != 0 {
+		t.Fatalf("OnConnectError fired %d times for the attempt Disconnect ended", n)
+	}
+}
+
+// Cancelling Connect's ctx while it waits for the CONNACK ends the
+// handshake with ctx's error, well within the connect timeout.
+func TestConnectCancelledAwaitingConnack(t *testing.T) {
+	sent := make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.Expect(wire.CONNECT, 0)
+		close(sent)
+		c.Hold(0)
+	})
+	cli, err := New(WithBroker(b.URL()), WithoutKeepAlive(), WithLogger(quietLogger()),
+		WithConnectTimeout(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- cli.Connect(ctx) }()
+	select {
+	case <-sent:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no CONNECT")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Connect = %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Connect ignored the cancelled ctx")
+	}
+	if cli.Connected() {
+		t.Fatal("connected after a cancelled Connect")
+	}
+}
+
+// A Disconnect during Connect's handshake cancels it: Connect returns
+// ErrClosed, and a CONNACK arriving later binds nothing.
+func TestDisconnectCancelsAConnectAwaitingConnack(t *testing.T) {
+	sent, held := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	first := testbroker.New(t, func(c *testbroker.Conn) {
+		c.Expect(wire.CONNECT, 0)
+		close(sent)
+		<-held
+		_ = c.Write(func(w io.Writer) (int64, error) { return wire.WriteConnack(w, wire.ConnackOpts{}) })
+		c.Hold(0)
+	})
+	t.Cleanup(release)
+	next := testbroker.New(t)
+	cli, err := New(WithBroker(first.URL()), WithClientID("span"), WithoutKeepAlive(), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	old := make(chan error, 1)
+	go func() { old <- cli.Connect(ctx) }()
+	<-sent
+	if err := cli.Disconnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The broker still holds the CONNACK: only the cancellation can
+	// have ended Connect.
+	select {
+	case err := <-old:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("the cancelled Connect returned %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect kept waiting for the CONNACK after Disconnect")
+	}
+	release()
+	if err := cli.SetBrokers(next.URL()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(ctx)
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("after")}); err != nil {
+		t.Fatalf("QoS 1 on the next span: %v", err)
+	}
+}
+
+// A connection Connect activated is joined by Disconnect even when the
+// span ends before its supervisor starts: Disconnect returns only once
+// its read loop, which runs SubscribeCallback handlers, has exited.
+func TestDisconnectBeforeSupervisorJoinsTheConnection(t *testing.T) {
+	poolSent, poolHeld := make(chan struct{}), make(chan struct{})
+	entered, held := make(chan struct{}), make(chan struct{})
+	releasePool := sync.OnceFunc(func() { close(poolHeld) })
+	release := sync.OnceFunc(func() { close(held) })
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeSubscribe(-1)
+		_ = c.Publish(wire.PublishOpts{Topic: "t", Payload: []byte("held")})
+		c.Hold(0)
+	}, func(c *testbroker.Conn) {
+		// The publisher pool's first member: its handshake keeps
+		// Connect from starting the supervisor.
+		c.Expect(wire.CONNECT, 0)
+		close(poolSent)
+		<-poolHeld
+	})
+	t.Cleanup(releasePool)
+	t.Cleanup(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var cli *Client
+	cli, err := New(WithBroker(b.URL()), WithClientID("joined"), WithoutKeepAlive(), WithPublisherPool(2), WithLogger(quietLogger()),
+		WithOnConnectionUp(func(ConnackInfo) {
+			go func() {
+				_, err := cli.SubscribeCallback(ctx, []TopicFilter{{Topic: "t"}}, func(*Message) {
+					close(entered)
+					<-held
+				})
+				if err != nil {
+					t.Error(err)
+				}
+			}()
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected := make(chan error, 1)
+	go func() { connected <- cli.Connect(ctx) }()
+	<-poolSent
+	<-entered
+	stopped := make(chan error, 1)
+	go func() { stopped <- cli.Disconnect(ctx) }()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		release()
+	}()
+	select {
+	case <-stopped:
+		select {
+		case <-held:
+		default:
+			t.Fatal("Disconnect returned while a SubscribeCallback handler was running")
+		}
+	case <-ctx.Done():
+		t.Fatal("Disconnect did not return")
+	}
+	releasePool()
+	if err := <-connected; !errors.Is(err, ErrClosed) {
+		t.Fatalf("Connect = %v, want ErrClosed", err)
+	}
+}
+
+// heldMetaStore holds its first SetMeta until release.
+type heldMetaStore struct {
+	*session.MemoryStore
+	entered chan struct{}
+	held    chan struct{}
+	once    sync.Once
+}
+
+func (s *heldMetaStore) SetMeta(ctx context.Context, m session.Meta) error {
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.held
+	})
+	return s.MemoryStore.SetMeta(ctx, m)
+}
+
+// A Disconnect while Connect binds the session engine to its new
+// connection waits for Connect, which then gives the connection up: the
+// next span's connection keeps the engine.
+func TestDisconnectWaitsForAConnectBindingItsConnection(t *testing.T) {
+	st := &heldMetaStore{MemoryStore: session.NewMemoryStore(), entered: make(chan struct{}), held: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(st.held) })
+	t.Cleanup(release)
+	first := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.Hold(0)
+	})
+	next := testbroker.New(t)
+	cli, err := New(WithBroker(first.URL()), WithClientID("binding"), WithStore(st), WithoutKeepAlive(), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	old := make(chan error, 1)
+	go func() { old <- cli.Connect(ctx) }()
+	<-st.entered
+	stopped := make(chan error, 1)
+	go func() { stopped <- cli.Disconnect(ctx) }()
+	select {
+	case <-stopped:
+		t.Fatal("Disconnect returned while Connect was binding its connection")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-old; !errors.Is(err, ErrClosed) {
+		t.Fatalf("the stopped Connect returned %v, want ErrClosed", err)
+	}
+	if err := cli.SetBrokers(next.URL()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(ctx)
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("after")}); err != nil {
+		t.Fatalf("QoS 1 on the next span: %v", err)
+	}
 }

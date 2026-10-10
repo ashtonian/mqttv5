@@ -141,140 +141,9 @@ func TestConnect_AUTHWithoutAuthenticator(t *testing.T) {
 	}
 }
 
-// TestMidSessionReAuth exercises the client's response to a mid-session
-// AUTH challenge (MQTT v5 §4.12). The broker accepts CONNECT, sends
-// CONNACK, then sends an AUTH the client must route to
-// Authenticator.Continue, replying 0x18 Continue without dropping the
-// connection.
-//
-// Note: a conformant broker cannot initiate re-auth — 0x19 is
-// client-only (§3.15.2.1) — so the broker sending 0x19 here simulates a
-// non-conformant prompt that handleServerAuth tolerates defensively.
-// Either way the client's reply must be 0x18 Continue, never 0x00.
-func TestMidSessionReAuth(t *testing.T) {
-	respCh := make(chan []byte, 1)
-	reasonCh := make(chan wire.ReasonCode, 1)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		defer c.Close()
-		dec := wire.NewDecoder(c)
-		acceptConnect(t, c, dec)
-
-		// Trigger mid-session re-auth.
-		if _, err := wire.WriteAuth(c, wire.AuthOpts{
-			ReasonCode:           wire.ReasonReAuthenticate,
-			AuthenticationMethod: "ECHO",
-			AuthenticationData:   []byte("ping"),
-		}); err != nil {
-			t.Errorf("broker write AUTH: %v", err)
-			return
-		}
-
-		// Read the client's AUTH response.
-		pkt, err := dec.ReadPacket()
-		if err != nil {
-			t.Errorf("read client AUTH: %v", err)
-			return
-		}
-		auth, ok := pkt.(*wire.Auth)
-		if !ok {
-			t.Errorf("expected AUTH, got %s", pkt.Type())
-			pkt.Release()
-			return
-		}
-		data, _ := auth.Properties.Binary(wire.PropAuthData)
-		dataCopy := append([]byte(nil), data...)
-		reason := auth.ReasonCode
-		pkt.Release()
-		respCh <- dataCopy
-		reasonCh <- reason
-		<-fb.Done()
-	})
-
-	auth := &echoAuth{}
-	cli, err := New(WithBroker(fb.URL()), WithAuthenticator(auth))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	select {
-	case resp := <-respCh:
-		if !bytes.Equal(resp, []byte("pong")) {
-			t.Fatalf("client AUTH response = %q, want pong", resp)
-		}
-		if rc := <-reasonCh; rc != wire.ReasonContinueAuthentication {
-			t.Fatalf("client reply reason = 0x%02X, want 0x18 Continue (never 0x00)", byte(rc))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("client did not respond to mid-session AUTH within 2s")
-	}
-
-	if !cli.Connected() {
-		t.Fatal("Connected() = false after mid-session re-auth")
-	}
-}
-
-// TestMidSessionReAuthWithoutAuthenticator exercises the failure path:
-// broker sends AUTH mid-session but client has no Authenticator. The
-// client must emit DISCONNECT 0x87 (Not authorized) and the
-// supervisor reconnects through the regular CONNECT path.
-func TestMidSessionReAuthWithoutAuthenticator(t *testing.T) {
-	disconnReceived := make(chan wire.ReasonCode, 1)
-	var connects atomic.Int32
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		defer c.Close()
-		dec := wire.NewDecoder(c)
-		acceptConnect(t, c, dec)
-		round := connects.Add(1)
-		if round == 1 {
-			// First connection: send mid-session AUTH, expect
-			// DISCONNECT, then the connection will drop.
-			if _, err := wire.WriteAuth(c, wire.AuthOpts{
-				ReasonCode:           wire.ReasonReAuthenticate,
-				AuthenticationMethod: "X",
-			}); err != nil {
-				return
-			}
-			pkt, err := dec.ReadPacket()
-			if err != nil {
-				return
-			}
-			d, ok := pkt.(*wire.Disconnect)
-			if ok {
-				disconnReceived <- d.ReasonCode
-			}
-			pkt.Release()
-			return
-		}
-		<-fb.Done()
-	})
-
-	cli, _ := New(
-		WithBroker(fb.URL()),
-		WithReconnectBackoff(ConstantBackoff(50*time.Millisecond)),
-	)
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	select {
-	case rc := <-disconnReceived:
-		if rc != wire.ReasonNotAuthorized {
-			t.Fatalf("DISCONNECT reason = 0x%02X, want ReasonNotAuthorized", byte(rc))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no DISCONNECT received within 2s")
-	}
-}
-
-// doneTrueAuth is an Authenticator whose Continue reports done=true. It
-// guards the regression where a done=true return made the client emit a
-// spec-violating AUTH 0x00 instead of 0x18 Continue (§3.15.2.1 — only the
-// server concludes the exchange).
+// doneTrueAuth is an Authenticator whose Continue reports done=true. The
+// client still answers with AUTH 0x18 Continue, never 0x00: only the
+// server concludes the exchange (§3.15.2.1).
 type doneTrueAuth struct {
 	steps atomic.Int32
 }
@@ -284,138 +153,6 @@ func (*doneTrueAuth) Begin(context.Context) ([]byte, error) { return []byte("hel
 func (a *doneTrueAuth) Continue(brokerData []byte) ([]byte, bool, error) {
 	a.steps.Add(1)
 	return []byte("pong"), true, nil // done=true — must NOT become AUTH 0x00
-}
-
-// TestMidSessionReAuth_DoneTrueRepliesContinue asserts the client replies
-// 0x18 Continue (not 0x00 Success) to a mid-session challenge even when
-// Authenticator.Continue returns done=true. Fails against the pre-fix
-// handler, which mapped done=true to a client-sent 0x00.
-func TestMidSessionReAuth_DoneTrueRepliesContinue(t *testing.T) {
-	reasonCh := make(chan wire.ReasonCode, 1)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		defer c.Close()
-		dec := wire.NewDecoder(c)
-		acceptConnect(t, c, dec)
-
-		if _, err := wire.WriteAuth(c, wire.AuthOpts{
-			ReasonCode:           wire.ReasonContinueAuthentication,
-			AuthenticationMethod: "ECHO",
-			AuthenticationData:   []byte("ping"),
-		}); err != nil {
-			t.Errorf("broker write AUTH: %v", err)
-			return
-		}
-
-		pkt, err := dec.ReadPacket()
-		if err != nil {
-			t.Errorf("read client AUTH: %v", err)
-			return
-		}
-		auth, ok := pkt.(*wire.Auth)
-		if !ok {
-			t.Errorf("expected AUTH, got %s", pkt.Type())
-			pkt.Release()
-			return
-		}
-		reason := auth.ReasonCode
-		pkt.Release()
-		reasonCh <- reason
-		<-fb.Done()
-	})
-
-	auth := &doneTrueAuth{}
-	cli, err := New(WithBroker(fb.URL()), WithAuthenticator(auth))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	select {
-	case rc := <-reasonCh:
-		if rc != wire.ReasonContinueAuthentication {
-			t.Fatalf("client reply reason = 0x%02X, want 0x18 Continue (client must never send 0x00)", byte(rc))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("client did not respond to mid-session AUTH within 2s")
-	}
-	if got := auth.steps.Load(); got != 1 {
-		t.Errorf("Authenticator.Continue calls = %d, want 1", got)
-	}
-	if !cli.Connected() {
-		t.Fatal("Connected() = false after mid-session re-auth")
-	}
-}
-
-// TestMidSessionReAuth_BrokerSuccessIsTerminal asserts that an inbound
-// AUTH 0x00 Success concludes the exchange: the client neither replies
-// nor re-enters the Authenticator, and the connection stays up. Fails
-// against the pre-fix handler, which fed the 0x00 into Continue (with
-// echoAuth that errors on non-"ping" data, forcing a DISCONNECT).
-func TestMidSessionReAuth_BrokerSuccessIsTerminal(t *testing.T) {
-	gotReply := make(chan string, 1)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
-		defer c.Close()
-		dec := wire.NewDecoder(c)
-		acceptConnect(t, c, dec)
-
-		// Conclude a (would-be) re-auth with 0x00 Success.
-		if _, err := wire.WriteAuth(c, wire.AuthOpts{
-			ReasonCode:           wire.ReasonSuccess,
-			AuthenticationMethod: "ECHO",
-		}); err != nil {
-			t.Errorf("broker write AUTH: %v", err)
-			return
-		}
-
-		// The client must send nothing back. Read with a short deadline
-		// and expect a timeout; any packet (a spurious AUTH, or a
-		// DISCONNECT from a failed Continue) is the bug.
-		_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		pkt, err := dec.ReadPacket()
-		switch {
-		case err == nil:
-			gotReply <- pkt.Type().String()
-			pkt.Release()
-		case isTimeout(err):
-			gotReply <- "" // good: silence
-		default:
-			gotReply <- "err:" + err.Error()
-		}
-		<-fb.Done()
-	})
-
-	var reauthed atomic.Int32
-	auth := &echoAuth{}
-	cli, err := New(WithBroker(fb.URL()), WithAuthenticator(auth),
-		WithOnReauthenticated(func() { reauthed.Add(1) }))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cli.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer cli.Disconnect(context.Background())
-
-	select {
-	case got := <-gotReply:
-		if got != "" {
-			t.Fatalf("client reacted to terminal AUTH 0x00 with %q, want silence", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("broker read did not settle within 2s")
-	}
-	if got := auth.steps.Load(); got != 0 {
-		t.Errorf("Authenticator.Continue called %d times on terminal 0x00, want 0", got)
-	}
-	if !cli.Connected() {
-		t.Fatal("Connected() = false after terminal AUTH 0x00 (connection should stay up)")
-	}
-	if got := reauthed.Load(); got != 1 {
-		t.Errorf("OnReauthenticated fired %d times on broker-driven 0x00, want 1", got)
-	}
 }
 
 func isTimeout(err error) bool {
@@ -976,9 +713,9 @@ func TestReauthenticate_FiresOnReauthenticated(t *testing.T) {
 		<-fb.Done()
 	})
 
-	var reauthed atomic.Int32
+	reauthed := make(chan struct{}, 2)
 	cli, err := New(WithBroker(fb.URL()), WithAuthenticator(&countingAuth{}),
-		WithOnReauthenticated(func() { reauthed.Add(1) }))
+		WithOnReauthenticated(func() { reauthed <- struct{}{} }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -990,10 +727,16 @@ func TestReauthenticate_FiresOnReauthenticated(t *testing.T) {
 	if err := cli.Reauthenticate(context.Background()); err != nil {
 		t.Fatalf("Reauthenticate: %v", err)
 	}
-	// The hook fires on the read loop before Reauthenticate's result is
-	// delivered, so it has run by the time the call returns.
-	if got := reauthed.Load(); got != 1 {
-		t.Errorf("OnReauthenticated fired %d times, want 1", got)
+	select {
+	case <-reauthed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnReauthenticated did not fire")
+	}
+	// Callbacks run in order: once the queue is flushed, a second firing
+	// would have run.
+	cli.events.flush(nil)
+	if n := len(reauthed); n != 0 {
+		t.Errorf("OnReauthenticated fired %d more times", n)
 	}
 }
 

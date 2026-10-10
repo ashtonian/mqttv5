@@ -11,9 +11,12 @@
 //     string/byte fields rather than copying.
 //   - Lazy property decoding: property bytes are kept as a slice until a
 //     consumer asks for a specific property by ID.
-//   - Encode produces a `net.Buffers` (fixed header, variable header,
-//     payload) so the writer can use vectored writes without an extra
-//     copy.
+//   - PUBLISH encoders for each lifetime: AppendPublishHeader encodes
+//     everything but the payload, so header and payload go out together
+//     (net.Buffers, one writev) without copying the payload;
+//     EncodePublish encodes the whole packet into a pooled buffer for a
+//     write that happens later; MarshalPublish into an owned,
+//     exact-size slice for a packet that is kept.
 //
 // Lifetime contract:
 //

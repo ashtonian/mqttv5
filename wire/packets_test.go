@@ -5,6 +5,7 @@ package wire
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -62,15 +63,17 @@ func TestPingrespRoundTrip(t *testing.T) {
 // ---------------- PUBACK / PUBREC / PUBREL / PUBCOMP ----------------
 
 func TestPubRespRoundTrip(t *testing.T) {
+	// Each type gets a non-success code it may legally carry.
 	cases := []struct {
 		name    string
 		writeFn func(*bytes.Buffer, PubRespOpts) (int64, error)
 		want    PacketType
+		reason  ReasonCode
 	}{
-		{"PUBACK", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePuback(b, o) }, PUBACK},
-		{"PUBREC", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePubrec(b, o) }, PUBREC},
-		{"PUBREL", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePubrel(b, o) }, PUBREL},
-		{"PUBCOMP", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePubcomp(b, o) }, PUBCOMP},
+		{"PUBACK", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePuback(b, o) }, PUBACK, ReasonNoMatchingSubscribers},
+		{"PUBREC", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePubrec(b, o) }, PUBREC, ReasonNoMatchingSubscribers},
+		{"PUBREL", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePubrel(b, o) }, PUBREL, ReasonPacketIdentifierNotFound},
+		{"PUBCOMP", func(b *bytes.Buffer, o PubRespOpts) (int64, error) { return WritePubcomp(b, o) }, PUBCOMP, ReasonPacketIdentifierNotFound},
 	}
 
 	shapes := []struct {
@@ -100,6 +103,9 @@ func TestPubRespRoundTrip(t *testing.T) {
 
 	for _, tc := range cases {
 		for _, sh := range shapes {
+			if sh.opts.ReasonCode != ReasonSuccess {
+				sh.opts.ReasonCode = tc.reason
+			}
 			t.Run(tc.name+"/"+sh.name, func(t *testing.T) {
 				pkt := roundTrip(t,
 					func(b *bytes.Buffer) (int64, error) { return tc.writeFn(b, sh.opts) },
@@ -385,7 +391,7 @@ func encodeBadCONNECTBody() []byte {
 
 func TestConnackRoundTrip(t *testing.T) {
 	sei := uint32(60)
-	maxQoS := byte(2)
+	maxQoS := byte(1)
 	opts := ConnackOpts{
 		SessionPresent:           true,
 		ReasonCode:               ReasonSuccess,
@@ -414,5 +420,48 @@ func TestConnackRoundTrip(t *testing.T) {
 	}
 	if got, _ := c.Properties.String(PropAssignedClientID); got != "broker-assigned-id" {
 		t.Errorf("AssignedClientID: got %q", got)
+	}
+}
+
+func TestPublishOptsRoundTrip(t *testing.T) {
+	zero, one := uint32(0), byte(1)
+	expiry := uint32(3600)
+	for _, opts := range []PublishOpts{
+		{Topic: "a/b", Payload: []byte("p"), QoS: 1, PacketID: 9, Retain: true},
+		{Topic: "a/b", QoS: 2, PacketID: 1, Dup: true, MessageExpiryInterval: &zero, CorrelationData: []byte{}},
+		{Topic: "t", Payload: []byte{1, 2}, PayloadFormatIndicator: &one, MessageExpiryInterval: &expiry,
+			ContentType: "application/json", ResponseTopic: "reply/to", CorrelationData: []byte("c"), TopicAlias: 3,
+			UserProperties: []UserProperty{{Key: "k", Value: "v"}, {Key: "k", Value: "w"}, {Key: "", Value: ""}}},
+	} {
+		frame, err := MarshalPublish(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkt, err := NewDecoder(bytes.NewReader(frame)).ReadPacket()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := pkt.(*Publish).Opts()
+		pkt.Release()
+		if !reflect.DeepEqual(got, opts) {
+			t.Fatalf("got  %+v\nwant %+v", got, opts)
+		}
+	}
+}
+
+func TestPublishOptsClone(t *testing.T) {
+	pfi, mei := byte(1), uint32(30)
+	orig := PublishOpts{Topic: "t", Payload: []byte("p"), PayloadFormatIndicator: &pfi, MessageExpiryInterval: &mei,
+		CorrelationData: []byte{}, UserProperties: []UserProperty{{Key: "k", Value: "v"}}}
+	c := orig.Clone()
+	if !reflect.DeepEqual(c, orig) {
+		t.Fatalf("clone %+v differs from %+v", c, orig)
+	}
+	orig.Payload[0], orig.UserProperties[0].Value, *orig.PayloadFormatIndicator, *orig.MessageExpiryInterval = 'x', "w", 0, 1
+	if string(c.Payload) != "p" || c.UserProperties[0].Value != "v" || *c.PayloadFormatIndicator != 1 || *c.MessageExpiryInterval != 30 {
+		t.Fatalf("clone shares memory with the original: %+v", c)
+	}
+	if c.CorrelationData == nil || (PublishOpts{}).Clone().CorrelationData != nil {
+		t.Fatal("Clone changed nil-ness of Correlation Data")
 	}
 }

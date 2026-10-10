@@ -109,12 +109,8 @@ func waitForPoolReady(t *testing.T, cli *Client, want int, timeout time.Duration
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if cli.pubPool == nil {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
 		ready := 0
-		for _, m := range cli.pubPool.members {
+		for _, m := range cli.pool.members {
 			if m.Connected() {
 				ready++
 			}
@@ -154,12 +150,12 @@ func TestPoolRouting_HashByTopic_SameTopicSameMember(t *testing.T) {
 	// Publish 5× to topic A, 5× to topic B. With hash-by-topic each
 	// topic must collapse to a single member.
 	for range 5 {
-		if err := cli.Publish(context.Background(), wire.PublishOpts{
+		if err := cli.Publish(context.Background(), PublishOptions{
 			Topic: "alpha", Payload: []byte("x"), QoS: 1,
 		}); err != nil {
 			t.Fatalf("Publish alpha: %v", err)
 		}
-		if err := cli.Publish(context.Background(), wire.PublishOpts{
+		if err := cli.Publish(context.Background(), PublishOptions{
 			Topic: "beta", Payload: []byte("x"), QoS: 1,
 		}); err != nil {
 			t.Fatalf("Publish beta: %v", err)
@@ -225,7 +221,7 @@ func TestPoolRouting_RoundRobin_SpreadsAcrossMembers(t *testing.T) {
 	// Publish 9× to a single topic. With round-robin and 3 members
 	// every member should receive at least one publish.
 	for range 9 {
-		if err := cli.Publish(context.Background(), wire.PublishOpts{
+		if err := cli.Publish(context.Background(), PublishOptions{
 			Topic: "same/topic", Payload: []byte("x"), QoS: 1,
 		}); err != nil {
 			t.Fatalf("Publish: %v", err)
@@ -368,9 +364,9 @@ func TestPoolMemberInheritsConnectProperties(t *testing.T) {
 			t.Errorf("CONNECT[%d] (%q) RequestResponseInformation = (%d, %v), want (1, true)",
 				i, s.clientID, s.rri, s.hasRRI)
 		}
-		if !s.hasRPI || s.rpi != 1 {
-			t.Errorf("CONNECT[%d] (%q) RequestProblemInformation = (%d, %v), want (1, true)",
-				i, s.clientID, s.rpi, s.hasRPI)
+		if s.hasRPI && s.rpi != 1 {
+			t.Errorf("CONNECT[%d] (%q) RequestProblemInformation = %d, want absent or 1",
+				i, s.clientID, s.rpi)
 		}
 		if s.userProperty["env"] != "test" {
 			t.Errorf("CONNECT[%d] (%q) missing env=test user property", i, s.clientID)
@@ -443,7 +439,7 @@ func TestPoolFallbackIncrementsStats(t *testing.T) {
 
 	// Pool members were refused, so they're unconnected. The publish
 	// path must fall back to the main connection.
-	if err := cli.Publish(context.Background(), wire.PublishOpts{
+	if err := cli.Publish(context.Background(), PublishOptions{
 		Topic: "fallback/test", QoS: 1, Payload: []byte("x"),
 	}); err != nil {
 		t.Fatalf("Publish: %v", err)

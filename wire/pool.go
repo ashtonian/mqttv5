@@ -4,40 +4,64 @@ package wire
 
 import "sync"
 
-// defaultBufferCap is the starting capacity of pooled []byte buffers.
-// Sized to comfortably hold a typical small PUBLISH (1-2 KiB) without
-// re-allocation. Larger packets grow on demand.
-const defaultBufferCap = 4096
+// bufClasses are the capacities of pooled frame buffers. A request is
+// served from the smallest class that fits, so a buffer never pins more
+// than 4x the bytes it holds (plus the 256 B floor). Requests above the
+// largest class are allocated exactly and left to the GC: pooling them
+// would let one large packet pin its size for the life of the pool.
+var bufClasses = [...]int{256, 1 << 10, 4 << 10, 16 << 10, 64 << 10}
 
-// bufPool stores reusable []byte buffers via *[]byte to avoid the
-// interface boxing alloc that sync.Pool of a slice value would incur.
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, defaultBufferCap)
-		return &b
-	},
+// bufPools holds one pool per class. Pools store *[]byte to avoid the
+// interface boxing allocation a slice value would incur.
+var bufPools [len(bufClasses)]sync.Pool
+
+func init() {
+	for i, size := range bufClasses {
+		bufPools[i].New = func() any {
+			b := make([]byte, 0, size)
+			return &b
+		}
+	}
 }
 
-// acquireBuf returns a pointer to a slice with length n. The underlying
-// array may have been used previously; the n bytes will be overwritten
-// by the caller before any read.
-//
-// If the pool's current buffer is smaller than n, a fresh slice is
-// allocated and replaces the pool's storage on Release.
-func acquireBuf(n int) *[]byte {
-	bp := bufPool.Get().(*[]byte)
-	if cap(*bp) < n {
-		*bp = make([]byte, n)
-	} else {
-		*bp = (*bp)[:n]
+// bufClass returns the index of the smallest class holding n bytes, or
+// -1 when n is larger than every class.
+func bufClass(n int) int {
+	for i, size := range bufClasses {
+		if n <= size {
+			return i
+		}
 	}
+	return -1
+}
+
+// acquireBuf returns a pointer to a slice of length n. The bytes may hold
+// data from an earlier use; the caller overwrites them before reading.
+func acquireBuf(n int) *[]byte {
+	i := bufClass(n)
+	if i < 0 {
+		b := make([]byte, n)
+		return &b
+	}
+	bp := bufPools[i].Get().(*[]byte)
+	*bp = (*bp)[:n]
 	return bp
 }
 
-// releaseBuf returns the buffer to the pool. The caller MUST NOT use
+// releaseBuf returns the buffer to its class pool. The caller MUST NOT use
 // the slice after this returns — that includes any sub-slice it handed
-// out to packet fields.
+// out to packet fields. Buffers whose capacity is not exactly a class
+// size (oversized allocations) are dropped.
 func releaseBuf(bp *[]byte) {
+	if !pooled(*bp) {
+		return
+	}
 	*bp = (*bp)[:0]
-	bufPool.Put(bp)
+	bufPools[bufClass(cap(*bp))].Put(bp)
+}
+
+// pooled reports whether releaseBuf recycles b.
+func pooled(b []byte) bool {
+	i := bufClass(cap(b))
+	return i >= 0 && bufClasses[i] == cap(b)
 }

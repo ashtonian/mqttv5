@@ -11,14 +11,13 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/wire"
 )
 
 // ---------------- RetainAsPublished (§3.8.3.1) ----------------
 
-// TestSubscribe_RetainAsPublished pins the discriminating behavior of
-// the RetainAsPublished subscription option, which only manifests on a
-// LIVE forward of a PUBLISH whose own RETAIN bit is set:
+// Retain As Published decides whether a live forward keeps the
+// publisher's RETAIN flag. The option only shows on a live forward of a
+// PUBLISH whose own RETAIN bit is set:
 //
 //   - RetainAsPublished=true: the broker forwards the publisher's RETAIN
 //     flag verbatim. A live publish with RETAIN=1 is delivered RETAIN=1.
@@ -56,13 +55,13 @@ func TestSubscribe_RetainAsPublished(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	want := []byte("rap-live-true")
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: trueTopic, Payload: want, QoS: 1, Retain: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = pub.Publish(context.Background(), wire.PublishOpts{
+		_ = pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: trueTopic, QoS: 1, Retain: true, Payload: nil,
 		})
 	})
@@ -88,13 +87,13 @@ func TestSubscribe_RetainAsPublished(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	live := []byte("rap-live-false")
-	if err := pub.Publish(context.Background(), wire.PublishOpts{
+	if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 		Topic: falseTopic, Payload: live, QoS: 1, Retain: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = pub.Publish(context.Background(), wire.PublishOpts{
+		_ = pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: falseTopic, QoS: 1, Retain: true, Payload: nil,
 		})
 	})
@@ -111,9 +110,8 @@ func TestSubscribe_RetainAsPublished(t *testing.T) {
 
 // ---------------- RetainHandling (§3.8.3.1) ----------------
 
-// TestSubscribe_RetainHandling pins the send-retained-on-subscribe
-// semantics of the RetainHandling option against a stored retained
-// message:
+// Retain Handling decides whether a new subscription receives the
+// stored retained message. Against a stored retained message:
 //
 //   - mode 0 (send retained at subscribe time): a brand-new subscription
 //     receives the retained message immediately. Asserted on RETAIN=1
@@ -122,7 +120,7 @@ func TestSubscribe_RetainAsPublished(t *testing.T) {
 //     replay at all. Asserted via expectNoMessage.
 //
 // mode 1 (send retained only if the subscription did not already exist)
-// is established-state dependent — see broker_caveats; it is exercised
+// depends on whether the subscription already existed; it is exercised
 // here only as the "new subscription -> retained delivered" case, which
 // for a fresh distinct filter behaves like mode 0.
 //
@@ -141,13 +139,13 @@ func TestSubscribe_RetainHandling(t *testing.T) {
 	storeRetained := func(t *testing.T) string {
 		t.Helper()
 		topic := "conformance/rh/" + randSuffix()
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: topic, Payload: want, QoS: 1, Retain: true,
 		}); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() {
-			_ = pub.Publish(context.Background(), wire.PublishOpts{
+			_ = pub.Publish(context.Background(), mqttv5.PublishOptions{
 				Topic: topic, QoS: 1, Retain: true, Payload: nil,
 			})
 		})
@@ -215,7 +213,7 @@ func TestSubscribe_RetainHandling(t *testing.T) {
 		// the subscribe silently failed rather than suppressing the
 		// retained replay.
 		live := []byte("rh-live-after-mode2")
-		if err := pub.Publish(context.Background(), wire.PublishOpts{
+		if err := pub.Publish(context.Background(), mqttv5.PublishOptions{
 			Topic: topic, Payload: live, QoS: 1, Retain: false,
 		}); err != nil {
 			t.Fatal(err)

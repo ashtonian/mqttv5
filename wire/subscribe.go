@@ -68,6 +68,9 @@ var ErrEmptyFilterList = fmt.Errorf("mqttv5: subscribe/unsubscribe requires at l
 
 // WriteSubscribe emits a SUBSCRIBE packet (flags = 0x02).
 func WriteSubscribe(w io.Writer, opts SubscribeOpts) (int64, error) {
+	if err := validateSubscribeOpts(&opts); err != nil {
+		return 0, err
+	}
 	if len(opts.Filters) == 0 {
 		return 0, ErrEmptyFilterList
 	}

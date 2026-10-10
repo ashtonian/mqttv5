@@ -1,0 +1,16 @@
+# Broker for the end-to-end benchmarks (`-tags e2e`). Pinned so results
+# from different days compare like for like; the version is recorded in
+# every raw result file by scripts/run.sh.
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.1.2-alpine
+    container_name: mqttv5-bench-mosquitto
+    ports:
+      - "127.0.0.1:1893:1883"
+    volumes:
+      - ./broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
