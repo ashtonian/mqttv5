@@ -431,7 +431,7 @@ the caller may reuse its buffers.
 
 Use `mqttv5.NewMemoryPublisherQueue()` for in-process buffering without
 crash safety. A custom `PublisherQueue` can be checked against the
-contract with `github.com/ashtonian/mqttv5/queuetest`.
+contract with `github.com/ashtonian/mqttv5/queue/queuetest`.
 
 ---
 
@@ -1505,20 +1505,24 @@ control queue that survives reconnects.
 
 | Path | What |
 |---|---|
-| `client.go`, `lifecycle.go`, `conn.go`, `events.go` | `Client`, `Connect`/`Disconnect`, the supervisor, per-connection state, the lifecycle callback queue |
-| `extensions.go`, `auth.go` | `Authenticator` and backoff policies; AUTH handling and `Reauthenticate` |
-| `reader.go`, `writer.go`, `keepalive.go` | read loop and dispatch, writer goroutine, keep-alive |
-| `publish.go`, `pool.go` | `Publish`, broker-limit checks, publisher pool |
-| `subscribe.go`, `subscription.go`, `message.go`, `queue.go` | subscribe API, subscription registry and control queue, message ownership, `Queue[T]` |
-| `publish_queue.go`, `publisher_queue.go` | `QueuePublisher` and the `PublisherQueue` interface with its in-memory implementation |
-| `client_group.go`, `typed.go` | `ClientGroup`, `Typed[T]` |
-| `options.go`, `types.go`, `errors.go`, `connack.go`, `redirect.go`, `stats.go`, `doc.go` | configuration, public value types, errors, CONNACK info, redirects, counters, package docs |
+| `client.go` | `Client`, `New`, `ServerInfo` (what CONNACK granted), `Stats` counters |
+| `options.go` | `Config`, every `With…` option, backoff policies |
+| `lifecycle.go` | `Connect`/`Disconnect`, the supervisor, lifecycle callbacks and their queue, server redirects |
+| `conn.go`, `conn_unix.go`, `conn_other.go` | per-connection state: read loop and dispatch, writer goroutine, direct writes, keep-alive; the non-blocking socket write on unix |
+| `auth.go` | `Authenticator` interfaces, AUTH handling, `Reauthenticate` |
+| `publish.go` | `Publish`, broker-limit checks, publisher pool |
+| `subscribe.go`, `subscription.go` | subscribe API with its results and tokens, `Message` and its delivery, `Queue[T]`; the subscription registry and control queue |
+| `queue_publisher.go` | `QueuePublisher`, the `PublisherQueue` interface and its in-memory implementation |
+| `client_group.go` | `ClientGroup` |
+| `types.go` | public value types, errors, `Codec[T]` and `Typed[T]` |
+| `doc.go` | package documentation |
+| `*_test.go` | a test file per source file, plus `helpers_test.go`, `session_test.go` (sessions and stores across connections), `bench_test.go`, `example_test.go` and `readme_test.go` |
 | `internal/inflight` | session engine: packet identifiers, QoS 1/2 state, quota, replay, store writes |
 | `internal/trie` | topic trie |
-| `internal/clock`, `internal/testbroker` | injectable clock; scripted broker for tests |
+| `internal/clock`, `internal/testbroker` | injectable clock; scripted and raw brokers for tests |
 | `internal/filedb` | bbolt wrapper with group commit, shared by `store/file` and `queue/file` |
 | `session`, `session/storetest` | `Store` interface, memory store, conformance tests for stores |
-| `queuetest` | conformance tests for `PublisherQueue` implementations |
+| `queue/queuetest` | conformance tests for `PublisherQueue` implementations |
 | `wire` | MQTT v5 codec (unstable API) |
 | `transport`, `transport/ws` | TCP/TLS dialing; WebSocket |
 | `store/file`, `queue/file` | durable session store and publish queue |

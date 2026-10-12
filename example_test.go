@@ -7,9 +7,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"testing"
 	"time"
 
 	"github.com/ashtonian/mqttv5"
+	"github.com/ashtonian/mqttv5/queue/queuetest"
 )
 
 // Example shows the minimal connect → subscribe → publish loop. The
@@ -227,6 +229,7 @@ type reading struct {
 }
 
 func (readingCodec) Encode(v reading) ([]byte, error) { return json.Marshal(v) }
+
 func (readingCodec) Decode(b []byte) (reading, error) {
 	var v reading
 	err := json.Unmarshal(b, &v)
@@ -345,4 +348,10 @@ func ExampleNewQueue() {
 	// Output:
 	// one
 	// two
+}
+
+func TestMemoryPublisherQueueConformance(t *testing.T) {
+	queuetest.Run(t, queuetest.Factory{
+		Open: func(*testing.T) mqttv5.PublisherQueue { return mqttv5.NewMemoryPublisherQueue() },
+	})
 }

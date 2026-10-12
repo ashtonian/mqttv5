@@ -14,7 +14,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/ashtonian/mqttv5"
-	"github.com/ashtonian/mqttv5/queuetest"
+	"github.com/ashtonian/mqttv5/queue/queuetest"
 )
 
 func factory(opts ...Option) queuetest.Factory {

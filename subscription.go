@@ -10,112 +10,12 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"strings"
 	"sync/atomic"
 
 	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/internal/trie"
 	"github.com/ashtonian/mqttv5/wire"
 )
-
-// SubscribeResult is the broker's answer for one filter of a SUBSCRIBE.
-type SubscribeResult struct {
-	Filter TopicFilter
-	// Reason is the SUBACK reason code: 0x00–0x02 grant that QoS,
-	// 0x80 and above refuse the filter.
-	Reason wire.ReasonCode
-}
-
-// Granted reports whether the broker accepted the filter.
-func (r SubscribeResult) Granted() bool { return !r.Reason.IsError() }
-
-// QoS is the maximum QoS the broker granted; meaningful when Granted.
-func (r SubscribeResult) QoS() byte { return byte(r.Reason) }
-
-// SubscribeError reports filters the broker refused. Results holds the
-// outcome of every filter of the SUBSCRIBE. When some filters were
-// granted the subscription is active for those; when none were, its
-// channel or queue is closed.
-type SubscribeError struct {
-	Results []SubscribeResult
-}
-
-func (e *SubscribeError) Error() string {
-	var refused []string
-	for _, r := range e.Results {
-		if !r.Granted() {
-			refused = append(refused, fmt.Sprintf("%q (0x%02X %s)", r.Filter.Topic, byte(r.Reason), reasonName(r.Reason)))
-		}
-	}
-	return fmt.Sprintf("mqttv5: broker refused %d of %d filters: %s", len(refused), len(e.Results), strings.Join(refused, ", "))
-}
-
-// Is matches the sentinel of any refusal's reason code (see
-// [ReasonCodeError]).
-func (e *SubscribeError) Is(target error) bool {
-	for _, r := range e.Results {
-		if !r.Granted() && (&ReasonCodeError{Packet: wire.SUBACK, Code: r.Reason}).Is(target) {
-			return true
-		}
-	}
-	return false
-}
-
-// UnsubscribeResult is the broker's answer for one topic filter of an
-// UNSUBSCRIBE.
-type UnsubscribeResult struct {
-	Topic string
-	// Reason is the UNSUBACK reason code: 0x00 success, 0x11 there was no
-	// such subscription (not an error), 0x80 and above refused.
-	Reason wire.ReasonCode
-}
-
-// UnsubscribeError reports topic filters the broker refused to
-// unsubscribe. The local subscription is closed regardless; the broker
-// may keep delivering messages for them, which the client then drops.
-type UnsubscribeError struct {
-	Results []UnsubscribeResult
-}
-
-func (e *UnsubscribeError) Error() string {
-	var refused []string
-	for _, r := range e.Results {
-		if r.Reason.IsError() {
-			refused = append(refused, fmt.Sprintf("%q (0x%02X %s)", r.Topic, byte(r.Reason), reasonName(r.Reason)))
-		}
-	}
-	return "mqttv5: broker refused to unsubscribe " + strings.Join(refused, ", ")
-}
-
-// SubscriptionToken identifies a subscription for [Client.Unsubscribe]
-// and reports what the broker decided.
-type SubscriptionToken struct {
-	client *Client
-	sub    *activeSub
-}
-
-// Results returns the broker's answer per filter from the subscription's
-// SUBACK, or nil before it arrived.
-func (t SubscriptionToken) Results() []SubscribeResult {
-	if t.sub == nil {
-		return nil
-	}
-	t.client.subsMu.Lock()
-	defer t.client.subsMu.Unlock()
-	return slices.Clone(t.sub.results)
-}
-
-// Err reports why the subscription ended other than by Unsubscribe or
-// Disconnect: the broker refused every filter, initially or when the
-// client re-subscribed after a session loss. Nil while it is active.
-func (t SubscriptionToken) Err() error {
-	if t.sub == nil {
-		return nil
-	}
-	t.client.subsMu.Lock()
-	defer t.client.subsMu.Unlock()
-	return t.sub.err
-}
 
 type subState uint8
 

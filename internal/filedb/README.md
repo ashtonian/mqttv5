@@ -72,7 +72,7 @@ go -C internal/filedb test -race ./...
 The tests cover the lock, concurrent writes persisting across a reopen
 under every sync policy, the group-commit fallback when one write fails
 a batch, the directories `Open` syncs, closed handles, and checksums.
-The stores' own suites (`session/storetest`, `queuetest`, crash tests)
+The stores' own suites (`session/storetest`, `queue/queuetest`, crash tests)
 exercise it end to end.
 
 ## Operations

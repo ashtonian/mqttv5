@@ -4,7 +4,9 @@
 
 package mqttv5
 
-import "github.com/ashtonian/mqttv5/transport"
+import (
+	"github.com/ashtonian/mqttv5/transport"
+)
 
 // rawWriter writes to a socket without waiting for room on unix only;
 // elsewhere newRawWriter gives none and the writer goroutine sends
