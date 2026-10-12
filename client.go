@@ -312,6 +312,10 @@ func (c *Client) ClientID() string {
 // enforces these limits on everything it sends: a publish that exceeds
 // them fails before it reaches the wire.
 type ConnackInfo struct {
+	// Broker is the URL of the broker the connection reached: with
+	// [WithBrokers], the one the client failed over to.
+	Broker string
+
 	// SessionPresent reports whether the broker resumed an existing
 	// session.
 	SessionPresent bool

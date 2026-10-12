@@ -449,6 +449,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				}
 			}
 			info := parseConnack(p, sent)
+			info.Broker = brokerURL
 			p.Release()
 			if !interrupt() {
 				// ctx ended as the CONNACK arrived.

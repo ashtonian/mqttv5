@@ -839,7 +839,7 @@ after five seconds.
 
 | Option | Signature / when | Effect |
 |---|---|---|
-| `WithOnConnectionUp(fn)` | `func(ConnackInfo)` — after every successful CONNACK | What the broker granted: session present, limits, assigned ClientID, effective keep-alive, server reference, ... |
+| `WithOnConnectionUp(fn)` | `func(ConnackInfo)` — after every successful CONNACK | The broker reached (`Broker`, with `WithBrokers` the one failed over to) and what it granted: session present, limits, assigned ClientID, effective keep-alive, server reference, ... |
 | `WithOnConnectionDown(fn)` | `func() bool` — on unexpected disconnect (not user Disconnect) | Return false to terminate the supervisor. |
 | `WithOnConnectError(fn)` | per failed CONNECT attempt (dial err, CONNACK refusal, AUTH-loop err) | Observability only. |
 | `WithOnReconnectAttempt(fn)` | immediately before each reconnect dial | Receives `(attempt, brokerURL)`. |
@@ -1336,7 +1336,8 @@ nil check.
 ### Health and metrics
 
 `Client.Connected()` reports a live connection, and
-`Client.ServerInfo()` what the broker granted. The
+`Client.ServerInfo()` which broker it reached (`Broker`) and what that
+broker granted. The
 [lifecycle callbacks](#lifecycle-callbacks) report connection events as
 they happen.
 

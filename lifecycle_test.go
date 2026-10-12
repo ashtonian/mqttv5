@@ -1630,6 +1630,18 @@ func TestMultiBrokerFailover(t *testing.T) {
 		t.Fatalf("did not failover to broker B within 2s (connsA=%d connsB=%d)",
 			connsA.Load(), connsB.Load())
 	}
+	// ServerInfo names the broker the client failed over to.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if info, ok := cli.ServerInfo(); ok && info.Broker == fbB.URL() {
+			break
+		}
+		if time.Now().After(deadline) {
+			info, _ := cli.ServerInfo()
+			t.Fatalf("ServerInfo().Broker = %q, want %q", info.Broker, fbB.URL())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	if cli.currentBrokerURL() != fbB.URL() {
 		t.Fatalf("after failover, currentBrokerURL = %q, want %q",
