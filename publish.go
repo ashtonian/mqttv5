@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -353,7 +354,7 @@ func notSent(err error) bool {
 //   - Timing & sizing: KeepAlive (or WithoutKeepAlive),
 //     ConnectTimeout, PingTimeout, DisconnectFlushTimeout,
 //     ReadBufferSize, WriteQueueSize, WriteBatch, WriteOverflowPolicy,
-//     ReconnectBackoff, PublishMode, RetryInitialConnect.
+//     ReconnectBackoff, PublishMode.
 //   - Publish behaviour: QoSDowngrade, SessionLossPolicy,
 //     OutboundTopicAliases, LenientDecoding, FollowServerRedirects
 //     (each member follows a redirect on its own connection).
@@ -372,6 +373,11 @@ func notSent(err error) bool {
 //     parent for application-visible lifecycle events.
 //   - CleanStartOnReconnect — pool members force CleanStart=true on
 //     every CONNECT.
+//   - RetryInitialConnect — pool members always retry a failed first
+//     CONNECT in the background, as after a lost connection: the
+//     parent is connected, so a member's refusal is taken as passing
+//     (a connection-rate limit, a busy broker), and publishes fall
+//     back to the other members and the parent meanwhile.
 //   - Store. Each pool member uses an in-memory session by default;
 //     CleanStart=true makes durable session storage moot.
 type publisherPool struct {
@@ -400,6 +406,7 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 			// not propagated for the same reason.
 			WithCleanStart(true),
 			WithSessionExpiry(0),
+			WithRetryInitialConnect(),
 			WithConnectTimeout(parent.ConnectTimeout),
 			WithPingTimeout(parent.PingTimeout),
 			WithDisconnectFlushTimeout(parent.DisconnectFlushTimeout),
@@ -451,9 +458,6 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 		if parent.StatsEnabled {
 			opts = append(opts, WithStats())
 		}
-		if parent.RetryInitialConnect {
-			opts = append(opts, WithRetryInitialConnect())
-		}
 		if parent.QoSDowngrade {
 			opts = append(opts, WithQoSDowngrade())
 		}
@@ -483,17 +487,12 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 	}, nil
 }
 
-// connect dials every pool member. Failed members retry on their own
-// supervisor; the joined error is diagnostic only — the pool is still
-// usable.
+// connect dials every pool member at once and waits for each one's
+// first attempt. A member that fails keeps retrying on its own
+// supervisor, so an error means ctx ended or the client stopped first;
+// the pool stays usable either way.
 func (p *publisherPool) connect(ctx context.Context) error {
-	var errs []error
-	for i, m := range p.members {
-		if err := m.Connect(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("pool member %d: %w", i+1, err))
-		}
-	}
-	return errors.Join(errs...)
+	return p.each(func(m *Client) error { return m.Connect(ctx) })
 }
 
 // publish picks a starting member per the routing policy and tries
@@ -532,13 +531,22 @@ func (p *publisherPool) startIndex(opts PublishOptions) uint64 {
 	}
 }
 
-// disconnect tears down every pool member, joining any errors.
+// disconnect tears down every pool member at once, joining any errors.
 func (p *publisherPool) disconnect(ctx context.Context) error {
-	var errs []error
+	return p.each(func(m *Client) error { return m.Disconnect(ctx) })
+}
+
+// each runs op on every member concurrently and joins the errors.
+func (p *publisherPool) each(op func(*Client) error) error {
+	errs := make([]error, len(p.members))
+	var wg sync.WaitGroup
 	for i, m := range p.members {
-		if err := m.Disconnect(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("pool member %d: %w", i+1, err))
-		}
+		wg.Go(func() {
+			if err := op(m); err != nil {
+				errs[i] = fmt.Errorf("pool member %d: %w", i+1, err)
+			}
+		})
 	}
+	wg.Wait()
 	return errors.Join(errs...)
 }

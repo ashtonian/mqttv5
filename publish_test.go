@@ -833,9 +833,8 @@ func TestPoolFallbackIncrementsStats(t *testing.T) {
 		isPool := strings.Contains(conn.ClientID, "-pub-")
 		conn.Release()
 		if isPool {
-			// Refuse the pool member with NotAuthorized — the client
-			// reports ErrConnectRefused, m.started stays false, the
-			// member never enters the supervisor.
+			// Refuse the pool member: it retries in the background
+			// and stays unconnected.
 			_, _ = wire.WriteConnack(c, wire.ConnackOpts{ReasonCode: wire.ReasonNotAuthorized})
 			return
 		}
@@ -1018,6 +1017,19 @@ func TestPoolFailsOverWhenAMemberIsDown(t *testing.T) {
 	}
 	if got := publishes.Load(); got != n {
 		t.Fatalf("%d publishes put %d PUBLISHes on the wire", n, got)
+	}
+}
+
+// A pool member refused at first keeps trying and joins the pool.
+func TestPoolMemberRetriesFirstConnect(t *testing.T) {
+	var refused atomic.Bool
+	b, _ := countingBroker(t, wire.ReasonSuccess, func(id string) bool {
+		return strings.HasSuffix(id, "-pub-1") && refused.CompareAndSwap(false, true)
+	})
+	cli := tbClient(t, b, WithPublisherPool(2))
+	waitForPoolReady(t, cli, 2, 3*time.Second)
+	if !refused.Load() {
+		t.Fatal("the broker never refused the pool member")
 	}
 }
 
