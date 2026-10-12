@@ -94,7 +94,11 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 	}
 	var sentMu sync.Mutex
 	var published []sent
-	var failures []error
+	type failure struct {
+		id  string
+		err error
+	}
+	var failures []failure
 	var wg sync.WaitGroup
 	deadline := time.Now().Add(duration)
 	for w := range workers {
@@ -115,7 +119,7 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 				cancel()
 				sentMu.Lock()
 				if err != nil {
-					failures = append(failures, fmt.Errorf("%s (QoS %d): %w", id, qos, err))
+					failures = append(failures, failure{id, fmt.Errorf("%s (QoS %d): %w", id, qos, err)})
 				} else {
 					published = append(published, sent{id, qos})
 				}
@@ -128,8 +132,11 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 	}
 	wg.Wait()
 	close(stop)
-	for _, err := range failures {
-		t.Error(err)
+	for _, f := range failures {
+		t.Error(f.err)
+		if px.trace != nil {
+			t.Logf("%s: publisher %s; subscriber %s", f.id, px.trace.history(f.id), subTrace.history(f.id))
+		}
 	}
 
 	missing := func() []string {
@@ -165,6 +172,9 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 	for _, p := range published {
 		if p.qos == 2 && arrived[p.id] > 1 {
 			t.Errorf("QoS 2 message %s arrived %d times", p.id, arrived[p.id])
+			if px.trace != nil {
+				t.Logf("%s: publisher %s; subscriber %s", p.id, px.trace.history(p.id), subTrace.history(p.id))
+			}
 		}
 		if arrived[p.id] > 1 {
 			duplicates++
