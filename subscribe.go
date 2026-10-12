@@ -563,6 +563,36 @@ func (m *Message) CloneTopic() string { return strings.Clone(m.Topic) }
 // subscriptions; owned messages may simply keep m.Payload.
 func (m *Message) ClonePayload() []byte { return bytes.Clone(m.Payload) }
 
+// PublishOptions returns options that publish m again as it arrived:
+// topic, payload, QoS, Retain, and the properties a client may send —
+// Payload Format Indicator, the Message Expiry Interval the broker left
+// it, Content Type, Response Topic, Correlation Data and User
+// Properties. A bridge changes the Topic or QoS and publishes it on
+// another connection. Retain is the flag as delivered: the publisher's
+// only on a subscription with RetainAsPublished. The options share m's
+// memory, so on a zero-copy subscription publish them before acking m.
+func (m *Message) PublishOptions() PublishOptions {
+	o := PublishOptions{
+		Topic:           m.Topic,
+		Payload:         m.Payload,
+		QoS:             m.QoS,
+		Retain:          m.Retain,
+		ContentType:     m.Properties.ContentType(),
+		ResponseTopic:   m.Properties.ResponseTopic(),
+		CorrelationData: m.Properties.CorrelationData(),
+	}
+	if v, ok := m.Properties.PayloadFormatIndicator(); ok {
+		o.PayloadFormatIndicator = &v
+	}
+	if v, ok := m.Properties.MessageExpiryInterval(); ok {
+		o.MessageExpiryInterval = &v
+	}
+	for k, v := range m.Properties.UserProperties() {
+		o.UserProperties = append(o.UserProperties, UserProperty{Key: k, Value: v})
+	}
+	return o
+}
+
 // delivery is one inbound PUBLISH shared by every handler it matched. The
 // broker acknowledgement is queued, and a zero-copy frame released, when
 // the last handler's Message is acked.

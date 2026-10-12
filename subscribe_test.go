@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -754,6 +755,41 @@ func TestSubscribe_SharedFilter_TrieMatchesUnderlying(t *testing.T) {
 		_ = m.Ack()
 	case <-time.After(2 * time.Second):
 		t.Fatal("shared subscription did not dispatch the inbound publish")
+	}
+}
+
+// A message's PublishOptions publish it again as it arrived.
+func TestMessagePublishOptions(t *testing.T) {
+	format, expiry := byte(1), uint32(90)
+	sent := wire.PublishOpts{
+		Topic: "plant/line-1", Payload: []byte(`{"rpm":1200}`), QoS: 1, PacketID: 1, Retain: true,
+		PayloadFormatIndicator: &format, MessageExpiryInterval: &expiry,
+		ContentType: "application/json", ResponseTopic: "plant/replies", CorrelationData: []byte{7},
+		UserProperties: []UserProperty{{Key: "site", Value: "3"}, {Key: "site", Value: "4"}},
+	}
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeSubscribe(-1)
+		c.Publish(sent)
+		c.Hold(0)
+	})
+	cli := tbClient(t, b)
+	msgs, _, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "plant/#", QoS: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := recvMsg(t, msgs, 2*time.Second)
+	defer m.Ack()
+
+	got := m.PublishOptions()
+	want := PublishOptions{
+		Topic: sent.Topic, Payload: sent.Payload, QoS: 1, Retain: true,
+		PayloadFormatIndicator: &format, MessageExpiryInterval: &expiry,
+		ContentType: sent.ContentType, ResponseTopic: sent.ResponseTopic, CorrelationData: sent.CorrelationData,
+		UserProperties: sent.UserProperties,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PublishOptions =\n%+v\nwant\n%+v", got, want)
 	}
 }
 
