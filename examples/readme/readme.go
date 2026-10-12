@@ -68,6 +68,56 @@ func subscribeQueue() {
 	}
 }
 
+func durableConsumer() {
+	cli, _ := mqttv5.New(
+		mqttv5.WithBroker(url),
+		mqttv5.WithClientID("billing-worker-1"),
+		mqttv5.WithCleanStart(false),       // resume the session after a restart
+		mqttv5.WithSessionExpiry(24*60*60), // the broker keeps it a day
+	)
+	msgs, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "invoices/#", QoS: 1}})
+	if err := cli.Connect(ctx); err != nil {
+		log.Fatal(err)
+	}
+	for m := range msgs { // first what arrived while the worker was down
+		handle(m)
+		_ = m.Ack()
+	}
+}
+
+func price([]byte) []byte { return nil }
+
+func responder() {
+	// Responder: reply on each request's Response Topic, with its
+	// Correlation Data. A shared subscription spreads requests over instances.
+	reqs, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "$share/pricing/requests/price", QoS: 1}})
+	for m := range reqs {
+		if rt := m.Properties.ResponseTopic(); rt != "" {
+			_ = cli.Publish(ctx, mqttv5.PublishOptions{
+				Topic:           rt,
+				CorrelationData: m.Properties.CorrelationData(),
+				QoS:             1,
+				Payload:         price(m.Payload),
+			})
+		}
+		_ = m.Ack()
+	}
+}
+
+func requester() {
+	// Requester: one reply subscription serves every request in flight.
+	replyTo := "replies/" + cli.ClientID()
+	replies, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: replyTo, QoS: 1}})
+	_ = cli.Publish(ctx, mqttv5.PublishOptions{
+		Topic:           "requests/price",
+		QoS:             1,
+		Payload:         []byte("A-100"),
+		ResponseTopic:   replyTo,
+		CorrelationData: []byte("req-1"), // matches the reply to this call
+	})
+	_ = replies
+}
+
 func subscribeCallback() {
 	cli.SubscribeCallback(ctx,
 		[]mqttv5.TopicFilter{{Topic: "ctrl/+", QoS: 0}},
@@ -77,57 +127,6 @@ func subscribeCallback() {
 			// Ack auto-fires after return.
 		},
 	)
-}
-
-func redirects() {
-	cli, _ := mqttv5.New(
-		mqttv5.WithBroker("mqtts://broker-a.example.com:8883"),
-		mqttv5.WithFollowServerRedirects(),
-		mqttv5.WithOnServerRedirect(func(r mqttv5.ServerRedirect) {
-			log.Printf("redirected to %s (permanent=%v)", r.Reference, r.Permanent())
-		}),
-	)
-	_ = cli
-}
-
-func group() {
-	g, _ := mqttv5.NewClientGroup(
-		[]mqttv5.GroupMember{
-			{
-				Brokers: []string{"mqtts://emea.example.com:8883"},
-				Name:    "emea",
-				Opts:    []mqttv5.Option{mqttv5.WithCredentials("emea-svc", []byte(token1))},
-			},
-			{
-				Brokers: []string{"mqtts://apac.example.com:8883"},
-				Name:    "apac",
-				Opts:    []mqttv5.Option{mqttv5.WithCredentials("apac-svc", []byte(token2))},
-			},
-		},
-		mqttv5.WithGroupSharedOpts(
-			mqttv5.WithClientID("fleet"),
-			mqttv5.WithKeepAlive(30),
-		),
-		mqttv5.WithGroupPublishPolicy(mqttv5.GroupPublishBroadcast),
-	)
-	_ = g
-}
-
-func groupPublish() {
-	results, err := g.Publish(ctx, mqttv5.PublishOptions{Topic: "events/x", QoS: 1, Payload: p})
-	for _, r := range results {
-		if r.Err != nil {
-			log.Printf("%s: %v", r.Member, r.Err) // errors.Is(err, mqttv5.ErrNotAuthorized) works on the GroupError too
-		}
-	}
-	_ = err
-}
-
-func groupSubscribe() {
-	ch, tokens, err := g.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}})
-	// tokens["emea"], tokens["apac"]
-	defer g.UnsubscribeAll(ctx, tokens)
-	_, _ = ch, err
 }
 
 func stats() {

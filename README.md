@@ -29,6 +29,7 @@ Requires Go 1.26 or later. Licensed under [Apache 2.0](LICENSE).
   [Examples](#examples) · [Modules](#modules)
 - **Guide:** [Publishing](#publishing) · [Subscribing](#subscribing) ·
   [Typed publish / subscribe](#typed-publish--subscribe) ·
+  [Request / response](#request--response) ·
   [Durable publishing](#durable-publishing-with-queuepublisher) ·
   [Authentication](#authentication) · [WebSocket](#websocket) ·
   [Multiple brokers](#multiple-brokers) · [Disconnecting](#disconnecting)
@@ -143,16 +144,24 @@ supervisor:
 
 ## Examples
 
-[`examples/`](examples/) is one module of runnable programs. Each but the
-quick start reads the broker from `MQTT_BROKER` (default
-`mqtt://127.0.0.1:1883`):
+[`examples/`](examples/) is one module of runnable programs. They read
+the broker from `MQTT_BROKER` (default `mqtt://127.0.0.1:1883`), the
+multi-broker ones from the variables in
+[`examples/README.md`](examples/README.md#configuration).
 
 | Path | Shows |
 |---|---|
 | [`examples/readme/quickstart`](examples/readme/quickstart) | The quick start above: connect, channel subscribe, publish |
+| [`examples/subscribe`](examples/subscribe) | Channel, queue and callback subscriptions, and what each does with a consumer that falls behind |
 | [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
+| [`examples/request`](examples/request) | MQTT 5 request/response: Response Topic, Correlation Data, a shared responder |
+| [`examples/durable`](examples/durable) | `QueuePublisher` on `queue/file` with `store/file`: publishing through outages and restarts |
 | [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
+| [`examples/failover`](examples/failover) | `WithBrokers` failover; `ConnackInfo.Broker` names the broker reached |
+| [`examples/pool`](examples/pool) | `WithPublisherPool`: QoS 1 throughput with and without a pool |
 | [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
+| [`examples/bridge`](examples/bridge) | At-least-once bridge between two brokers, surviving outages and restarts |
+| [`examples/shared`](examples/shared) | Workers sharing a subscription (`$share`) |
 | [`examples/ws`](examples/ws) | WebSocket transport — `WithDialFunc(ws.DialFunc(opts))` |
 | [`examples/stats`](examples/stats) | `Client.Stats()` snapshot — bridge into Prometheus / OTel / expvar |
 | [`examples/oauth`](examples/oauth) | `WithConnectPacketBuilder` rotating an OAuth bearer per CONNECT |
@@ -325,6 +334,32 @@ message's fields are then valid only until the callback returns. The
 handler must not call `Disconnect`, which waits for the read goroutine;
 start it on another goroutine.
 
+### Durable consumers
+
+A consumer with a session the broker keeps (a fixed ClientID,
+`WithCleanStart(false)`, and a `WithSessionExpiry` longer than its
+downtime) gets the messages that arrived while it was down. The broker
+sends them right after the CONNACK, so subscribe before `Connect`:
+`Subscribe` then returns at once and its SUBSCRIBE goes out first on
+the connection.
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBroker(url),
+    mqttv5.WithClientID("billing-worker-1"),
+    mqttv5.WithCleanStart(false),        // resume the session after a restart
+    mqttv5.WithSessionExpiry(24*60*60),  // the broker keeps it a day
+)
+msgs, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "invoices/#", QoS: 1}})
+if err := cli.Connect(ctx); err != nil {
+    log.Fatal(err)
+}
+for m := range msgs { // first what arrived while the worker was down
+    handle(m)
+    _ = m.Ack()
+}
+```
+
 ---
 
 ## Typed publish / subscribe
@@ -358,6 +393,49 @@ and delivered with the buffer, bound and drop policy of
 `Client.Subscribe` / `SubscribeQueue`; a payload the codec rejects is
 logged, acked and dropped. The channel or queue closes when the
 subscription ends, whether or not anyone is still reading it.
+
+---
+
+## Request / response
+
+MQTT 5 carries the reply address in the request: a Response Topic and
+Correlation Data, which the responder copies into its reply.
+
+```go
+// Responder: reply on each request's Response Topic, with its
+// Correlation Data. A shared subscription spreads requests over instances.
+reqs, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "$share/pricing/requests/price", QoS: 1}})
+for m := range reqs {
+    if rt := m.Properties.ResponseTopic(); rt != "" {
+        _ = cli.Publish(ctx, mqttv5.PublishOptions{
+            Topic:           rt,
+            CorrelationData: m.Properties.CorrelationData(),
+            QoS:             1,
+            Payload:         price(m.Payload),
+        })
+    }
+    _ = m.Ack()
+}
+```
+
+```go
+// Requester: one reply subscription serves every request in flight.
+replyTo := "replies/" + cli.ClientID()
+replies, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: replyTo, QoS: 1}})
+_ = cli.Publish(ctx, mqttv5.PublishOptions{
+    Topic:           "requests/price",
+    QoS:             1,
+    Payload:         []byte("A-100"),
+    ResponseTopic:   replyTo,
+    CorrelationData: []byte("req-1"), // matches the reply to this call
+})
+```
+
+A requester with several requests in flight matches each reply to its
+call by Correlation Data; [`examples/request`](examples/request) keeps
+the pending calls in a map, each with its own timeout. Brokers that
+assign reply topics announce a prefix in `ConnackInfo.ResponseInformation`
+when asked with `WithRequestResponseInformation(true)`.
 
 ---
 
@@ -534,32 +612,113 @@ them otherwise.
 
 ## Multiple brokers
 
-Three patterns, each its own API:
+There are three ways to use more than one broker. Which one fits
+depends on how the brokers relate to each other:
 
-| Goal | API | Connections |
-|---|---|---|
-| **Failover** — one logical client across interchangeable brokers (same data) | `WithBrokers(urls...)` | 1 at a time, supervisor rotates on drop |
-| **Parallel sessions to N independent brokers** | `NewClientGroup(members, opts...)` | N (one per broker), all live |
-| **Publish across connections** — more than one connection's writer | `WithPublisherPool(N)` | N publish-only to the *same* broker |
+| Pattern | API | Connections | The brokers |
+|---|---|---|---|
+| [Failover](#failover-withbrokers) | `WithBrokers(urls...)` | one at a time | are interchangeable: nodes of a cluster, or replicas |
+| [Parallel sessions](#parallel-sessions-clientgroup) | `NewClientGroup(members, opts...)` | one per member, all live | are independent: each holds its own data |
+| [Publish pool](#publish-pool-withpublisherpool) | `WithPublisherPool(n)` | n publish-only, beside the main one | are the client's own: the pool spreads its publishing |
 
-These compose:
+```mermaid
+flowchart TD
+    same{"Do the brokers hold<br/>the same data?"}
+    same -- "yes: a cluster or replicas" --> rate{"Does one connection<br/>limit publish throughput?"}
+    rate -- no --> failover["Failover<br/>WithBrokers"]
+    rate -- yes --> pooled["Failover + publish pool<br/>WithBrokers + WithPublisherPool"]
+    same -- "no: each is its own system" --> standby{"Does each one<br/>have a standby?"}
+    standby -- no --> group["Parallel sessions<br/>ClientGroup"]
+    standby -- yes --> regional["Regional HA<br/>ClientGroup, members with several Brokers"]
+```
 
-- `WithBrokers` inside a `GroupMember.Opts` gives HA-per-region fan-out.
-- `WithPublisherPool` alongside `WithBrokers` spreads publishing across connections to an HA pair.
+They compose: a `ClientGroup` member is a full `Client`, so it can fail
+over between brokers of its own and carry its own publish pool
+([What combines](#what-combines)). The [recipes](#recipes) build on
+them: a bridge that loses nothing, quorum writes, sharding with fan-in,
+a durable outbox, brokers from service discovery, and consumers scaled
+out with shared subscriptions.
 
-Publisher pool members are configured from the parent: brokers, dialing,
-TLS, credentials, authenticator, CONNECT properties, timeouts, buffer
-sizes, write path, backoff, `WithRetryInitialConnect`, and the publish
-behaviour (`WithQoSDowngrade`, `WithSessionLossPolicy`,
-`WithOutboundTopicAliases`, `WithLenientDecoding`,
-`WithFollowServerRedirects`). They do not take the Will, the `Store`,
-the lifecycle callbacks, or a session: every member connects with
-CleanStart=1 and Session Expiry 0, so a QoS 1/2 publish interrupted by
-a member's reconnect is handled by the session-loss policy (republished
-by default, possibly duplicated). Use the main connection for publishes
-that must be resumed exactly.
+### Failover: `WithBrokers`
 
-### Redirecting at runtime
+One client, one session identity, one connection at a time, moving
+between brokers that carry the same data.
+
+```mermaid
+flowchart LR
+    client["Client ingest-7"] == "connected" ==> b1[("mqtt-1")]
+    client -. "after a drop" .-> b2[("mqtt-2")]
+    client -. "then" .-> b3[("mqtt-3")]
+```
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBrokers(
+        "mqtts://mqtt-1.example.com:8883",
+        "mqtts://mqtt-2.example.com:8883",
+        "mqtts://mqtt-3.example.com:8883",
+    ),
+    mqttv5.WithClientID("ingest-7"),
+    mqttv5.WithOnConnectionUp(func(info mqttv5.ConnackInfo) {
+        log.Printf("connected to %s, session present: %v", info.Broker, info.SessionPresent)
+    }),
+    mqttv5.WithOnReconnectAttempt(func(attempt int, broker string) {
+        log.Printf("reconnect attempt %d: %s", attempt, broker)
+    }),
+)
+```
+
+- **Connect.** Each client starts at a random entry, so a fleet that
+  restarts together spreads over the list. `Connect` tries each broker
+  once and fails only when none accepts; its error joins every
+  broker's, each naming its URL, and `errors.Is` sees them all. With
+  `WithRetryInitialConnect` the client keeps trying in the background
+  instead.
+- **A drop.** After the reconnect backoff the supervisor dials the next
+  entry, so the first attempt leaves the broker that just failed, and
+  each further attempt moves on one. The client stays on whichever
+  broker accepts it; `ConnackInfo.Broker`, in `OnConnectionUp` and
+  `ServerInfo()`, names it.
+- **The session.** Nodes of a cluster share sessions: the next one
+  answers Session Present = 1, unacknowledged QoS 1/2 messages are
+  resent with DUP set (QoS 2 stays exactly-once), and subscriptions
+  stay in place. An independent broker has only the session it kept
+  itself for this ClientID: usually none (Session Present = 0), so every
+  subscription is subscribed again and unacknowledged publishes follow
+  `WithSessionLossPolicy` — sent again as new messages (the default; a
+  consumer may see a duplicate) or failed with `ErrSessionLost`. If it
+  kept an older one from an earlier connection, that one resumes,
+  messages it queued since included.
+- **Callers.** A `Publish` waiting for its acknowledgement keeps waiting
+  across the failover, bounded by its ctx. While no broker is
+  connected, `Publish` returns `ErrNotConnected`; a
+  [`QueuePublisher`](#durable-publishing-with-queuepublisher) queues.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as mqtt-1
+    participant B as mqtt-2
+    C->>A: CONNECT
+    A-->>C: CONNACK
+    C->>A: PUBLISH QoS 1, id 7
+    A--xC: connection lost before the PUBACK
+    Note over C: OnConnectionDown, backoff,<br/>OnReconnectAttempt(1, mqtt-2)
+    C->>B: CONNECT, Clean Start 0
+    alt mqtt-2 shares the session (cluster)
+        B-->>C: CONNACK, Session Present 1
+        C->>B: PUBLISH QoS 1, id 7, DUP
+        B-->>C: PUBACK 7
+    else mqtt-2 is independent
+        B-->>C: CONNACK, Session Present 0
+        C->>B: SUBSCRIBE, every subscription
+        C->>B: PUBLISH QoS 1, new id (SessionLossRepublish)
+        B-->>C: PUBACK
+    end
+    Note over C: Publish returns
+```
+
+#### Changing brokers at runtime
 
 A broker can send the client elsewhere ([§4.11]): a CONNACK or DISCONNECT
 with reason `0x9D` Server moved or `0x9C` Use another server and a
@@ -579,20 +738,29 @@ cli, _ := mqttv5.New(
 )
 ```
 
-`Client.SetBrokers(urls...)` swaps the failover list at runtime by hand.
+`Client.SetBrokers(urls...)` replaces the list from your side, from
+service discovery for example ([recipe](#brokers-from-service-discovery)).
+The live connection stays where it is; the next connection attempt uses
+the new list.
 
-### `ClientGroup` policies
+### Parallel sessions: `ClientGroup`
 
-`ClientGroup` is for **N parallel sessions to N brokers**, each treated
-as itself:
+N sessions to N brokers, each member treated as itself:
 
 - bridges between independent brokers,
 - multi-tenant SaaS with per-broker credentials,
 - a clustered broker fleet you want N parallel sessions into.
 
-If your brokers are interchangeable for the same data, use
-`WithBrokers` on a single Client — `ClientGroup` does not failover
-between members.
+```mermaid
+flowchart LR
+    group["ClientGroup"] --> emea["member emea<br/>Client, own session"] --> b1[("emea broker")]
+    group --> apac["member apac<br/>Client, own session"] --> b2[("apac broker")]
+```
+
+Members never stand in for each other: if your brokers are
+interchangeable for the same data, use `WithBrokers` on a single
+`Client`. A member can have several `Brokers` of its own to fail over
+between ([regional HA](#regional-ha)).
 
 Construction takes a `GroupMember` list plus group-level options:
 
@@ -619,17 +787,20 @@ g, _ := mqttv5.NewClientGroup(
 ```
 
 `GroupMember.Opts` applies **after** `WithGroupSharedOpts`, so
-per-member auth / TLS / ClientID / callbacks win. Member names default
-to `member-N` (1-based) when unset.
+per-member auth / TLS / ClientID / callbacks win; brokers come only
+from `GroupMember.Brokers`, and `NewClientGroup` rejects `WithBroker` or
+`WithBrokers` in either. Member names default to `member-N` (1-based)
+when unset. Two members with the same ClientID get a `-N` suffix on the
+second; members without one have it assigned by their broker.
 
 `Publish` returns every member's outcome (`[]GroupResult`) and an
 error decided by the policy below:
 
 | Publish policy | Behaviour | Use case |
 |---|---|---|
-| `GroupPublishBroadcast` (default) | Publishes to every member at once. Fails with a `*GroupError` when fewer than `WithGroupSuccess` members succeed. | Bridge / mirror — members carry different data |
+| `GroupPublishBroadcast` (default) | Publishes to every member at once and returns when each has answered or ctx ends. Fails with a `*GroupError` when fewer than `WithGroupSuccess` members succeed. | Bridge / mirror / quorum — members carry different data |
 | `GroupPublishRoundRobin` | One member per call, the next each time. | Distribute publishes across a clustered broker fleet |
-| `GroupPublishHashByTopic` | FNV-1a(topic) → member. Per-topic ordering. | Fleet throughput with per-topic affinity |
+| `GroupPublishHashByTopic` | FNV-1a(topic) → member. Per-topic ordering. | Shard topics across brokers; fleet throughput with per-topic affinity |
 
 RoundRobin and HashByTopic send each message once. They move to the
 next member only when the chosen one could not send it at all (not
@@ -669,13 +840,327 @@ ch, tokens, err := g.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "events/#", QoS
 defer g.UnsubscribeAll(ctx, tokens)
 ```
 
+A member whose connection drops reconnects on its own, to its own
+brokers, while the others carry on; each member's subscriptions come
+back with it.
+
 Connect / Disconnect / Subscribe run in parallel across members by
 default. Pass `WithGroupSequentialLifecycle` if you need deterministic
 ordering. A group is used once: after `Disconnect` its methods return
 `ErrClosed`.
 
 Use `g.Members()` or `g.Member(name)` for direct per-member access
-(per-member `Stats()`, etc.).
+(per-member `Stats()`, a `QueuePublisher` per member, etc.).
+
+### Publish pool: `WithPublisherPool`
+
+A broker lets each connection have at most its Receive Maximum QoS 1/2
+publishes unacknowledged (by default 20 for mosquitto, 32 for EMQX, 10
+for HiveMQ CE) and handles each connection's packets in order, so
+concurrent publishers on one connection wait on its round trips. The
+pool adds n publish-only connections to the client's brokers, each with
+a window of its own, and spreads `Publish` calls over them.
+[`examples/pool`](examples/pool) measures the difference against your
+broker.
+
+```mermaid
+flowchart LR
+    pub["Publish"] --> route{"routing:<br/>round robin, or<br/>hash of the topic"}
+    route --> m1["pool member 1"]
+    route --> m2["pool member 2"]
+    route --> m3["pool member n"]
+    route -. "no member can send" .-> main["main connection"]
+    m1 & m2 & m3 & main --> broker[("broker")]
+```
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBrokers("mqtts://mqtt-1.example.com:8883", "mqtts://mqtt-2.example.com:8883"),
+    mqttv5.WithClientID("telemetry-gw"),
+    mqttv5.WithPublisherPool(4), // members telemetry-gw-pub-1 … -4
+    mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
+)
+```
+
+- **Routing.** Each `Publish` goes out on one connection. Round robin
+  (the default) takes the next member each call and may reorder a
+  topic; `PoolRoutingHashByTopic` keeps each topic on one member, and so
+  in order while that member stays connected.
+- **Failure.** A member that cannot send (not connected, or its write
+  queue full under `WriteDropNewest`) passes the message to the next;
+  when none can, the main connection sends it, counted in
+  `Stats().PoolFallbacks`. A broker refusal or ctx ending is returned as
+  is, so a message never goes out twice. A member whose first CONNECT
+  fails keeps retrying in the background.
+- **Guarantees.** Members have no session: each connects with Clean
+  Start = 1 and Session Expiry 0. A QoS 1/2 publish interrupted by a
+  member's reconnect follows the session-loss policy — sent again,
+  possibly duplicated, so QoS 2 is not exactly-once across it. Publish
+  what must resume exactly on a connection with a session: a
+  `QueuePublisher` always uses the main connection.
+- **Brokers.** Members take the client's broker list and each starts at
+  a random entry, so over a cluster the pool spreads across its nodes.
+- **Everything else** — subscriptions, the Will, the session store,
+  the lifecycle callbacks — stays on the main connection.
+
+Members are configured from the parent: brokers, dialing, TLS,
+credentials, authenticator, CONNECT properties, timeouts, buffer sizes,
+write path, backoff, and the publish behaviour (`WithQoSDowngrade`,
+`WithSessionLossPolicy`, `WithOutboundTopicAliases`,
+`WithLenientDecoding`, `WithFollowServerRedirects`). Their ClientIDs
+come from `WithPublisherPoolClientIDFn` (default `<ClientID>-pub-<n>`).
+
+### Recipes
+
+#### At-least-once bridge
+
+Copy messages from one broker to another without losing any, even when
+the bridge crashes: subscribe on the source with a channel, and ack each
+message only once the destination has acknowledged its copy.
+
+```mermaid
+sequenceDiagram
+    participant A as source
+    participant Br as bridge
+    participant B as destination
+    A->>Br: PUBLISH QoS 1, id 41
+    Br->>B: PUBLISH QoS 1, id 9 (m.PublishOptions)
+    B-->>Br: PUBACK 9
+    Br->>A: PUBACK 41 (m.Ack)
+    Note over A,Br: a bridge that dies before PUBACK 41<br/>gets message 41 again
+```
+
+```go
+src, _ := mqttv5.New(
+    mqttv5.WithBroker("mqtts://plant.example.com:8883"),
+    mqttv5.WithClientID("bridge-plant-3"),
+    mqttv5.WithCleanStart(false),       // resume the source's session after a restart
+    mqttv5.WithSessionExpiry(24*60*60), // the source holds messages while the bridge is down
+)
+dst, _ := mqttv5.New(
+    mqttv5.WithBroker("mqtts://cloud.example.com:8883"),
+    mqttv5.WithClientID("bridge-plant-3"),
+)
+// Subscribe before Connect, so the messages held for the bridge reach it.
+msgs, _, _ := src.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "plant/#", QoS: 1}})
+// Connect dst, then src, then:
+for m := range msgs {
+    if err := forward(ctx, dst, m); err != nil {
+        return err // m stays unacked: the source delivers it again
+    }
+    _ = m.Ack()
+}
+```
+
+```go
+// forward publishes m on dst under "site-3/", waiting out dst's
+// outages. It returns nil once dst has the message or refused it for
+// good, and an error when ctx ends or dst is closed.
+func forward(ctx context.Context, dst *mqttv5.Client, m *mqttv5.Message) error {
+    opts := m.PublishOptions() // payload and properties as they arrived
+    opts.Topic = "site-3/" + m.Topic
+    for {
+        err := dst.Publish(ctx, opts)
+        switch {
+        case err == nil:
+            return nil
+        case errors.Is(err, mqttv5.ErrNotConnected):
+            if err = dst.AwaitConnection(ctx); err != nil {
+                return err
+            }
+        case ctx.Err() != nil, errors.Is(err, mqttv5.ErrClosed):
+            return err
+        default:
+            log.Printf("destination refused %s: %v", opts.Topic, err)
+            return nil // drop it rather than hold up every message behind it
+        }
+    }
+}
+```
+
+The source keeps the bridge's session, so messages that arrive while
+the bridge is down wait for it, and any it received but never acked
+come again when it reconnects or restarts
+([durable consumers](#durable-consumers)). Never losing one costs the occasional
+duplicate: after a crash, the source may deliver again a message the
+destination already has.
+
+This bridge forwards one message per destination round trip. For more,
+store into a [`QueuePublisher`](#durable-publishing-with-queuepublisher)
+on `queue/file` and ack the source once the message is on disk: the
+queue keeps a window of messages in flight to the destination, retries
+what can pass and dead-letters what cannot.
+
+```go
+out, _ := mqttv5.NewQueuePublisher(dst, q) // q from qfile.Open
+for m := range msgs {
+    opts := m.PublishOptions()
+    opts.Topic = "site-3/" + m.Topic
+    opts.QoS = max(opts.QoS, 1) // the queue takes QoS 1 and 2
+    if err := out.Publish(ctx, opts); err != nil {
+        return err // not stored: the source delivers it again
+    }
+    _ = m.Ack()
+}
+```
+
+To spread the load, run several bridges on a shared subscription
+(`$share/bridge/plant/#`): the source hands each message to one of
+them.
+
+#### Regional HA
+
+A `ClientGroup` whose members each fail over within their own region:
+a broadcast publish reaches every region, and a broker going down moves
+only its region's member.
+
+```mermaid
+flowchart LR
+    group["ClientGroup"] --> eu["member eu"]
+    group --> us["member us"]
+    eu == "connected" ==> eu1[("eu-1")]
+    eu -. "standby" .-> eu2[("eu-2")]
+    us == "connected" ==> us1[("us-1")]
+    us -. "standby" .-> us2[("us-2")]
+```
+
+```go
+g, _ := mqttv5.NewClientGroup(
+    []mqttv5.GroupMember{
+        {Name: "eu", Brokers: []string{"mqtts://eu-1.example.com:8883", "mqtts://eu-2.example.com:8883"}},
+        {Name: "us", Brokers: []string{"mqtts://us-1.example.com:8883", "mqtts://us-2.example.com:8883"}},
+    },
+    mqttv5.WithGroupSharedOpts(mqttv5.WithClientID("pricing")),
+    mqttv5.WithGroupSuccess(mqttv5.GroupSuccessAny),
+)
+```
+
+With `GroupSuccessAny`, a publish succeeds while any region takes it;
+`results` says which did not.
+
+#### Quorum writes
+
+Write to independent brokers and succeed once enough of them have the
+message:
+
+```go
+g, _ := mqttv5.NewClientGroup(members, // three independent brokers
+    mqttv5.WithGroupSuccess(mqttv5.GroupSuccessQuorum(2)),
+)
+results, err := g.Publish(ctx, mqttv5.PublishOptions{Topic: "ledger/tx", QoS: 1, Payload: p})
+// err is nil once two of the three acknowledged; results has each one's outcome
+```
+
+`Publish` returns when every member has answered, so ctx bounds how
+long a slow broker can hold the call.
+
+#### Sharding with fan-in
+
+Spread topics over an unclustered fleet, each topic always on the same
+broker, and consume all of them through one subscription:
+
+```go
+// Publishers: each topic goes to the same broker while it is connected.
+pubs, _ := mqttv5.NewClientGroup(shards,
+    mqttv5.WithGroupSharedOpts(mqttv5.WithClientID("orders-pub")),
+    mqttv5.WithGroupPublishPolicy(mqttv5.GroupPublishHashByTopic),
+)
+
+// Consumers: one merged subscription across every shard; each Ack goes
+// back to the broker that delivered the message.
+subs, _ := mqttv5.NewClientGroup(shards, mqttv5.WithGroupSharedOpts(mqttv5.WithClientID("orders-sub")))
+msgs, tokens, _ := subs.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "orders/#", QoS: 1}})
+```
+
+While a shard's broker is down, its topics pass to the next member.
+Consumers subscribed to every shard still receive them, but a topic's
+order is not kept across the switch.
+
+#### Durable outbox
+
+Publish through outages, broker failovers and process restarts:
+`QueuePublisher` on `queue/file`, the session in `store/file`, and a
+broker list.
+
+```go
+st, _ := sfile.Open("/var/lib/gateway/session")
+q, _ := qfile.Open("/var/lib/gateway/outbound")
+cli, _ := mqttv5.New(
+    mqttv5.WithBrokers("mqtts://mqtt-1.example.com:8883", "mqtts://mqtt-2.example.com:8883"),
+    mqttv5.WithClientID("gateway-12"),
+    mqttv5.WithStore(st),
+    mqttv5.WithRetryInitialConnect(),
+)
+pub, _ := mqttv5.NewQueuePublisher(cli, q, mqttv5.WithQueueIdempotencyKey())
+```
+
+`pub.Publish` returns once the message is on disk, whether a broker is
+up or not. A restarted process continues the exchanges in flight
+instead of publishing those messages again. Across a failover between
+nodes of a cluster the session continues too; between independent
+brokers the failover is a session loss and in-flight messages go out
+again, so `WithQueueIdempotencyKey` adds the `mqttv5-msg-id` user
+property for consumers to drop the copy.
+
+#### Brokers from service discovery
+
+```go
+// watchBrokers keeps cli's broker list at the _mqtt._tcp SRV records
+// of example.com, checked every minute.
+func watchBrokers(ctx context.Context, cli *mqttv5.Client) {
+    tick := time.NewTicker(time.Minute)
+    defer tick.Stop()
+    for {
+        _, srvs, err := net.DefaultResolver.LookupSRV(ctx, "mqtt", "tcp", "example.com")
+        if err == nil {
+            urls := make([]string, 0, len(srvs))
+            for _, s := range srvs {
+                urls = append(urls, "mqtt://"+net.JoinHostPort(strings.TrimSuffix(s.Target, "."), strconv.Itoa(int(s.Port))))
+            }
+            err = cli.SetBrokers(urls...)
+        }
+        if err != nil {
+            log.Printf("broker list unchanged: %v", err)
+        }
+        select {
+        case <-ctx.Done():
+            return
+        case <-tick.C:
+        }
+    }
+}
+```
+
+`SetBrokers` leaves the connection in use alone; the new list applies
+from the next connection attempt.
+
+#### Scaling out consumers
+
+Several instances of a service share the work of one subscription: the
+broker hands each message to one of them ([§4.8.2]).
+
+```go
+// In every instance:
+jobs, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "$share/workers/jobs/#", QoS: 1}})
+```
+
+When an instance dies holding a message it never acked, the broker
+may, at QoS 1, wait for that instance to come back or hand the message
+to another; at QoS 2 it waits, and the message is lost if the
+instance's session expires first. Make each instance a
+[durable consumer](#durable-consumers) so it comes back for it.
+
+### What combines
+
+| Combination | Gives |
+|---|---|
+| `WithBrokers` + `WithPublisherPool` | Pool members fail over too, each starting at its own entry of the list. |
+| `WithBrokers` + `WithStore` + `QueuePublisher` | The [durable outbox](#durable-outbox). |
+| `WithBrokers` + `WithFollowServerRedirects` | A `0x9D` move replaces the list; a `0x9C` redirect takes one attempt. |
+| `ClientGroup` member with several `Brokers` | [Regional HA](#regional-ha). |
+| `WithPublisherPool` in a `GroupMember.Opts` | A pool per member, over that member's brokers. |
+| `NewQueuePublisher(g.Member(name), q)` | A durable outbox per member. |
+| `ClientGroup` + `$share` filters | Shared subscriptions on every broker, merged into one output. |
 
 ---
 
@@ -719,7 +1204,7 @@ See [`examples/disconnect`](examples/disconnect).
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. |
+| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. Several URLs fail over: `Connect` and each reconnect attempt move to the next ([Failover](#failover-withbrokers)). |
 | `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial. Takes precedence over `WithDialer`/`WithTLSConfig`. Nil rejected. |
 | `WithTLSConfig(*tls.Config)` | — | TLS for `mqtts://`. |
 | `WithDialer(*net.Dialer)` | default | Override transport `net.Dialer`. |
@@ -783,8 +1268,8 @@ See [`examples/disconnect`](examples/disconnect).
 | Option | Default | Effect |
 |---|---|---|
 | `WithReconnectBackoff(b)` | `ExponentialBackoff(1s, 30s, 200ms)` | Delay before reconnect attempt n. `ConstantBackoff(d)` also shipped. The attempt count carries over connections that drop sooner than the delay before them. |
-| `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure. |
-| `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Redirecting at runtime](#redirecting-at-runtime)). |
+| `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure: with `WithBrokers`, once every broker has failed. |
+| `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Changing brokers at runtime](#changing-brokers-at-runtime)). |
 
 #### Write path and publishing
 
@@ -794,7 +1279,7 @@ See [`examples/disconnect`](examples/disconnect).
 | `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per writev syscall. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
 | `WithWriteOverflowPolicy(p)` | `WriteBlock` | QoS 0 only. See note below. |
 | `WithPublishMode(mode)` | `PublishFireAndForget` | `PublishWaitForFlush` makes QoS 0 wait until the packet is written; on an idle TCP or Unix connection the caller writes it itself, without copying the payload. ctx bounds the wait; a write it interrupts is finished by the writer goroutine. |
-| `WithPublisherPool(N)` | 0 (off) | N dedicated publish-only conns. |
+| `WithPublisherPool(N)` | 0 (off) | N publish-only connections that `Publish` spreads over ([Publish pool](#publish-pool-withpublisherpool)). |
 | `WithPublisherPoolRouting(p)` | `PoolRoutingRoundRobin` | `PoolRoutingHashByTopic` preserves per-topic ordering. |
 | `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"` | Customise per-member ClientIDs. Required when the parent ClientID is empty (broker-assigned). |
 | `WithQoSDowngrade()` | off | Send a publish whose QoS exceeds the broker's Maximum QoS at that maximum instead of failing it with `ErrQoSNotSupported`. Weakens the guarantee (QoS 2 becomes at-least-once). |
@@ -895,9 +1380,15 @@ after five seconds.
 | Option | Type | Default | Effect |
 |---|---|---|---|
 | `WithGroupSharedOpts(opts...)` | `...Option` | none | Client options applied to every member before its `GroupMember.Opts`. |
-| `WithGroupPublishPolicy(p)` | `GroupPublishPolicy` | `GroupPublishBroadcast` | Broadcast, RoundRobin or HashByTopic (see [`ClientGroup` policies](#clientgroup-policies)). |
+| `WithGroupPublishPolicy(p)` | `GroupPublishPolicy` | `GroupPublishBroadcast` | Broadcast, RoundRobin or HashByTopic (see [Parallel sessions](#parallel-sessions-clientgroup)). |
 | `WithGroupSuccess(s)` | `GroupSuccess` | `GroupSuccessAll` | How many members must succeed for a broadcast Publish or a Subscribe; `GroupSuccessAny`, `GroupSuccessQuorum(n)`. |
 | `WithGroupSequentialLifecycle()` | — | parallel | Connect, Disconnect and Subscribe members one after another. |
+
+| `GroupMember` field | Default | Effect |
+|---|---|---|
+| `Brokers` | (required) | The member's broker URLs: one, or several it fails over between as `WithBrokers` does. `WithBroker`/`WithBrokers` in `Opts` or `WithGroupSharedOpts` is rejected. |
+| `Name` | `member-N` (1-based) | Key in the Subscribe token map and for `ClientGroup.Member`; must be unique. |
+| `Opts` | none | Client options for this member, applied after `WithGroupSharedOpts`. |
 
 ---
 
@@ -911,10 +1402,11 @@ them with `errors.As`.
 
 | Error | Source | Meaning |
 |---|---|---|
-| `ErrNotConnected` | `Publish`, `Subscribe*` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect. |
+| `ErrNotConnected` | `Publish`, `Reauthenticate` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect (`AwaitConnection`). |
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
 | `ErrClosed` | any after `Disconnect` | Client torn down. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason; the error is a `*ReasonCodeError` carrying the code, reason string and server reference. |
+| joined errors | `Connect` with `WithBrokers` | No broker accepted: one error per broker, each prefixed with its URL; `errors.Is` / `errors.As` see every one. |
 | `*ProtocolError` | `Connect`, connection drops | The broker broke MQTT v5 (e.g. Session Present for CleanStart=1, a packet above the client's Maximum Packet Size, more in-flight messages than the client's Receive Maximum). The client sent DISCONNECT with `Reason` and reconnects; counted in `Stats().ProtocolErrors`. |
 | `ErrInvalidSessionExpiry` | `DisconnectWith` | Non-zero Session Expiry when CONNECT sent 0 [MQTT-3.14.2-2]; nothing is sent. |
 | `ErrUnexpectedPacket` | various | Broker sent an unexpected packet for the current state. Treat as protocol bug. |
@@ -988,12 +1480,14 @@ them with `errors.As`.
 
 ### Connection
 
-**Connect.** Blocks until the CONNACK, or until ctx ends. Without
-`WithRetryInitialConnect()` it returns the first failure. With it,
+**Connect.** Blocks until the CONNACK, or until ctx ends. With
+`WithBrokers` it tries each broker once, from a random one on. Without
+`WithRetryInitialConnect()` it returns the failure, every broker's when
+there are several. With it,
 `Connect` returns nil, the supervisor retries with the reconnect
 backoff, and `Client.AwaitConnection(ctx)` waits for the connection;
-until then `Publish` and `Subscribe` return `ErrNotConnected` and a
-`QueuePublisher` keeps queuing.
+until then `Publish` returns `ErrNotConnected`, `Subscribe` waits for
+the connection, and a `QueuePublisher` keeps queuing.
 
 **Reconnect.** `ExponentialBackoff(1s, 30s, 200ms)` by default. With
 `WithBrokers`, URLs rotate per attempt and a successful connect sticks.
@@ -1029,8 +1523,8 @@ no-op. Unacknowledged outbound QoS 1/2 messages follow
 duplicate is possible, and QoS 2 cannot stay exactly-once across the
 loss) or failed with `ErrSessionLost`. A broker that reports a present
 session for a CleanStart=1 CONNECT is a protocol error (DISCONNECT
-`0x82`). With `WithBrokers`, failover to another broker is a session
-loss.
+`0x82`). With `WithBrokers`, failover to a broker that does not share
+the session (not a node of the same cluster) is a session loss.
 
 **Send quota.** At most the broker's Receive Maximum QoS 1/2 PUBLISHes
 are in flight ([§4.9]); further publishes wait in order.
@@ -1076,7 +1570,18 @@ keep them longer.
 **Across a drop.** A SUBSCRIBE or UNSUBSCRIBE still waiting for its
 answer when the connection drops is sent again on the next one, in the
 order the calls were made; `Subscribe` and `Unsubscribe` keep waiting
-until the answer arrives or ctx ends. When the broker has no session,
+until the answer arrives or ctx ends. A `Subscribe` made while the
+client reconnects waits for the next connection the same way.
+
+**Before Connect.** A `Subscribe` before `Connect` (or between
+`Disconnect` and the next `Connect`) returns at once, and its SUBSCRIBE
+goes out first on the connection `Connect` makes. Its route is in place
+before the CONNACK, so the messages a resumed session holds — which the
+broker sends right after the CONNACK — reach it; `token.Results()`
+reports the SUBACK once it arrives. A filter that connection's CONNACK
+rules out (shared or wildcard subscriptions unavailable) ends the
+subscription with that error instead of being sent. If `Connect`
+fails, its subscriptions end with it. When the broker has no session,
 pending UNSUBSCRIBEs complete without being sent and every subscription
 is subscribed again, oldest first. Filters the broker refuses then end
 the subscription's share of them: `WithOnResubscribeError` is called,
@@ -1102,7 +1607,11 @@ and a PUBLISH tagged with identifiers reaches only the subscriptions it
 was sent for. With overlapping filters (`a/#` and `a/b`) a broker may
 send one copy per matching subscription; each subscription then
 receives exactly one. Without identifiers every matching subscription
-receives every copy.
+receives every copy. A PUBLISH tagged only with identifiers this client
+never gave a subscription to its topic was sent for a subscription of
+an earlier process, whose session this one resumed: it is matched by
+topic, as without identifiers. One tagged with an identifier the
+client has replaced, or is unsubscribing, is dropped.
 
 **Broker capabilities.** When the CONNACK disables shared subscriptions,
 wildcards or Subscription Identifiers, `Subscribe*` fails before
@@ -1453,6 +1962,25 @@ when the file system does: check free space and the Error log, then
 
 ## Architecture
 
+Outbound, a publish takes the shortest path the connection allows:
+
+```mermaid
+flowchart LR
+    pub["Publish"] -- "QoS 1/2: packet ID,<br/>send quota, record" --> engine["session engine"] --> store[("session.Store")]
+    pub -- "idle TCP or Unix socket" --> direct["caller's goroutine,<br/>direct write"] --> sock(("socket"))
+    pub -- "busy writer, TLS, WebSocket,<br/>fire-and-forget QoS 0" --> writer["writer goroutine<br/>queue, writev batches"] --> sock
+```
+
+Inbound, acknowledgements leave in arrival order, from the read loop
+itself when the socket takes them:
+
+```mermaid
+flowchart LR
+    sock(("socket")) --> reader["read loop<br/>decode, validate,<br/>trie match"] --> subs["channel, queue<br/>or callback"] -- "Ack" --> engine["session engine<br/>acks in arrival order"]
+    engine -- "ready when the read loop<br/>waits: non-blocking write" --> out(("socket"))
+    engine -- "the rest" --> writer["writer goroutine"] --> out
+```
+
 One goroutine per connection drives
 `read → decode → trie match → handlers (sync)`. On a TCP or Unix
 connection, a publish that waits for its write (QoS 1/2, or QoS 0 with
@@ -1622,6 +2150,7 @@ Apache 2.0 — see [LICENSE](LICENSE) for the full text and
 [§3.8.4]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901170 "3.8.4 SUBSCRIBE Actions"
 [§4.4]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901238 "4.4 Message delivery retry"
 [§4.6]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901240 "4.6 Message ordering"
+[§4.8.2]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901250 "4.8.2 Shared Subscriptions"
 [§4.9]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901251 "4.9 Flow Control"
 [§4.11]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901255 "4.11 Server redirection"
 [§4.12]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901256 "4.12 Enhanced authentication"
