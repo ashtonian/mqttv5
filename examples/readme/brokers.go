@@ -20,6 +20,38 @@ var (
 	q       mqttv5.PublisherQueue
 )
 
+func commandService() {
+	svc, _ := mqttv5.NewClientGroup(
+		[]mqttv5.GroupMember{
+			{Name: "a", Brokers: []string{"mqtts://a-1.example.com:8883", "mqtts://a-2.example.com:8883"}},
+			{Name: "b", Brokers: []string{"mqtts://b-1.example.com:8883", "mqtts://b-2.example.com:8883"}},
+		},
+		mqttv5.WithGroupSharedOpts(
+			mqttv5.WithClientID("command-service"),
+			mqttv5.WithCleanStart(false),
+			mqttv5.WithSessionExpiry(60*60),
+			mqttv5.WithRetryInitialConnect(), // a cluster down at start is tried again
+		),
+		mqttv5.WithGroupSuccess(mqttv5.GroupSuccessAny), // one cluster down fails no command
+	)
+	// Replies from devices on either cluster, in one channel.
+	replies, _, _ := svc.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/+/reply", QoS: 1}})
+	if err := svc.Connect(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	// One command, to both clusters.
+	expiry := uint32(60)
+	_, err := svc.Publish(ctx, mqttv5.PublishOptions{
+		Topic:                 "devices/42/cmd",
+		QoS:                   1,
+		Payload:               []byte(`{"desired":{"firmware":"1.4.2"}}`),
+		CorrelationData:       []byte("c7"),
+		MessageExpiryInterval: &expiry,
+	})
+	_, _ = replies, err
+}
+
 func failover() {
 	cli, _ := mqttv5.New(
 		mqttv5.WithBrokers(
