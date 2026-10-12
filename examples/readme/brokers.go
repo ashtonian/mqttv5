@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ashtonian/mqttv5"
@@ -18,7 +19,83 @@ var (
 	members []mqttv5.GroupMember
 	shards  []mqttv5.GroupMember
 	q       mqttv5.PublisherQueue
+	dev     *mqttv5.Client
+	pending sync.Map // command ID → chan struct{}
 )
+
+func seen([]byte) bool { return false }
+
+func execute([]byte) {}
+
+func commandService() {
+	svc, _ := mqttv5.NewClientGroup(
+		[]mqttv5.GroupMember{
+			{Name: "a", Brokers: []string{"mqtts://a-1.example.com:8883", "mqtts://a-2.example.com:8883"}},
+			{Name: "b", Brokers: []string{"mqtts://b-1.example.com:8883", "mqtts://b-2.example.com:8883"}},
+		},
+		mqttv5.WithGroupSharedOpts(
+			mqttv5.WithClientID("command-service"),
+			mqttv5.WithCleanStart(false),
+			mqttv5.WithSessionExpiry(60*60),
+			mqttv5.WithRetryInitialConnect(), // a cluster down at start is tried again
+		),
+		mqttv5.WithGroupSuccess(mqttv5.GroupSuccessAny), // one cluster down fails no command
+	)
+	// Acknowledgements from devices on either cluster, in one channel.
+	acks, _, _ := svc.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/+/ack", QoS: 1}})
+	if err := svc.Connect(ctx); err != nil {
+		log.Fatal(err)
+	}
+	// Each acknowledgement completes the command waiting for it; a
+	// duplicate finds none.
+	for m := range acks {
+		if acked, ok := pending.LoadAndDelete(string(m.Properties.CorrelationData())); ok {
+			close(acked.(chan struct{}))
+		}
+		_ = m.Ack()
+	}
+}
+
+// sendCommand publishes cmd to every cluster until its device
+// acknowledges it.
+func sendCommand(ctx context.Context, svc *mqttv5.ClientGroup, device, id string, cmd []byte) error {
+	acked := make(chan struct{})
+	pending.Store(id, acked)
+	defer pending.Delete(id)
+	expiry := uint32(60) // a copy no device collects goes stale
+	for {
+		_, err := svc.Publish(ctx, mqttv5.PublishOptions{
+			Topic:                 "devices/" + device + "/cmd",
+			QoS:                   1,
+			Payload:               cmd,
+			CorrelationData:       []byte(id),
+			MessageExpiryInterval: &expiry,
+		})
+		if err != nil {
+			log.Printf("command %s: no cluster took it: %v", id, err)
+		}
+		select {
+		case <-acked:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second): // no acknowledgement yet: send it again
+		}
+	}
+}
+
+func device() {
+	// On a device: act once per command, acknowledge every copy.
+	cmds, _, _ := dev.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/42/cmd", QoS: 1}})
+	for m := range cmds {
+		id := m.Properties.CorrelationData()
+		if !seen(id) {
+			execute(m.Payload)
+		}
+		_ = dev.Publish(ctx, mqttv5.PublishOptions{Topic: "devices/42/ack", QoS: 1, CorrelationData: id})
+		_ = m.Ack()
+	}
+}
 
 func failover() {
 	cli, _ := mqttv5.New(

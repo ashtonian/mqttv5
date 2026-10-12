@@ -14,6 +14,10 @@ store, process restarts.
   `Client`.
 - Messages arrive on a channel, a bounded queue or a callback, and are
   acknowledged when you say so.
+- Several brokers from one service: fail over between a cluster's
+  nodes, reach devices spread over independent clusters with one publish
+  and one merged subscription, or spread publishing over a pool of
+  connections ([Multiple brokers](#multiple-brokers)).
 - Decoding a PUBLISH of up to 64 KiB allocates nothing once pools are
   warm.
 
@@ -159,7 +163,7 @@ multi-broker ones from the variables in
 | [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
 | [`examples/failover`](examples/failover) | `WithBrokers` failover; `ConnackInfo.Broker` names the broker reached |
 | [`examples/pool`](examples/pool) | `WithPublisherPool`: QoS 1 throughput with and without a pool |
-| [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
+| [`examples/group`](examples/group) | `ClientGroup`: a central service sending commands to devices on either of two clusters and collecting their acknowledgements |
 | [`examples/bridge`](examples/bridge) | At-least-once bridge between two brokers, surviving outages and restarts |
 | [`examples/shared`](examples/shared) | Workers sharing a subscription (`$share`) |
 | [`examples/ws`](examples/ws) | WebSocket transport — `WithDialFunc(ws.DialFunc(opts))` |
@@ -612,8 +616,24 @@ them otherwise.
 
 ## Multiple brokers
 
-There are three ways to use more than one broker. Which one fits
-depends on how the brokers relate to each other:
+One connection reaches one broker. Services outgrow that for three
+reasons, and each has an API of its own:
+
+- **No single broker may take the service down.** Brokers that carry
+  the same data — the nodes of a cluster, or replicas — are
+  interchangeable, so one client connects to whichever is up:
+  [failover](#failover-withbrokers).
+- **The data is spread over brokers that do not share it.** Devices
+  connect to whichever of two independent clusters is up or nearer,
+  regions or tenants have brokers of their own, or a fleet is moving
+  from one broker to another. A central service needs a session on each:
+  one publish reaches all of them and one subscription hears from all
+  of them: [parallel sessions](#parallel-sessions-clientgroup), as in
+  [central service over independent clusters](#central-service-over-independent-clusters).
+- **One connection limits publish throughput**:
+  [a publish pool](#publish-pool-withpublisherpool).
+
+Which one fits depends on how the brokers relate to each other:
 
 | Pattern | API | Connections | The brokers |
 |---|---|---|---|
@@ -627,7 +647,7 @@ flowchart TD
     same -- "yes: a cluster or replicas" --> rate{"Does one connection<br/>limit publish throughput?"}
     rate -- no --> failover["Failover<br/>WithBrokers"]
     rate -- yes --> pooled["Failover + publish pool<br/>WithBrokers + WithPublisherPool"]
-    same -- "no: each is its own system" --> standby{"Does each one<br/>have a standby?"}
+    same -- "no: devices or data split across them" --> standby{"Does each one<br/>have a standby?"}
     standby -- no --> group["Parallel sessions<br/>ClientGroup"]
     standby -- yes --> regional["Regional HA<br/>ClientGroup, members with several Brokers"]
 ```
@@ -635,9 +655,10 @@ flowchart TD
 They compose: a `ClientGroup` member is a full `Client`, so it can fail
 over between brokers of its own and carry its own publish pool
 ([What combines](#what-combines)). The [recipes](#recipes) build on
-them: a bridge that loses nothing, quorum writes, sharding with fan-in,
-a durable outbox, brokers from service discovery, and consumers scaled
-out with shared subscriptions.
+them: a central service over independent clusters, a bridge that loses
+nothing, quorum writes, sharding with fan-in, a durable outbox, brokers
+from service discovery, and consumers scaled out with shared
+subscriptions.
 
 ### Failover: `WithBrokers`
 
@@ -747,6 +768,11 @@ the new list.
 
 N sessions to N brokers, each member treated as itself:
 
+- a central service for devices split across independent clusters:
+  every command to all of them, every reply from any of them
+  ([recipe](#central-service-over-independent-clusters)),
+- a migration from one broker to another, publishing to both until the
+  devices have moved,
 - bridges between independent brokers,
 - multi-tenant SaaS with per-broker credentials,
 - a clustered broker fleet you want N parallel sessions into.
@@ -911,6 +937,138 @@ write path, backoff, and the publish behaviour (`WithQoSDowngrade`,
 come from `WithPublisherPoolClientIDFn` (default `<ClientID>-pub-<n>`).
 
 ### Recipes
+
+#### Central service over independent clusters
+
+Devices connect to either of two clusters, both always running, that
+share no data. A cloud service sends commands to devices and waits for
+their acknowledgements, without knowing which cluster a device is on.
+The service keeps a session on both: a `ClientGroup` with a member per
+cluster publishes each command to both, and one merged subscription
+hears acknowledgements from either.
+
+```mermaid
+flowchart LR
+    service["command service<br/>ClientGroup"] <--> a[("cluster A")]
+    service <--> b[("cluster B")]
+    a <--> d17["device 17"]
+    a <--> d42["device 42"]
+    b <--> d63["device 63"]
+```
+
+```go
+svc, _ := mqttv5.NewClientGroup(
+    []mqttv5.GroupMember{
+        {Name: "a", Brokers: []string{"mqtts://a-1.example.com:8883", "mqtts://a-2.example.com:8883"}},
+        {Name: "b", Brokers: []string{"mqtts://b-1.example.com:8883", "mqtts://b-2.example.com:8883"}},
+    },
+    mqttv5.WithGroupSharedOpts(
+        mqttv5.WithClientID("command-service"),
+        mqttv5.WithCleanStart(false),
+        mqttv5.WithSessionExpiry(60*60),
+        mqttv5.WithRetryInitialConnect(), // a cluster down at start is tried again
+    ),
+    mqttv5.WithGroupSuccess(mqttv5.GroupSuccessAny), // one cluster down fails no command
+)
+// Acknowledgements from devices on either cluster, in one channel.
+acks, _, _ := svc.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/+/ack", QoS: 1}})
+if err := svc.Connect(ctx); err != nil {
+    log.Fatal(err)
+}
+// Each acknowledgement completes the command waiting for it; a
+// duplicate finds none.
+for m := range acks {
+    if acked, ok := pending.LoadAndDelete(string(m.Properties.CorrelationData())); ok {
+        close(acked.(chan struct{}))
+    }
+    _ = m.Ack()
+}
+```
+
+```go
+// sendCommand publishes cmd to every cluster until its device
+// acknowledges it.
+func sendCommand(ctx context.Context, svc *mqttv5.ClientGroup, device, id string, cmd []byte) error {
+    acked := make(chan struct{})
+    pending.Store(id, acked)
+    defer pending.Delete(id)
+    expiry := uint32(60) // a copy no device collects goes stale
+    for {
+        _, err := svc.Publish(ctx, mqttv5.PublishOptions{
+            Topic:                 "devices/" + device + "/cmd",
+            QoS:                   1,
+            Payload:               cmd,
+            CorrelationData:       []byte(id),
+            MessageExpiryInterval: &expiry,
+        })
+        if err != nil {
+            log.Printf("command %s: no cluster took it: %v", id, err)
+        }
+        select {
+        case <-acked:
+            return nil
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-time.After(10 * time.Second): // no acknowledgement yet: send it again
+        }
+    }
+}
+```
+
+```go
+// On a device: act once per command, acknowledge every copy.
+cmds, _, _ := dev.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/42/cmd", QoS: 1}})
+for m := range cmds {
+    id := m.Properties.CorrelationData()
+    if !seen(id) {
+        execute(m.Payload)
+    }
+    _ = dev.Publish(ctx, mqttv5.PublishOptions{Topic: "devices/42/ack", QoS: 1, CorrelationData: id})
+    _ = m.Ack()
+}
+```
+
+```mermaid
+sequenceDiagram
+    participant S as command service
+    participant A as cluster A
+    participant B as cluster B
+    participant D as device 42 (on A)
+    S->>A: PUBLISH devices/42/cmd, correlation c7, expiry 60 s
+    S->>B: PUBLISH devices/42/cmd, correlation c7, expiry 60 s
+    A->>D: PUBLISH devices/42/cmd
+    Note over B: no subscriber: dropped, or held<br/>for a session device 42 left here<br/>until it expires
+    D->>A: PUBLISH devices/42/ack, correlation c7
+    A->>S: delivered on the merged subscription
+    Note over S: c7 completes the waiting command
+```
+
+Why each part is there:
+
+- **Both clusters, every time.** The service cannot tell which cluster
+  a device is on, and a device can move. `GroupSuccessAny` lets a
+  command go out while one cluster is down; the results say which.
+- **Resend until acknowledged.** QoS 1 takes a command as far as the
+  broker. A device that is offline gets it from its session only on the
+  cluster that session is on, and one that moved to the other cluster
+  gets it only from a copy sent there after it arrived. The device's
+  acknowledgement closes the loop end to end, and the resend covers
+  every gap.
+- **Act once per command.** A resend, or a device that moves and
+  collects the copy waiting in its old session, can deliver a command
+  twice: devices remember recent command IDs, and the service ignores a
+  second acknowledgement.
+- **Expiry.** A copy that no device collects — on the cluster a device
+  is not on — goes stale instead of reaching the device much later.
+- **Sessions.** The service subscribes before `Connect` with a session
+  that outlives a restart, so acknowledgements sent while it was down
+  arrive when it comes back ([durable consumers](#durable-consumers)).
+  Each member lists its cluster's nodes and fails over among them;
+  devices can list both clusters with `WithBrokers` and move to the
+  other when theirs goes down.
+
+[`examples/group`](examples/group) runs this with two brokers and three
+simulated devices, one of which comes online late.
 
 #### At-least-once bridge
 
@@ -1157,7 +1315,7 @@ instance's session expires first. Make each instance a
 | `WithBrokers` + `WithPublisherPool` | Pool members fail over too, each starting at its own entry of the list. |
 | `WithBrokers` + `WithStore` + `QueuePublisher` | The [durable outbox](#durable-outbox). |
 | `WithBrokers` + `WithFollowServerRedirects` | A `0x9D` move replaces the list; a `0x9C` redirect takes one attempt. |
-| `ClientGroup` member with several `Brokers` | [Regional HA](#regional-ha). |
+| `ClientGroup` member with several `Brokers` | [Regional HA](#regional-ha); a [central service](#central-service-over-independent-clusters) whose clusters fail over within themselves. |
 | `WithPublisherPool` in a `GroupMember.Opts` | A pool per member, over that member's brokers. |
 | `NewQueuePublisher(g.Member(name), q)` | A durable outbox per member. |
 | `ClientGroup` + `$share` filters | Shared subscriptions on every broker, merged into one output. |

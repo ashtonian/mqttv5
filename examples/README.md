@@ -18,7 +18,7 @@ here and never by the core module.
 | `reconnect/` | The supervisor across a broker restart: lifecycle callbacks, QoS 1 replay, re-subscription | MQTT on 1883; restart it while running |
 | `failover/` | `WithBrokers`: connects to whichever broker accepts, moves to the next when it drops, `ConnackInfo.Broker` names it | two brokers; stop the one it reports |
 | `pool/` | `WithPublisherPool`: the same burst of QoS 1 publishes over the main connection alone and through a pool of four | MQTT on 1883 |
-| `group/` | `ClientGroup` across two brokers: broadcast publish, merged subscribe, per-member results | two brokers |
+| `group/` | A central service over two independent clusters: each command to both, acknowledgements from either on one merged subscription, resent until acknowledged; devices act once per command | two brokers |
 | `bridge/` | An at-least-once bridge: acks the source only after the destination's PUBACK, resumes the source's session after a restart | two brokers; stop either, or the bridge, while running |
 | `shared/` | Three workers sharing `$share/workers/jobs/#`, each a durable consumer | MQTT on 1883 |
 | `stats/` | `WithStats` counters printed every second | MQTT on 1883 |
@@ -35,7 +35,7 @@ cleanly, and exits 1 with the error on failure.
 | Variable | Used by | Default | Description |
 |---|---|---|---|
 | `MQTT_BROKER` | all but `group`, `failover`, `bridge` and `readme/quickstart` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`) | Broker URL. |
-| `MQTT_BROKERS` | `group`, `failover`, `durable` | `mqtt://127.0.0.1:1883,mqtt://127.0.0.1:1884` (`durable`: `MQTT_BROKER`) | Comma-separated broker URLs: one group member each for `group`, the failover list for the others. |
+| `MQTT_BROKERS` | `group`, `failover`, `durable` | `mqtt://127.0.0.1:1883,mqtt://127.0.0.1:1884` (`durable`: `MQTT_BROKER`) | Comma-separated broker URLs: one cluster (group member) each for `group`, the failover list for the others. |
 | `MQTT_SOURCE` | `bridge` | `mqtt://127.0.0.1:1883` | Broker the bridge copies from. |
 | `MQTT_DESTINATION` | `bridge` | `mqtt://127.0.0.1:1884` | Broker the bridge copies to. |
 | `MQTT_DATA_DIR` | `durable` | `$TMPDIR/mqttv5-durable` | Directory of the queue and session files; delete it to start over. |
