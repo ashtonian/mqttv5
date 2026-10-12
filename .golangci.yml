@@ -24,7 +24,7 @@ linters:
         - fieldalignment
     gosec:
       excludes:
-        - G103 # unsafe.String for zero-alloc topic/payload aliasing; isolated to wire/unsafe.go and contract-documented
+        - G103 # unsafe.String for zero-alloc topic/payload aliasing; isolated to one function in wire/fields.go and contract-documented
         - G104 # `_ = m.Ack()` is intentional throughout (manual-ack contract)
         - G115 # bounded uint16 packet IDs trip integer-overflow false positives
         - G118 # supervisor + decode goroutines are client-lifetime, not request-scoped — context.Background is correct

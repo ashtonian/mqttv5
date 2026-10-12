@@ -1,5 +1,29 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
+// Package wire implements the MQTT v5 wire-format codec. It is the
+// foundation layer of the mqttv5 client and is the only package that
+// touches packet bytes directly.
+//
+// Goals:
+//
+//   - Zero allocations on the receive path in steady state. Frames are
+//     drawn from a pool; packet structs reference the frame buffer for
+//     string/byte fields rather than copying.
+//   - Lazy property decoding: property bytes are kept as a slice until a
+//     consumer asks for a specific property by ID.
+//   - PUBLISH encoders for each lifetime: AppendPublishHeader encodes
+//     everything but the payload, so header and payload go out together
+//     (net.Buffers, one writev) without copying the payload;
+//     EncodePublish encodes the whole packet into a pooled buffer for a
+//     write that happens later; MarshalPublish into an owned,
+//     exact-size slice for a packet that is kept.
+//
+// Lifetime contract:
+//
+//	A Packet returned from a Decoder borrows its underlying frame buffer.
+//	The caller MUST call Packet.Release once they are done. After Release,
+//	every []byte and string field is invalid — copy what you need to keep
+//	(use strings.Clone, bytes.Clone, or assignment into a heap struct).
 package wire
 
 import (
@@ -7,7 +31,91 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
+
+// PacketType is the MQTT control packet type byte (high nibble of byte 1).
+type PacketType byte
+
+// MQTT v5 control packet types (§2.1.2).
+const (
+	CONNECT     PacketType = 1
+	CONNACK     PacketType = 2
+	PUBLISH     PacketType = 3
+	PUBACK      PacketType = 4
+	PUBREC      PacketType = 5
+	PUBREL      PacketType = 6
+	PUBCOMP     PacketType = 7
+	SUBSCRIBE   PacketType = 8
+	SUBACK      PacketType = 9
+	UNSUBSCRIBE PacketType = 10
+	UNSUBACK    PacketType = 11
+	PINGREQ     PacketType = 12
+	PINGRESP    PacketType = 13
+	DISCONNECT  PacketType = 14
+	AUTH        PacketType = 15
+)
+
+// String returns the protocol name of the type.
+func (t PacketType) String() string {
+	switch t {
+	case CONNECT:
+		return "CONNECT"
+	case CONNACK:
+		return "CONNACK"
+	case PUBLISH:
+		return "PUBLISH"
+	case PUBACK:
+		return "PUBACK"
+	case PUBREC:
+		return "PUBREC"
+	case PUBREL:
+		return "PUBREL"
+	case PUBCOMP:
+		return "PUBCOMP"
+	case SUBSCRIBE:
+		return "SUBSCRIBE"
+	case SUBACK:
+		return "SUBACK"
+	case UNSUBSCRIBE:
+		return "UNSUBSCRIBE"
+	case UNSUBACK:
+		return "UNSUBACK"
+	case PINGREQ:
+		return "PINGREQ"
+	case PINGRESP:
+		return "PINGRESP"
+	case DISCONNECT:
+		return "DISCONNECT"
+	case AUTH:
+		return "AUTH"
+	default:
+		return "INVALID"
+	}
+}
+
+// FixedHeader is the 2-5 byte MQTT fixed header. Type occupies the high
+// nibble of byte 1; Flags the low nibble. RemainingLength is a VBI.
+type FixedHeader struct {
+	Type            PacketType
+	Flags           byte
+	RemainingLength uint32
+}
+
+// Packet is the polymorphic return value from Decoder.ReadPacket. Each
+// concrete type (Publish, Connack, etc.) implements it.
+//
+// Release returns the packet and its frame buffer to their respective
+// pools. Calling Release more than once is a programming error and may
+// corrupt pooled memory.
+type Packet interface {
+	Type() PacketType
+	Release()
+}
+
+// ErrInvalidPacket is returned for packets that violate MQTT structure
+// (bad flags for the type, oversized properties section, etc.).
+var ErrInvalidPacket = errors.New("mqttv5: invalid packet")
 
 // DefaultReadBufferSize is the bufio.Reader window NewDecoder uses: how
 // many bytes one read syscall can bring in. Packets larger than the
@@ -221,3 +329,127 @@ func (d *Decoder) readBody(n int) (*[]byte, error) {
 		}
 	}
 }
+
+// bufClasses are the capacities of pooled frame buffers. A request is
+// served from the smallest class that fits, so a buffer never pins more
+// than 4x the bytes it holds (plus the 256 B floor). Requests above the
+// largest class are allocated exactly and left to the GC: pooling them
+// would let one large packet pin its size for the life of the pool.
+var bufClasses = [...]int{256, 1 << 10, 4 << 10, 16 << 10, 64 << 10}
+
+// bufPools holds one pool per class. Pools store *[]byte to avoid the
+// interface boxing allocation a slice value would incur.
+var bufPools [len(bufClasses)]sync.Pool
+
+func init() {
+	for i, size := range bufClasses {
+		bufPools[i].New = func() any {
+			b := make([]byte, 0, size)
+			return &b
+		}
+	}
+}
+
+// bufClass returns the index of the smallest class holding n bytes, or
+// -1 when n is larger than every class.
+func bufClass(n int) int {
+	for i, size := range bufClasses {
+		if n <= size {
+			return i
+		}
+	}
+	return -1
+}
+
+// acquireBuf returns a pointer to a slice of length n. The bytes may hold
+// data from an earlier use; the caller overwrites them before reading.
+func acquireBuf(n int) *[]byte {
+	i := bufClass(n)
+	if i < 0 {
+		b := make([]byte, n)
+		return &b
+	}
+	bp := bufPools[i].Get().(*[]byte)
+	*bp = (*bp)[:n]
+	return bp
+}
+
+// releaseBuf returns the buffer to its class pool. The caller MUST NOT use
+// the slice after this returns — that includes any sub-slice it handed
+// out to packet fields. Buffers whose capacity is not exactly a class
+// size (oversized allocations) are dropped.
+func releaseBuf(bp *[]byte) {
+	if !pooled(*bp) {
+		return
+	}
+	*bp = (*bp)[:0]
+	bufPools[bufClass(cap(*bp))].Put(bp)
+}
+
+// pooled reports whether releaseBuf recycles b.
+func pooled(b []byte) bool {
+	i := bufClass(cap(b))
+	return i >= 0 && bufClasses[i] == cap(b)
+}
+
+// ReasonCode is the single-byte reason code carried by CONNACK,
+// PUBACK/REC/REL/COMP, SUBACK, UNSUBACK, DISCONNECT, and AUTH. The
+// meaning of each value is context-dependent — see MQTT v5 §3.x.2 for
+// which codes are valid in which packets.
+type ReasonCode byte
+
+// Success and granted-QoS codes (0x00 – 0x04).
+const (
+	ReasonSuccess                ReasonCode = 0x00 // CONNACK, PUBACK/REC/REL/COMP, SUBACK, UNSUBACK
+	ReasonNormalDisconnection    ReasonCode = 0x00 // DISCONNECT
+	ReasonGrantedQoS0            ReasonCode = 0x00 // SUBACK
+	ReasonGrantedQoS1            ReasonCode = 0x01 // SUBACK
+	ReasonGrantedQoS2            ReasonCode = 0x02 // SUBACK
+	ReasonDisconnectWithWill     ReasonCode = 0x04 // DISCONNECT
+	ReasonNoMatchingSubscribers  ReasonCode = 0x10 // PUBACK, PUBREC
+	ReasonNoSubscriptionExisted  ReasonCode = 0x11 // UNSUBACK
+	ReasonContinueAuthentication ReasonCode = 0x18 // AUTH
+	ReasonReAuthenticate         ReasonCode = 0x19 // AUTH
+)
+
+// Error and refusal codes (0x80 – 0xA2).
+const (
+	ReasonUnspecifiedError                  ReasonCode = 0x80
+	ReasonMalformedPacket                   ReasonCode = 0x81
+	ReasonProtocolError                     ReasonCode = 0x82
+	ReasonImplementationSpecificError       ReasonCode = 0x83
+	ReasonUnsupportedProtocolVersion        ReasonCode = 0x84 // CONNACK
+	ReasonClientIdentifierNotValid          ReasonCode = 0x85 // CONNACK
+	ReasonBadUsernameOrPassword             ReasonCode = 0x86 // CONNACK
+	ReasonNotAuthorized                     ReasonCode = 0x87
+	ReasonServerUnavailable                 ReasonCode = 0x88 // CONNACK
+	ReasonServerBusy                        ReasonCode = 0x89
+	ReasonBanned                            ReasonCode = 0x8A // CONNACK
+	ReasonServerShuttingDown                ReasonCode = 0x8B // DISCONNECT
+	ReasonBadAuthenticationMethod           ReasonCode = 0x8C
+	ReasonKeepAliveTimeout                  ReasonCode = 0x8D // DISCONNECT
+	ReasonSessionTakenOver                  ReasonCode = 0x8E // DISCONNECT
+	ReasonTopicFilterInvalid                ReasonCode = 0x8F
+	ReasonTopicNameInvalid                  ReasonCode = 0x90
+	ReasonPacketIdentifierInUse             ReasonCode = 0x91 // PUBACK, PUBREC, SUBACK, UNSUBACK
+	ReasonPacketIdentifierNotFound          ReasonCode = 0x92 // PUBREL, PUBCOMP
+	ReasonReceiveMaximumExceeded            ReasonCode = 0x93 // DISCONNECT
+	ReasonTopicAliasInvalid                 ReasonCode = 0x94 // DISCONNECT
+	ReasonPacketTooLarge                    ReasonCode = 0x95
+	ReasonMessageRateTooHigh                ReasonCode = 0x96 // DISCONNECT
+	ReasonQuotaExceeded                     ReasonCode = 0x97
+	ReasonAdministrativeAction              ReasonCode = 0x98 // DISCONNECT
+	ReasonPayloadFormatInvalid              ReasonCode = 0x99
+	ReasonRetainNotSupported                ReasonCode = 0x9A
+	ReasonQoSNotSupported                   ReasonCode = 0x9B
+	ReasonUseAnotherServer                  ReasonCode = 0x9C
+	ReasonServerMoved                       ReasonCode = 0x9D
+	ReasonSharedSubscriptionsNotSupported   ReasonCode = 0x9E
+	ReasonConnectionRateExceeded            ReasonCode = 0x9F
+	ReasonMaximumConnectTime                ReasonCode = 0xA0 // DISCONNECT
+	ReasonSubscriptionIDsNotSupported       ReasonCode = 0xA1 // SUBACK, DISCONNECT
+	ReasonWildcardSubscriptionsNotSupported ReasonCode = 0xA2 // SUBACK, DISCONNECT
+)
+
+// IsError reports whether the reason code indicates an error (high bit set).
+func (r ReasonCode) IsError() bool { return r >= 0x80 }
