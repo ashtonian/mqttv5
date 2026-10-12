@@ -18,7 +18,7 @@ here and never by the core module.
 | `reconnect/` | The supervisor across a broker restart: lifecycle callbacks, QoS 1 replay, re-subscription | MQTT on 1883; restart it while running |
 | `failover/` | `WithBrokers`: connects to whichever broker accepts, moves to the next when it drops, `ConnackInfo.Broker` names it | two brokers; stop the one it reports |
 | `pool/` | `WithPublisherPool`: the same burst of QoS 1 publishes over the main connection alone and through a pool of four | MQTT on 1883 |
-| `group/` | A central service over two independent clusters: each command to both, acknowledgements from either on one merged subscription, resent until acknowledged; devices act once per command | two brokers |
+| `group/` | A central service over two independent clusters, acknowledged in the application as a device shadow or command RPC is: each desired-state update to both clusters, the devices' replies (their reported state) from either on one merged subscription, resent until the device replies; devices act once per command | two brokers |
 | `bridge/` | An at-least-once bridge: acks the source only after the destination's PUBACK, resumes the source's session after a restart | two brokers; stop either, or the bridge, while running |
 | `shared/` | Three workers sharing `$share/workers/jobs/#`, each a durable consumer | MQTT on 1883 |
 | `stats/` | `WithStats` counters printed every second | MQTT on 1883 |

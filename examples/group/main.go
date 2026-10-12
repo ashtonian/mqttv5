@@ -1,12 +1,14 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
 // Group example: a central service for devices split across independent
-// clusters. Each device connects to one of them; the service keeps a
-// session on every cluster through a ClientGroup, publishes each command
-// to all of them, and hears the devices' acknowledgements from any of
-// them on one merged subscription. A command goes out again until its
-// device acknowledges it, and a device acts once per command however
-// many copies reach it.
+// clusters, acknowledged in the application as a device shadow or a
+// command RPC is. Each device connects to one cluster; the service keeps
+// a session on every cluster through a ClientGroup, publishes each
+// command — here a desired shadow state — to all of them, and hears the
+// devices' replies, carrying their reported state, from any of them on
+// one merged subscription. A command goes out again until its device
+// replies, and a device acts once per command however many copies reach
+// it.
 //
 //	docker run -d --name mq1 -p 1883:1883 eclipse-mosquitto:2.1.2-alpine mosquitto -c /mosquitto-no-auth.conf
 //	docker run -d --name mq2 -p 1884:1883 eclipse-mosquitto:2.1.2-alpine mosquitto -c /mosquitto-no-auth.conf
@@ -87,25 +89,25 @@ func run(ctx context.Context) error {
 			}
 			id := fmt.Sprintf("cmd-%d", i+1)
 			start := time.Now()
-			sends, err := svc.send(ctx, d.id, id, []byte(`{"op":"reboot"}`))
+			reported, sends, err := svc.send(ctx, d.id, id, []byte(`{"firmware":"1.4.2"}`))
 			if err != nil {
 				fmt.Printf("SVC   %s to %s: %v\n", id, d.id, err)
 				return
 			}
-			fmt.Printf("SVC   %s acknowledged by %s after %d send(s), %v\n", id, d.id, sends, time.Since(start).Round(time.Millisecond))
+			fmt.Printf("SVC   %s: %s reports %s after %d send(s), %v\n", id, d.id, reported, sends, time.Since(start).Round(time.Millisecond))
 		})
 	}
 	wg.Wait()
 	return nil
 }
 
-// service sends commands to devices on any cluster and matches their
-// acknowledgements to the commands waiting for them.
+// service sends commands to devices on any cluster and hands each
+// device's reply to the command waiting for it.
 type service struct {
 	group *mqttv5.ClientGroup
 
 	mu      sync.Mutex
-	pending map[string]chan struct{} // by command ID
+	pending map[string]chan []byte // by command ID
 }
 
 func newService(ctx context.Context, clusters []string, logger *slog.Logger) (*service, error) {
@@ -124,24 +126,25 @@ func newService(ctx context.Context, clusters []string, logger *slog.Logger) (*s
 	if err != nil {
 		return nil, err
 	}
-	s := &service{group: g, pending: make(map[string]chan struct{})}
-	acks, _, err := g.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/+/ack", QoS: 1}})
+	s := &service{group: g, pending: make(map[string]chan []byte)}
+	replies, _, err := g.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "devices/+/reply", QoS: 1}})
 	if err != nil {
 		return nil, err
 	}
 	if err := g.Connect(ctx); err != nil {
 		return nil, err
 	}
-	go s.collect(acks)
+	go s.collect(replies)
 	return s, nil
 }
 
-// send publishes a command to every cluster until its device
-// acknowledges it, and reports how many times it went out.
-func (s *service) send(ctx context.Context, device, id string, payload []byte) (int, error) {
-	acked := make(chan struct{})
+// send publishes desired state to every cluster until its device
+// replies, and returns the state the device reports and how many times
+// the command went out.
+func (s *service) send(ctx context.Context, device, id string, desired []byte) ([]byte, int, error) {
+	reply := make(chan []byte, 1)
 	s.mu.Lock()
-	s.pending[id] = acked
+	s.pending[id] = reply
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -154,7 +157,7 @@ func (s *service) send(ctx context.Context, device, id string, payload []byte) (
 		results, err := s.group.Publish(ctx, mqttv5.PublishOptions{
 			Topic:                 "devices/" + device + "/cmd",
 			QoS:                   1,
-			Payload:               payload,
+			Payload:               desired,
 			CorrelationData:       []byte(id),
 			MessageExpiryInterval: &expiry,
 		})
@@ -167,26 +170,26 @@ func (s *service) send(ctx context.Context, device, id string, payload []byte) (
 			}
 		}
 		select {
-		case <-acked:
-			return sends, nil
+		case reported := <-reply:
+			return reported, sends, nil
 		case <-ctx.Done():
-			return sends, ctx.Err()
+			return nil, sends, ctx.Err()
 		case <-time.After(resendAfter):
 		}
 	}
 }
 
-// collect completes the command each acknowledgement names; a duplicate
-// finds none.
-func (s *service) collect(acks <-chan *mqttv5.Message) {
-	for m := range acks {
+// collect hands each reply to the command it names; a duplicate finds
+// none.
+func (s *service) collect(replies <-chan *mqttv5.Message) {
+	for m := range replies {
 		id := string(m.Properties.CorrelationData())
 		s.mu.Lock()
-		acked := s.pending[id]
+		reply := s.pending[id]
 		delete(s.pending, id)
 		s.mu.Unlock()
-		if acked != nil {
-			close(acked)
+		if reply != nil {
+			reply <- m.Payload
 		}
 		_ = m.Ack()
 	}
@@ -199,8 +202,9 @@ func (s *service) close() {
 }
 
 // runDevice connects a simulated device to its cluster after delay and
-// closes ready once it is subscribed. It acts once per command ID and
-// acknowledges every copy.
+// closes ready once it is subscribed. It applies each command's desired
+// state once per command ID and replies to every copy with the state it
+// reports.
 func runDevice(ctx context.Context, id, cluster string, delay time.Duration, ready chan<- struct{}, logger *slog.Logger) {
 	select {
 	case <-time.After(delay):
@@ -230,17 +234,21 @@ func runDevice(ctx context.Context, id, cluster string, delay time.Duration, rea
 	fmt.Printf("DEV   %s online on %s\n", id, cluster)
 
 	seen := make(map[string]bool)
+	reported := []byte(`{"firmware":"1.4.1"}`)
 	for m := range cmds {
 		cmd := string(m.Properties.CorrelationData())
 		if seen[cmd] {
-			fmt.Printf("DEV   %s: %s again, acknowledged without acting\n", id, cmd)
+			fmt.Printf("DEV   %s: %s again, answered without acting\n", id, cmd)
 		} else {
 			seen[cmd] = true
-			fmt.Printf("DEV   %s: %s %s\n", id, cmd, m.Payload)
+			reported = m.ClonePayload() // the update applied
+			fmt.Printf("DEV   %s: %s desired %s\n", id, cmd, m.Payload)
 		}
-		err := dev.Publish(ctx, mqttv5.PublishOptions{Topic: "devices/" + id + "/ack", QoS: 1, CorrelationData: m.Properties.CorrelationData()})
+		err := dev.Publish(ctx, mqttv5.PublishOptions{
+			Topic: "devices/" + id + "/reply", QoS: 1, CorrelationData: m.Properties.CorrelationData(), Payload: reported,
+		})
 		if err != nil && ctx.Err() == nil {
-			fmt.Printf("DEV   %s: ack %s: %v\n", id, cmd, err)
+			fmt.Printf("DEV   %s: reply to %s: %v\n", id, cmd, err)
 		}
 		_ = m.Ack()
 	}
