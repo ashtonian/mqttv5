@@ -793,7 +793,7 @@ func (c *Client) ctrlIdle() bool {
 // poisonBroker serves every connection like the auto-responder, but
 // answers a SUBSCRIBE for filter with DISCONNECT 0x81 and a close, as
 // mosquitto does for a filter deeper than its limit. It counts those.
-func poisonBroker(t *testing.T, filter string) (*testbroker.Broker, *atomic.Int32) {
+func poisonBroker(t *testing.T, filter string, holdFirst <-chan struct{}) (*testbroker.Broker, *atomic.Int32) {
 	var poisoned atomic.Int32
 	b := testbroker.New(t)
 	b.SetFallback(func(c *testbroker.Conn) {
@@ -811,7 +811,13 @@ func poisonBroker(t *testing.T, filter string) (*testbroker.Broker, *atomic.Int3
 			switch p.Type {
 			case wire.SUBSCRIBE:
 				if slices.ContainsFunc(p.Filters, func(f wire.SubscribeFilter) bool { return f.Topic == filter }) {
-					poisoned.Add(1)
+					if poisoned.Add(1) == 1 && holdFirst != nil {
+						select {
+						case <-holdFirst:
+						case <-c.Gone():
+							return
+						}
+					}
 					_ = c.Disconnect(wire.DisconnectOpts{ReasonCode: wire.ReasonMalformedPacket})
 					c.Close()
 					return
@@ -835,7 +841,7 @@ func poisonBroker(t *testing.T, filter string) (*testbroker.Broker, *atomic.Int3
 // maxCtrlAttempts times, then fails with RejectedByDisconnectError; the
 // client carries on, and other subscriptions work.
 func TestPoisonedSubscribeGivesUp(t *testing.T) {
-	b, poisoned := poisonBroker(t, "deep/filter")
+	b, poisoned := poisonBroker(t, "deep/filter", nil)
 	cli := tbClient(t, b, WithReconnectBackoff(ConstantBackoff(time.Millisecond)))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -862,14 +868,27 @@ func TestPoisonedSubscribeGivesUp(t *testing.T) {
 // A caller that stops waiting does not keep the poisoned SUBSCRIBE
 // alive: it still stops after maxCtrlAttempts.
 func TestAbandonedPoisonedSubscribeStops(t *testing.T) {
-	b, poisoned := poisonBroker(t, "deep/filter")
+	hold := make(chan struct{})
+	b, poisoned := poisonBroker(t, "deep/filter", hold)
 	cli := tbClient(t, b, WithReconnectBackoff(ConstantBackoff(time.Millisecond)))
-	short, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer cancel()
-	if _, _, err := cli.Subscribe(short, []TopicFilter{{Topic: "deep/filter"}}); err == nil {
-		t.Fatal("Subscribe succeeded")
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := cli.Subscribe(ctx, []TopicFilter{{Topic: "deep/filter"}})
+		errc <- err
+	}()
+	// The caller gives up while the broker holds its answer to the
+	// first SUBSCRIBE.
 	deadline := time.Now().Add(5 * time.Second)
+	for poisoned.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe = %v, want context.Canceled", err)
+	}
+	close(hold)
+	deadline = time.Now().Add(5 * time.Second)
 	for poisoned.Load() < maxCtrlAttempts && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
