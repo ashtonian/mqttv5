@@ -481,7 +481,7 @@ func TestClientGroupCallbacksFirePerMember(t *testing.T) {
 	var upCount atomic.Int32
 	members := make([]GroupMember, memberCount)
 	for i, u := range urls {
-		members[i] = GroupMember{Broker: u}
+		members[i] = GroupMember{Brokers: []string{u}}
 	}
 	group, err := NewClientGroup(members,
 		WithGroupSharedOpts(

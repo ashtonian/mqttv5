@@ -181,14 +181,14 @@ func ExampleNewClientGroup() {
 	group, err := mqttv5.NewClientGroup(
 		[]mqttv5.GroupMember{
 			{
-				Broker: "mqtts://emea.example.com:8883",
-				Name:   "emea",
-				Opts:   []mqttv5.Option{mqttv5.WithCredentials("emea-svc", []byte("token-1"))},
+				Brokers: []string{"mqtts://emea.example.com:8883"},
+				Name:    "emea",
+				Opts:    []mqttv5.Option{mqttv5.WithCredentials("emea-svc", []byte("token-1"))},
 			},
 			{
-				Broker: "mqtts://apac.example.com:8883",
-				Name:   "apac",
-				Opts:   []mqttv5.Option{mqttv5.WithCredentials("apac-svc", []byte("token-2"))},
+				Brokers: []string{"mqtts://apac.example.com:8883"},
+				Name:    "apac",
+				Opts:    []mqttv5.Option{mqttv5.WithCredentials("apac-svc", []byte("token-2"))},
 			},
 		},
 		mqttv5.WithGroupSharedOpts(

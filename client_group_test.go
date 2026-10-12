@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,14 +123,14 @@ func TestClientGroupPerMemberAuth(t *testing.T) {
 	g, err := NewClientGroup(
 		[]GroupMember{
 			{
-				Broker: fb1.URL(),
-				Name:   "primary",
-				Opts:   []Option{WithCredentials("primary-user", []byte("pw1"))},
+				Brokers: []string{fb1.URL()},
+				Name:    "primary",
+				Opts:    []Option{WithCredentials("primary-user", []byte("pw1"))},
 			},
 			{
-				Broker: fb2.URL(),
-				Name:   "secondary",
-				Opts:   []Option{WithCredentials("secondary-user", []byte("pw2"))},
+				Brokers: []string{fb2.URL()},
+				Name:    "secondary",
+				Opts:    []Option{WithCredentials("secondary-user", []byte("pw2"))},
 			},
 		},
 	)
@@ -178,9 +179,9 @@ func TestClientGroupPublishRoundRobin(t *testing.T) {
 	for i := range memberCount {
 		brokers[i] = testbroker.NewRaw(t, groupBrokerHandler(t, rec))
 		members[i] = GroupMember{
-			Broker: brokers[i].URL(),
-			Name:   fmt.Sprintf("m%d", i+1),
-			Opts:   []Option{WithCredentials(fmt.Sprintf("m%d", i+1), nil)},
+			Brokers: []string{brokers[i].URL()},
+			Name:    fmt.Sprintf("m%d", i+1),
+			Opts:    []Option{WithCredentials(fmt.Sprintf("m%d", i+1), nil)},
 		}
 	}
 
@@ -235,9 +236,9 @@ func TestClientGroupPublishHashByTopic(t *testing.T) {
 	for i := range memberCount {
 		brokers[i] = testbroker.NewRaw(t, groupBrokerHandler(t, rec))
 		members[i] = GroupMember{
-			Broker: brokers[i].URL(),
-			Name:   fmt.Sprintf("m%d", i+1),
-			Opts:   []Option{WithCredentials(fmt.Sprintf("m%d", i+1), nil)},
+			Brokers: []string{brokers[i].URL()},
+			Name:    fmt.Sprintf("m%d", i+1),
+			Opts:    []Option{WithCredentials(fmt.Sprintf("m%d", i+1), nil)},
 		}
 	}
 
@@ -302,8 +303,8 @@ func TestClientGroupMemberByName(t *testing.T) {
 	fb2 := testbroker.NewRaw(t, groupBrokerHandler(t, &groupPublishRecorder{}))
 
 	g, err := NewClientGroup([]GroupMember{
-		{Broker: fb1.URL(), Name: "primary"},
-		{Broker: fb2.URL(), Name: "secondary"},
+		{Brokers: []string{fb1.URL()}, Name: "primary"},
+		{Brokers: []string{fb2.URL()}, Name: "secondary"},
 	})
 	if err != nil {
 		t.Fatalf("NewClientGroup: %v", err)
@@ -344,7 +345,7 @@ func TestClientGroupParallelConnect(t *testing.T) {
 	}
 	members := make([]GroupMember, memberCount)
 	for i := range memberCount {
-		members[i] = GroupMember{Broker: makeSlowBroker().URL()}
+		members[i] = GroupMember{Brokers: []string{makeSlowBroker().URL()}}
 	}
 
 	g, err := NewClientGroup(members)
@@ -405,8 +406,8 @@ func TestClientGroupNamedTokens(t *testing.T) {
 	fb2 := makeBroker()
 
 	g, err := NewClientGroup([]GroupMember{
-		{Broker: fb1.URL(), Name: "alpha"},
-		{Broker: fb2.URL(), Name: "beta"},
+		{Brokers: []string{fb1.URL()}, Name: "alpha"},
+		{Brokers: []string{fb2.URL()}, Name: "beta"},
 	})
 	if err != nil {
 		t.Fatalf("NewClientGroup: %v", err)
@@ -436,11 +437,82 @@ func TestClientGroupNamedTokens(t *testing.T) {
 // same Name — the token map and Member lookup require uniqueness.
 func TestClientGroupDuplicateMemberName(t *testing.T) {
 	_, err := NewClientGroup([]GroupMember{
-		{Broker: "mqtt://127.0.0.1:1", Name: "same"},
-		{Broker: "mqtt://127.0.0.1:2", Name: "same"},
+		{Brokers: []string{"mqtt://127.0.0.1:1"}, Name: "same"},
+		{Brokers: []string{"mqtt://127.0.0.1:2"}, Name: "same"},
 	})
 	if err == nil {
 		t.Fatal("NewClientGroup accepted duplicate Name; want error")
+	}
+}
+
+// A member's brokers come only from GroupMember.Brokers.
+func TestClientGroupMemberBrokers(t *testing.T) {
+	tests := []struct {
+		name   string
+		member GroupMember
+		shared []Option
+		want   string
+	}{
+		{"none", GroupMember{}, nil, "Brokers is required"},
+		{"in member opts", GroupMember{
+			Brokers: []string{"mqtt://127.0.0.1:1"},
+			Opts:    []Option{WithBrokers("mqtt://127.0.0.1:2")},
+		}, nil, "set brokers in GroupMember.Brokers"},
+		{"in shared opts", GroupMember{Brokers: []string{"mqtt://127.0.0.1:1"}},
+			[]Option{WithBroker("mqtt://127.0.0.1:2")}, "set brokers in GroupMember.Brokers"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewClientGroup([]GroupMember{tt.member}, WithGroupSharedOpts(tt.shared...))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("NewClientGroup = %v, want an error containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// Members with the same ClientID get a suffix; members without one
+// leave it to their brokers.
+func TestClientGroupMemberClientIDs(t *testing.T) {
+	g, err := NewClientGroup([]GroupMember{
+		{Brokers: []string{"mqtt://127.0.0.1:1"}, Opts: []Option{WithClientID("svc")}},
+		{Brokers: []string{"mqtt://127.0.0.1:2"}, Opts: []Option{WithClientID("svc")}},
+		{Brokers: []string{"mqtt://127.0.0.1:3"}},
+		{Brokers: []string{"mqtt://127.0.0.1:4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, m := range g.Members() {
+		ids = append(ids, m.ClientID())
+	}
+	if want := []string{"svc", "svc-2", "", ""}; !slices.Equal(ids, want) {
+		t.Fatalf("member ClientIDs = %q, want %q", ids, want)
+	}
+}
+
+// A member with several brokers connects through whichever accepts it.
+func TestClientGroupMemberFailover(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		<-fb.Done()
+	})
+	g, err := NewClientGroup([]GroupMember{
+		{Name: "region", Brokers: []string{"mqtt://127.0.0.1:1", fb.URL()}},
+	}, WithGroupSharedOpts(WithLogger(quietLogger())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := g.Member("region")
+	m.brokerIdx.Store(0)
+	if err := g.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer g.Disconnect(context.Background())
+	if info, _ := m.ServerInfo(); info.Broker != fb.URL() {
+		t.Fatalf("member connected to %q, want %q", info.Broker, fb.URL())
 	}
 }
 
@@ -480,8 +552,8 @@ func TestClientGroupConnectPartialFailure(t *testing.T) {
 	})
 
 	g, err := NewClientGroup([]GroupMember{
-		{Broker: ok.URL(), Name: "good"},
-		{Broker: bad.URL(), Name: "evil"},
+		{Brokers: []string{ok.URL()}, Name: "good"},
+		{Brokers: []string{bad.URL()}, Name: "evil"},
 	})
 	if err != nil {
 		t.Fatalf("NewClientGroup: %v", err)
@@ -528,8 +600,8 @@ func TestClientGroupPublishFanOut(t *testing.T) {
 	fb2 := makeBroker()
 
 	g, err := NewClientGroup([]GroupMember{
-		{Broker: fb1.URL()},
-		{Broker: fb2.URL()},
+		{Brokers: []string{fb1.URL()}},
+		{Brokers: []string{fb2.URL()}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -565,8 +637,8 @@ func TestClientGroupSubscribeFanIn(t *testing.T) {
 	fb2 := makeBroker([]byte("from-broker-2"))
 
 	g, err := NewClientGroup([]GroupMember{
-		{Broker: fb1.URL()},
-		{Broker: fb2.URL()},
+		{Brokers: []string{fb1.URL()}},
+		{Brokers: []string{fb2.URL()}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -660,7 +732,7 @@ func newTestGroup(t *testing.T, brokers []*groupBroker, opts ...ClientGroupOptio
 	t.Helper()
 	members := make([]GroupMember, len(brokers))
 	for i, gb := range brokers {
-		members[i] = GroupMember{Broker: gb.b.URL()}
+		members[i] = GroupMember{Brokers: []string{gb.b.URL()}}
 	}
 	opts = append([]ClientGroupOption{WithGroupSharedOpts(WithLogger(quietLogger()), WithClientID(t.Name()),
 		WithReconnectBackoff(ConstantBackoff(10*time.Millisecond)))}, opts...)

@@ -924,8 +924,8 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 
 	g, err := mqttv5.NewClientGroup(
 		[]mqttv5.GroupMember{
-			{Broker: brokerURL()},
-			{Broker: secondaryBrokerURL()},
+			{Brokers: []string{brokerURL()}},
+			{Brokers: []string{secondaryBrokerURL()}},
 		},
 		mqttv5.WithGroupSharedOpts(
 			mqttv5.WithClientID("conformance-group-"+randSuffix()),

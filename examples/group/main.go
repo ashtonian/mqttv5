@@ -36,8 +36,8 @@ func main() {
 		// Each member could carry per-broker credentials, TLS config,
 		// or callbacks via Opts — see the per-broker comment below.
 		members[i] = mqttv5.GroupMember{
-			Broker: broker,
-			Name:   fmt.Sprintf("broker-%d", i+1),
+			Brokers: []string{broker},
+			Name:    fmt.Sprintf("broker-%d", i+1),
 		}
 	}
 
