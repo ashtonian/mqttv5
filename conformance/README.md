@@ -44,28 +44,28 @@ their doc comments, and prints the block to paste.
 | `TestSubscribe_SameFilterSurvivesUnsubscribe` | `conformance_test.go` | The broker holds one subscription per filter ([§3.8.4]): when one of two subscriptions with the same filter unsubscribes, the other keeps receiving. |
 | `TestSubscribe_SharedSub_RoundRobinAcrossGroup` | `conformance_test.go` | A shared subscription ($share) delivers each message to exactly one member of the group. |
 | `TestClientGroup_PublishFanOutToBothBrokers` | `conformance_test.go` | A ClientGroup broadcast publish reaches subscribers on both brokers. |
+| `TestQueuePublisher_DrainsInOrderOnce` | `conformance_test.go` | A pipelined QueuePublisher delivers every queued message once, in order, through a real broker at QoS 1 and 2. |
 | `TestSession_LostWhileDisconnected` | `faults_test.go` | When the broker has lost the session by the time the client reconnects (Session Present 0), an unacknowledged QoS 1 publish follows the session-loss policy: republished as a new message by default, or failed with ErrSessionLost. |
 | `TestQoS2_ResumesAfterPUBREC` | `faults_test.go` | A QoS 2 exchange cut after PUBREC resumes with PUBREL on the next connection ([§4.4]): the Publish succeeds and the message arrives once. |
 | `TestSubscribe_RefusedFilterReported` | `faults_test.go` | A filter a broker will not take is reported, and the client carries on. |
-| `TestReceiveMaximumHonoured` | `limits_test.go` | Publishes far more QoS 1 messages at once than the broker's Receive Maximum (mosquitto advertises 20, EMQX 32, HiveMQ 10, the strict HiveMQ 4) and checks the client never had more in flight than the broker allows and that every publish completes. |
-| `TestSubscribe_NoLocal_SuppressesOwnPublishes` | `nolocal_test.go` | Verifies the MQTT v5 [§3.8.3.1] No-Local subscription option: when a client subscribes with NoLocal=true, the broker must NOT deliver that client's own matching PUBLISHes back to it. |
-| `TestOverlappingSubscriptionsOneCopyEach` | `overlap_test.go` | Checks against real brokers that, with two overlapping subscriptions on one client, each receives the message exactly once. |
-| `TestQueuePublisher_DrainsInOrderOnce` | `queue_test.go` | A pipelined QueuePublisher delivers every queued message once, in order, through a real broker at QoS 1 and 2. |
+| `TestReconnect_QoS1SurvivesConnectionDrop` | `faults_test.go` | A QoS 1 message published across an ungraceful connection drop is resent after the reconnect, delivered at least once, and its Publish call returns success. |
+| `TestSoak_DeliveryAcrossConnectionCuts` | `faults_test.go` | Publishers whose connection a proxy cuts at random moments keep their session (Session Expiry 300 s), so every message they publish arrives: QoS 2 exactly once, QoS 1 at least once. |
+| `TestReceiveMaximumHonoured` | `features_test.go` | Publishes far more QoS 1 messages at once than the broker's Receive Maximum (mosquitto advertises 20, EMQX 32, HiveMQ 10, the strict HiveMQ 4) and checks the client never had more in flight than the broker allows and that every publish completes. |
+| `TestSubscribe_NoLocal_SuppressesOwnPublishes` | `features_test.go` | Verifies the MQTT v5 [§3.8.3.1] No-Local subscription option: when a client subscribes with NoLocal=true, the broker must NOT deliver that client's own matching PUBLISHes back to it. |
+| `TestOverlappingSubscriptionsOneCopyEach` | `features_test.go` | Checks against real brokers that, with two overlapping subscriptions on one client, each receives the message exactly once. |
+| `TestSubscribe_RetainAsPublished` | `features_test.go` | Retain As Published decides whether a live forward keeps the publisher's RETAIN flag. |
+| `TestSubscribe_RetainHandling` | `features_test.go` | Retain Handling decides whether a new subscription receives the stored retained message. |
+| `TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery` | `features_test.go` | Verifies the MQTT v5 Subscription Identifier echo ([§3.3.4]): when a SUBSCRIBE carries a Subscription Identifier ([§3.8.2.1.2]), every matching PUBLISH the broker dispatches to that subscription is tagged with the same identifier in PropSubscriptionIdentifier ([§3.3.2.3.8]). |
+| `TestSubscribe_SubscriptionIdentifier_RoutesByID` | `features_test.go` | Verifies the [§3.8.4] routing invariant: when one session holds several subscriptions each carrying a distinct Subscription Identifier, a delivered PUBLISH is tagged with the identifier of the subscription it matched — so the receiver can route by id. |
+| `TestWill_DeliveredOnUngracefulDisconnect` | `features_test.go` | Verifies the broker publishes the configured will (payload + will properties) when the will client's TCP connection drops without a DISCONNECT. |
+| `TestWill_SuppressedOnGracefulDisconnect` | `features_test.go` | Verifies a normal DISCONNECT clears the will: the broker must NOT publish it. |
+| `TestWill_DelayInterval` | `features_test.go` | Verifies WillDelayInterval defers publication: after an ungraceful drop the will must not arrive before the delay elapses, but must arrive once it does. |
 | `TestReauthenticate_SCRAM_EMQX` | `reauth_test.go` | Exercises client-initiated MQTT 5 re-authentication ([§4.12]) end-to-end against a real broker. |
-| `TestReconnect_QoS1SurvivesConnectionDrop` | `reconnect_replay_test.go` | A QoS 1 message published across an ungraceful connection drop is resent after the reconnect, delivered at least once, and its Publish call returns success. |
-| `TestSubscribe_RetainAsPublished` | `retain_options_test.go` | Retain As Published decides whether a live forward keeps the publisher's RETAIN flag. |
-| `TestSubscribe_RetainHandling` | `retain_options_test.go` | Retain Handling decides whether a new subscription receives the stored retained message. |
-| `TestSoak_DeliveryAcrossConnectionCuts` | `soak_test.go` | Publishers whose connection a proxy cuts at random moments keep their session (Session Expiry 300 s), so every message they publish arrives: QoS 2 exactly once, QoS 1 at least once. |
 | `TestStrict_MaximumQoS` | `strict_test.go` | A QoS above the broker's Maximum QoS fails before anything is sent, or is downgraded with WithQoSDowngrade; the connection survives. |
 | `TestStrict_MaximumPacketSize` | `strict_test.go` | A packet above the broker's Maximum Packet Size fails before it is sent; the connection survives and smaller packets go through. |
 | `TestStrict_ServerKeepAlive` | `strict_test.go` | The broker's Server Keep Alive replaces the keep-alive the client asked for: idle longer than the broker's limit, the client keeps the connection by pinging at the broker's interval. |
 | `TestStrict_TopicAliasMaximum` | `strict_test.go` | Outbound topic aliases stay within the broker's Topic Alias Maximum: more topics than aliases all arrive, without a protocol error. |
 | `TestStrict_UnavailableFeatures` | `strict_test.go` | Features the broker says it lacks fail before anything is sent, and a subscription works without a Subscription Identifier the broker does not accept. |
-| `TestSubscribe_SubscriptionIdentifier_EchoedOnDelivery` | `subscription_id_test.go` | Verifies the MQTT v5 Subscription Identifier echo ([§3.3.4]): when a SUBSCRIBE carries a Subscription Identifier ([§3.8.2.1.2]), every matching PUBLISH the broker dispatches to that subscription is tagged with the same identifier in PropSubscriptionIdentifier ([§3.3.2.3.8]). |
-| `TestSubscribe_SubscriptionIdentifier_RoutesByID` | `subscription_id_test.go` | Verifies the [§3.8.4] routing invariant: when one session holds several subscriptions each carrying a distinct Subscription Identifier, a delivered PUBLISH is tagged with the identifier of the subscription it matched — so the receiver can route by id. |
-| `TestWill_DeliveredOnUngracefulDisconnect` | `will_test.go` | Verifies the broker publishes the configured will (payload + will properties) when the will client's TCP connection drops without a DISCONNECT. |
-| `TestWill_SuppressedOnGracefulDisconnect` | `will_test.go` | Verifies a normal DISCONNECT clears the will: the broker must NOT publish it. |
-| `TestWill_DelayInterval` | `will_test.go` | Verifies WillDelayInterval defers publication: after an ungraceful drop the will must not arrive before the delay elapses, but must arrive once it does. |
 <!-- tests:end -->
 
 The client's protocol state machine — Session Present handling, QoS 2
@@ -188,11 +188,12 @@ synthetic payloads only.
 
 | File | What |
 |---|---|
-| `helpers.go` | broker URLs, `connect`, subscriber helpers |
-| `conformance_test.go` | connect, publish, subscribe, properties, retain, topic aliases, shared subscriptions, ClientGroup |
-| `limits_test.go`, `nolocal_test.go`, `overlap_test.go`, `retain_options_test.go`, `subscription_id_test.go`, `will_test.go` | one protocol feature each |
-| `queue_test.go`, `reconnect_replay_test.go` | QueuePublisher draining; QoS 1 replay across a dropped connection |
-| `reauth_test.go`, `scram.go` | SCRAM-SHA-256 re-authentication against EMQX |
+| `helpers.go` | broker URLs, `connect`, subscriber helpers, the fault-injecting proxy with its packet trace, the SCRAM-SHA-256 client |
+| `conformance_test.go` | connect, publish, subscribe, properties, retain, topic aliases, shared subscriptions, ClientGroup, QueuePublisher |
+| `features_test.go` | one protocol feature per test: Receive Maximum, No Local, overlapping subscriptions, retain options, Subscription Identifiers, wills |
+| `faults_test.go` | session loss, QoS 2 resumption, refused filters, QoS 1 replay across a dropped connection, the connection-cut soak |
+| `reauth_test.go` | SCRAM-SHA-256 re-authentication against EMQX |
+| `strict_test.go` | a broker announcing tight limits |
 | `readme_test.go` | generates and checks the test list above |
 | `docker-compose.yml`, `mosquitto.conf`, `emqx/` | the brokers |
 
