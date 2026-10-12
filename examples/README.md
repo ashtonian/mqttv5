@@ -11,21 +11,34 @@ here and never by the core module.
 | Folder | What it shows | Broker |
 |---|---|---|
 | `readme/quickstart/` | The README's quick start: connect, subscribe through a channel, publish QoS 1 | MQTT on `localhost:1883` |
+| `subscribe/` | Channel, queue and callback subscriptions; a slow channel reader loses QoS 0 messages, never QoS 1; a `DropOldest` queue keeps the freshest | MQTT on 1883 |
 | `typed/` | `Typed[T]` with `codec/json`: typed publish and subscribe | MQTT on 1883 |
+| `request/` | MQTT 5 request/response: a responder on a shared subscription, a requester matching replies by Correlation Data | MQTT on 1883 |
+| `durable/` | `QueuePublisher` on `queue/file` with the session in `store/file`: stores while no broker is up, delivers in order once one is, and a restart neither loses nor repeats a message | MQTT on 1883; stop and start it, or the program, while running |
 | `reconnect/` | The supervisor across a broker restart: lifecycle callbacks, QoS 1 replay, re-subscription | MQTT on 1883; restart it while running |
+| `failover/` | `WithBrokers`: connects to whichever broker accepts, moves to the next when it drops, `ConnackInfo.Broker` names it | two brokers; stop the one it reports |
+| `pool/` | `WithPublisherPool`: the same burst of QoS 1 publishes over the main connection alone and through a pool of four | MQTT on 1883 |
 | `group/` | `ClientGroup` across two brokers: broadcast publish, merged subscribe, per-member results | two brokers |
+| `bridge/` | An at-least-once bridge: acks the source only after the destination's PUBACK, resumes the source's session after a restart | two brokers; stop either, or the bridge, while running |
+| `shared/` | Three workers sharing `$share/workers/jobs/#`, each a durable consumer | MQTT on 1883 |
 | `stats/` | `WithStats` counters printed every second | MQTT on 1883 |
 | `disconnect/` | `DisconnectWith`: reason code, reason string, Session Expiry override | MQTT on 1883 |
 | `oauth/` | `WithConnectPacketBuilder` refreshing a bearer token on every connection attempt | MQTT on 1883 (accepts any password) |
 | `ws/` | MQTT over WebSocket with `transport/ws` | a WebSocket listener |
 | `readme/` | Every Go snippet of the repository README, as code that compiles; `TestREADMESnippets` fails when the README and these files disagree | none |
 
+Each program runs until it is done or interrupted (Ctrl-C), disconnects
+cleanly, and exits 1 with the error on failure.
+
 ## Configuration
 
 | Variable | Used by | Default | Description |
 |---|---|---|---|
-| `MQTT_BROKER` | all but `group` and `readme/quickstart` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`) | Broker URL. |
-| `MQTT_BROKERS` | `group` | `mqtt://127.0.0.1:1883,mqtt://127.0.0.1:1884` | Comma-separated broker URLs, one group member each. |
+| `MQTT_BROKER` | all but `group`, `failover`, `bridge` and `readme/quickstart` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`) | Broker URL. |
+| `MQTT_BROKERS` | `group`, `failover`, `durable` | `mqtt://127.0.0.1:1883,mqtt://127.0.0.1:1884` (`durable`: `MQTT_BROKER`) | Comma-separated broker URLs: one group member each for `group`, the failover list for the others. |
+| `MQTT_SOURCE` | `bridge` | `mqtt://127.0.0.1:1883` | Broker the bridge copies from. |
+| `MQTT_DESTINATION` | `bridge` | `mqtt://127.0.0.1:1884` | Broker the bridge copies to. |
+| `MQTT_DATA_DIR` | `durable` | `$TMPDIR/mqttv5-durable` | Directory of the queue and session files; delete it to start over. |
 
 ## External dependencies
 
@@ -37,7 +50,7 @@ through `replace` directives to this repository.
 
 ```bash
 # A local broker:
-docker run -d --name mq -p 1883:1883 eclipse-mosquitto:2.1.2-alpine
+docker run -d --name mq -p 1883:1883 eclipse-mosquitto:2.1.2-alpine mosquitto -c /mosquitto-no-auth.conf
 
 go -C examples run ./readme/quickstart
 go -C examples run ./typed
@@ -46,9 +59,17 @@ go -C examples run ./stats
 go -C examples run ./disconnect
 go -C examples run ./oauth
 
-# Two brokers for the group example:
-docker run -d -p 1884:1883 eclipse-mosquitto:2.1.2-alpine
+go -C examples run ./subscribe
+go -C examples run ./request
+go -C examples run ./shared
+go -C examples run ./pool
+go -C examples run ./durable       # then: docker stop mq; docker start mq
+
+# Two brokers for the multi-broker examples:
+docker run -d --name mq2 -p 1884:1883 eclipse-mosquitto:2.1.2-alpine mosquitto -c /mosquitto-no-auth.conf
 go -C examples run ./group
+go -C examples run ./failover      # then: docker stop the broker it reports
+go -C examples run ./bridge        # then: stop mq2, or the bridge, and start it again
 
 # WebSocket: a mosquitto with a "listener 8083" + "protocol websockets"
 # configuration, then:
@@ -60,8 +81,9 @@ go -C examples test ./...
 ```
 
 Recent mosquitto images refuse anonymous clients unless the
-configuration allows them; the repository's
-[`conformance/mosquitto.conf`](../conformance/mosquitto.conf) does.
+configuration allows them; the image's `/mosquitto-no-auth.conf`, used
+above, does, as does the repository's
+[`conformance/mosquitto.conf`](../conformance/mosquitto.conf).
 
 ## Plugging in a different codec
 
@@ -81,6 +103,9 @@ A custom codec is any type with `Encode(T) ([]byte, error)` and
 | `ErrConnectRefused` (0x87 Not authorized) | the broker's `allow_anonymous` setting | Allow anonymous clients or add credentials to the example. |
 | `ws` example: `unexpected HTTP response status` | the broker's WebSocket listener and path | Configure a `protocol websockets` listener; most brokers serve it on `/mqtt`. |
 | `TestREADMESnippets` fails | the README snippet it names | Change the README and the matching file in `readme/` together. |
+| `failover` never moves | which broker `UP` names; whether you stopped that one | Stop the broker it reports; with one broker up it stays there. |
+| `durable` or `bridge` repeats old messages at start | `MQTT_DATA_DIR`, and the brokers' sessions for the example's ClientID | They resume earlier runs on purpose; delete `MQTT_DATA_DIR` or let the sessions expire to start over. |
+| `pool` shows no gain | the broker's Receive Maximum (`ServerInfo().ReceiveMaximum`) and its threading | A broker with a large window and one core gains little; the example measures it. |
 
 ## Security
 
@@ -94,7 +119,7 @@ credentials belong. The OAuth token source in that example is a stub.
 | Path | What |
 |---|---|
 | `*/main.go` | one program per folder |
-| `readme/readme.go` | README snippets that show no imports |
+| `readme/readme.go`, `readme/brokers.go` | README snippets that show no imports; `brokers.go` holds those of Multiple brokers |
 | `readme/typed.go`, `readme/queue.go`, `readme/websocket.go` | snippets whose import block the README shows, so each keeps a file of its own |
 | `readme/quickstart/main.go` | the quick start, a program of its own |
 | `readme/readme_test.go` | `TestREADMESnippets` |

@@ -6,8 +6,8 @@
 // OnConnectError / OnReconnectAttempt) logs each lifecycle event so
 // you can watch the supervisor at work when you bounce the broker:
 //
-//	docker run -d --name mq -p 1883:1883 eclipse-mosquitto
-//	go run ./examples/reconnect
+//	docker run -d --name mq -p 1883:1883 eclipse-mosquitto:2.1.2-alpine mosquitto -c /mosquitto-no-auth.conf
+//	go -C examples run ./reconnect
 //	# in another terminal:
 //	docker restart mq
 //
@@ -30,8 +30,15 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	err := run(ctx)
+	stop()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reconnect:", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "mqtt://127.0.0.1:1883")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -61,10 +68,10 @@ func main() {
 		mqttv5.WithLogger(logger),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	if err = cli.Connect(ctx); err != nil {
-		panic(err)
+		return err
 	}
 	defer func() {
 		shutdown, c := context.WithTimeout(context.Background(), 5*time.Second)
@@ -75,7 +82,7 @@ func main() {
 	msgs, _, err := cli.Subscribe(ctx,
 		[]mqttv5.TopicFilter{{Topic: "reconnect/demo", QoS: 1}}, mqttv5.SubBuffer(64))
 	if err != nil {
-		panic(err)
+		return err
 	}
 	go func() {
 		for m := range msgs {
@@ -98,7 +105,7 @@ func main() {
 				fmt.Printf("publish err (will retry): %v\n", err)
 			}
 		case <-ctx.Done():
-			return
+			return nil
 		}
 	}
 }

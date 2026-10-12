@@ -7,7 +7,7 @@
 // OpenTelemetry, expvar) by exporting each field as a gauge or
 // monotonic counter.
 //
-//	MQTT_BROKER=mqtt://127.0.0.1:1883 go run ./examples/stats
+//	MQTT_BROKER=mqtt://127.0.0.1:1883 go -C examples run ./stats
 package main
 
 import (
@@ -24,8 +24,15 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	err := run(ctx)
+	stop()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "stats:", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "mqtt://127.0.0.1:1883")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -38,10 +45,10 @@ func main() {
 		mqttv5.WithStats(),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	if err := cli.Connect(ctx); err != nil {
-		panic(err)
+		return err
 	}
 	defer func() {
 		shutdown, c := context.WithTimeout(context.Background(), 5*time.Second)
@@ -76,7 +83,7 @@ func main() {
 				s.Connects, s.PublishesSent, s.PublishesAcked,
 				s.PublishesInflight, s.ConnectFailures)
 		case <-ctx.Done():
-			return
+			return nil
 		}
 	}
 }
