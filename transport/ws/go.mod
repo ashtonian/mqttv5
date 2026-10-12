@@ -3,7 +3,7 @@ module github.com/ashtonian/mqttv5/transport/ws
 go 1.26.4
 
 require (
-	github.com/ashtonian/mqttv5 v0.0.0
+	github.com/ashtonian/mqttv5 v0.11.0
 	github.com/gobwas/ws v1.4.0
 )
 

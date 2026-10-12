@@ -3,8 +3,8 @@ module github.com/ashtonian/mqttv5/store/file
 go 1.26.4
 
 require (
-	github.com/ashtonian/mqttv5 v0.0.0
-	github.com/ashtonian/mqttv5/internal/filedb v0.0.0
+	github.com/ashtonian/mqttv5 v0.11.0
+	github.com/ashtonian/mqttv5/internal/filedb v0.11.0
 	go.etcd.io/bbolt v1.5.0
 )
 
