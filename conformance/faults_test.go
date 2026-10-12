@@ -132,10 +132,10 @@ func TestQoS2_ResumesAfterPUBREC(t *testing.T) {
 
 	var resent, pubrels int
 	for _, e := range px.trace.history("resumed") {
-		if strings.Contains(e, "PUBLISH") && strings.Contains(e, "dup=true") {
+		if e.typ == wire.PUBLISH && e.dup {
 			resent++
 		}
-		if strings.Contains(e, "PUBREL") {
+		if e.typ == wire.PUBREL {
 			pubrels++
 		}
 	}
@@ -439,6 +439,13 @@ func soakDuration(t *testing.T) time.Duration {
 // connection is down returns ErrNotConnected without sending, and is
 // retried once the client has reconnected; every other Publish returns
 // success. A subscriber on a stable connection counts arrivals.
+//
+// With MQTTV5_SOAK_TRACE set, the publisher's packets tell a broker's
+// fault from the client's: a QoS 2 message whose exchange was correct
+// but arrived twice was duplicated by the broker ([MQTT-4.3.3-10]), and
+// a first PUBLISH refused with 0x91 under an identifier whose previous
+// exchange had ended met state the broker kept after that exchange.
+// Both are logged rather than failed; without the trace they fail.
 func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 	requireBroker(t, brokerURL())
 	duration := soakDuration(t)
@@ -524,7 +531,12 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 					published = append(published, sent{id, qos})
 				}
 				sentMu.Unlock()
-				if err != nil {
+				// A PUBLISH the broker refused because it holds the
+				// identifier ends only that message; any other failure
+				// ends the worker.
+				var refused *mqttv5.ReasonCodeError
+				inUse := errors.As(err, &refused) && refused.Code == wire.ReasonPacketIdentifierInUse
+				if err != nil && !inUse {
 					return
 				}
 			}
@@ -532,7 +544,13 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 	}
 	wg.Wait()
 	close(stop)
+	brokerRefusals := 0
 	for _, f := range failures {
+		if px.trace != nil && staleIdentifierRefusal(px.trace.history(f.id)) {
+			brokerRefusals++
+			t.Logf("broker refused %s under an identifier whose exchange had ended: %v; publisher %s", f.id, f.err, px.trace.history(f.id))
+			continue
+		}
 		t.Error(f.err)
 		if px.trace != nil {
 			t.Logf("%s: publisher %s; subscriber %s", f.id, px.trace.history(f.id), subTrace.history(f.id))
@@ -568,23 +586,134 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 		}
 	}
 	mu.Lock()
-	duplicates := 0
+	duplicates, brokerDuplicates := 0, 0
 	for _, p := range published {
-		if p.qos == 2 && arrived[p.id] > 1 {
+		switch {
+		case arrived[p.id] <= 1:
+		case p.qos == 1:
+			duplicates++
+		case px.trace != nil && exchangeCorrect(px.trace.history(p.id)):
+			brokerDuplicates++
+			t.Logf("broker delivered QoS 2 message %s %d times after a correct exchange: publisher %s; subscriber %s",
+				p.id, arrived[p.id], px.trace.history(p.id), subTrace.history(p.id))
+		default:
 			t.Errorf("QoS 2 message %s arrived %d times", p.id, arrived[p.id])
 			if px.trace != nil {
 				t.Logf("%s: publisher %s; subscriber %s", p.id, px.trace.history(p.id), subTrace.history(p.id))
 			}
 		}
-		if arrived[p.id] > 1 {
-			duplicates++
-		}
 	}
 	mu.Unlock()
 	s := pub.Stats()
-	t.Logf("%v: %d messages, %d connection cuts, %d reconnects, %d publishes resent, %d QoS 1 duplicates",
-		duration, len(published), cuts.Load(), s.Connects-1, s.PublishesReplayed, duplicates)
+	t.Logf("%v: %d messages, %d connection cuts, %d reconnects, %d publishes resent, %d QoS 1 duplicates; broker faults: %d QoS 2 duplicates, %d stale-identifier refusals",
+		duration, len(published), cuts.Load(), s.Connects-1, s.PublishesReplayed, duplicates, brokerDuplicates, brokerRefusals)
 	if cuts.Load() == 0 {
 		t.Error("the proxy never cut a connection")
+	}
+}
+
+// exchangeCorrect reports whether the client's packets for one message
+// were a correct QoS 2 exchange ([§4.3.3], [§4.4]): a first PUBLISH
+// without DUP under an identifier whose previous exchange had ended,
+// each later PUBLISH a DUP resend under the same identifier on a later
+// connection and none after the PUBREL, ending with PUBCOMP.
+func exchangeCorrect(ev []traceEvent) bool {
+	var id uint16
+	pubs, conn := 0, 0
+	released, completed := false, false
+	for _, e := range ev {
+		switch {
+		case e.out && e.typ == wire.PUBLISH:
+			if pubs == 0 {
+				if e.dup || !e.reuseEnded {
+					return false
+				}
+				id = e.id
+			} else if !e.dup || e.id != id || e.conn <= conn || released {
+				return false
+			}
+			pubs++
+			conn = e.conn
+		case e.out && e.typ == wire.PUBREL:
+			if e.id != id {
+				return false
+			}
+			released = true
+		case !e.out && e.typ == wire.PUBCOMP && e.id == id:
+			completed = true
+		}
+	}
+	return pubs > 0 && released && completed
+}
+
+// staleIdentifierRefusal reports whether a message was refused because
+// the broker still held its packet identifier: the client's first
+// PUBLISH, under an identifier whose previous exchange had ended, drew a
+// PUBREC with 0x91 (Packet Identifier in use).
+func staleIdentifierRefusal(ev []traceEvent) bool {
+	if len(ev) == 0 {
+		return false
+	}
+	first := ev[0]
+	if !first.out || first.typ != wire.PUBLISH || first.dup || !first.reuseEnded {
+		return false
+	}
+	for _, e := range ev[1:] {
+		if !e.out && e.typ == wire.PUBREC && e.id == first.id {
+			return e.rc == wire.ReasonPacketIdentifierInUse
+		}
+	}
+	return false
+}
+
+// The soak blames the broker only for a message the client exchanged
+// correctly; any fault of the client's own stays a failure.
+func TestSoak_BrokerFaultAttribution(t *testing.T) {
+	publish := func(conn int, id uint16, dup, reuseEnded bool) traceEvent {
+		return traceEvent{conn: conn, out: true, typ: wire.PUBLISH, id: id, qos: 2, dup: dup, reuseEnded: reuseEnded}
+	}
+	ack := func(conn int, typ wire.PacketType, id uint16, rc wire.ReasonCode) traceEvent {
+		return traceEvent{conn: conn, typ: typ, id: id, rc: rc}
+	}
+	rel := func(conn int, id uint16) traceEvent {
+		return traceEvent{conn: conn, out: true, typ: wire.PUBREL, id: id}
+	}
+	exchanges := []struct {
+		name    string
+		events  []traceEvent
+		correct bool
+	}{
+		{"one connection", []traceEvent{publish(1, 5, false, true), ack(1, wire.PUBREC, 5, 0), rel(1, 5), ack(1, wire.PUBCOMP, 5, 0)}, true},
+		{"resent after a cut", []traceEvent{publish(1, 5, false, true), publish(2, 5, true, false), ack(2, wire.PUBREC, 5, 0), rel(2, 5), ack(2, wire.PUBCOMP, 5, 0)}, true},
+		{"resent without DUP", []traceEvent{publish(1, 5, false, true), publish(2, 5, false, true), ack(2, wire.PUBREC, 5, 0), rel(2, 5), ack(2, wire.PUBCOMP, 5, 0)}, false},
+		{"resent on the same connection", []traceEvent{publish(1, 5, false, true), publish(1, 5, true, false), ack(1, wire.PUBREC, 5, 0), rel(1, 5), ack(1, wire.PUBCOMP, 5, 0)}, false},
+		{"resent under another identifier", []traceEvent{publish(1, 5, false, true), publish(2, 6, true, false), ack(2, wire.PUBREC, 6, 0), rel(2, 6), ack(2, wire.PUBCOMP, 6, 0)}, false},
+		{"PUBLISH after PUBREL", []traceEvent{publish(1, 5, false, true), ack(1, wire.PUBREC, 5, 0), rel(1, 5), publish(2, 5, true, false), ack(2, wire.PUBCOMP, 5, 0)}, false},
+		{"identifier still in use", []traceEvent{publish(1, 5, false, false), ack(1, wire.PUBREC, 5, 0), rel(1, 5), ack(1, wire.PUBCOMP, 5, 0)}, false},
+		{"no PUBCOMP", []traceEvent{publish(1, 5, false, true), ack(1, wire.PUBREC, 5, 0), rel(1, 5)}, false},
+	}
+	for _, tt := range exchanges {
+		t.Run("exchange/"+tt.name, func(t *testing.T) {
+			if got := exchangeCorrect(tt.events); got != tt.correct {
+				t.Errorf("exchangeCorrect = %v, want %v", got, tt.correct)
+			}
+		})
+	}
+	refusals := []struct {
+		name   string
+		events []traceEvent
+		stale  bool
+	}{
+		{"fresh identifier refused in use", []traceEvent{publish(1, 7, false, true), ack(1, wire.PUBREC, 7, wire.ReasonPacketIdentifierInUse)}, true},
+		{"identifier still in use", []traceEvent{publish(1, 7, false, false), ack(1, wire.PUBREC, 7, wire.ReasonPacketIdentifierInUse)}, false},
+		{"other refusal", []traceEvent{publish(1, 7, false, true), ack(1, wire.PUBREC, 7, wire.ReasonUnspecifiedError)}, false},
+		{"refused resend", []traceEvent{publish(1, 7, true, false), ack(1, wire.PUBREC, 7, wire.ReasonPacketIdentifierInUse)}, false},
+	}
+	for _, tt := range refusals {
+		t.Run("refusal/"+tt.name, func(t *testing.T) {
+			if got := staleIdentifierRefusal(tt.events); got != tt.stale {
+				t.Errorf("staleIdentifierRefusal = %v, want %v", got, tt.stale)
+			}
+		})
 	}
 }

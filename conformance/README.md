@@ -50,6 +50,7 @@ their doc comments, and prints the block to paste.
 | `TestSubscribe_RefusedFilterReported` | `faults_test.go` | A filter a broker will not take is reported, and the client carries on. |
 | `TestReconnect_QoS1SurvivesConnectionDrop` | `faults_test.go` | A QoS 1 message published across an ungraceful connection drop is resent after the reconnect, delivered at least once, and its Publish call returns success. |
 | `TestSoak_DeliveryAcrossConnectionCuts` | `faults_test.go` | Publishers whose connection a proxy cuts at random moments keep their session (Session Expiry 300 s), so every message they publish arrives: QoS 2 exactly once, QoS 1 at least once. |
+| `TestSoak_BrokerFaultAttribution` | `faults_test.go` | The soak blames the broker only for a message the client exchanged correctly; any fault of the client's own stays a failure. |
 | `TestReceiveMaximumHonoured` | `features_test.go` | Publishes far more QoS 1 messages at once than the broker's Receive Maximum (mosquitto advertises 20, EMQX 32, HiveMQ 10, the strict HiveMQ 4) and checks the client never had more in flight than the broker allows and that every publish completes. |
 | `TestSubscribe_NoLocal_SuppressesOwnPublishes` | `features_test.go` | Verifies the MQTT v5 [§3.8.3.1] No-Local subscription option: when a client subscribes with NoLocal=true, the broker must NOT deliver that client's own matching PUBLISHes back to it. |
 | `TestOverlappingSubscriptionsOneCopyEach` | `features_test.go` | Checks against real brokers that, with two overlapping subscriptions on one client, each receives the message exactly once. |
@@ -100,7 +101,7 @@ two more with `--profile hivemq`:
 | `MQTT_BROKER_SCRAM` | `mqtt://127.0.0.1:1885` | SCRAM-enabled EMQX (re-authentication). |
 | `MQTT_BROKER_STRICT` | `mqtt://127.0.0.1:1887` | Broker announcing tight limits (`strict_test.go`). |
 | `MQTTV5_SOAK` | `3s` | How long `TestSoak_DeliveryAcrossConnectionCuts` publishes (a Go duration); the nightly job runs minutes. |
-| `MQTTV5_SOAK_TRACE` | unset | When set, the soak decodes both connections and prints the packet history of any message that did not arrive. Costs memory in proportion to the messages sent. |
+| `MQTTV5_SOAK_TRACE` | unset | When set, the soak decodes both connections, prints the packet history of any message that did not arrive, arrived twice or failed, and tells a broker's fault from the client's (see [Broker notes](#broker-notes)). Costs memory in proportion to the messages sent; the nightly job sets it. |
 
 Some assertions are broker-specific and skip elsewhere: the shared
 subscription test checks mosquitto's round-robin distribution only on
@@ -154,6 +155,20 @@ modules (through `replace` directives) and `codec/json`.
   `TestSoak_DeliveryAcrossConnectionCuts`, all with the client's
   packets as the specification requires (shown by
   `MQTTV5_SOAK_TRACE`). EMQX 6.3.1 does not lose any; use it or later.
+- **EMQX 6.3.1 duplicates QoS 2 messages across a session takeover.**
+  When a publisher reconnects a few milliseconds after its connection
+  drops, EMQX sometimes processes the old connection's last QoS 2
+  PUBLISH after the new connection has taken the session over. The
+  client's DUP=1 resend under the same identifier then draws PUBREC
+  0x00, and the message is delivered twice, which [MQTT-4.3.3-10]
+  forbids. The same race leaves identifiers marked in use after their
+  exchange ended, so a later message reusing one is refused with
+  PUBREC 0x91 and never delivered. In `TestSoak_DeliveryAcrossConnectionCuts`
+  this showed as up to one duplicate in 14,000 QoS 2 messages and a few
+  refusals per ten minutes, each with the client's packets as the
+  specification requires. With `MQTTV5_SOAK_TRACE` set the test checks
+  the client's packets and logs these as broker faults instead of
+  failing; mosquitto and HiveMQ show neither.
 - **Shared subscriptions:** EMQX distributes randomly by default, so
   the round-robin assertion runs against mosquitto only.
 

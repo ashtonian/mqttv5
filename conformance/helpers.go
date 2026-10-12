@@ -230,12 +230,12 @@ func (px *faultProxy) accept() {
 		px.accepted++
 		n := px.accepted
 		px.mu.Unlock()
-		go px.relay(broker, client, fmt.Sprintf("c%d>", n), true)
-		go px.relay(client, broker, fmt.Sprintf("c%d<", n), false)
+		go px.relay(broker, client, n, true)
+		go px.relay(client, broker, n, false)
 	}
 }
 
-func (px *faultProxy) relay(dst, src net.Conn, dir string, fromClient bool) {
+func (px *faultProxy) relay(dst, src net.Conn, conn int, fromClient bool) {
 	defer func() { _ = dst.Close() }()
 	r := bufio.NewReaderSize(src, 64<<10)
 	for {
@@ -250,7 +250,7 @@ func (px *faultProxy) relay(dst, src net.Conn, dir string, fromClient bool) {
 			}
 		}
 		if px.trace != nil {
-			px.trace.recordFrame(dir, frame)
+			px.trace.recordFrame(conn, fromClient, frame)
 		}
 		if _, err := dst.Write(frame); err != nil {
 			return
@@ -297,17 +297,47 @@ type packetTrace struct {
 	mu    sync.Mutex
 	// byID maps a packet identifier of the client — one session across
 	// all its connections — to the payload of the PUBLISH it currently
-	// belongs to.
+	// belongs to, and ended records whether the client's exchange under
+	// it has ended.
 	byID     map[uint16]string
-	events   map[string][]string
+	ended    map[uint16]bool
+	events   map[string][]traceEvent
 	connacks []string
 }
 
-func newPacketTrace() *packetTrace {
-	return &packetTrace{start: time.Now(), byID: map[uint16]string{}, events: map[string][]string{}}
+// traceEvent is one packet a traced connection carried.
+type traceEvent struct {
+	at    time.Duration
+	conn  int  // the proxy's connection number
+	out   bool // sent by the client
+	typ   wire.PacketType
+	id    uint16
+	qos   byte
+	dup   bool
+	rc    wire.ReasonCode
+	topic string
+	// reuseEnded, on a PUBLISH the client sent without DUP, reports
+	// whether its previous exchange under the same identifier had ended
+	// (or there was none).
+	reuseEnded bool
 }
 
-func (pt *packetTrace) recordFrame(dir string, frame []byte) {
+func (e traceEvent) String() string {
+	dir := "<"
+	if e.out {
+		dir = ">"
+	}
+	if e.typ == wire.PUBLISH {
+		return fmt.Sprintf("%v c%d%s PUBLISH#%d qos=%d dup=%v topic=%q", e.at, e.conn, dir, e.id, e.qos, e.dup, e.topic)
+	}
+	return fmt.Sprintf("%v c%d%s %s#%d rc=0x%02x", e.at, e.conn, dir, e.typ, e.id, byte(e.rc))
+}
+
+func newPacketTrace() *packetTrace {
+	return &packetTrace{start: time.Now(), byID: map[uint16]string{}, ended: map[uint16]bool{}, events: map[string][]traceEvent{}}
+}
+
+func (pt *packetTrace) recordFrame(conn int, out bool, frame []byte) {
 	p, err := wire.NewDecoder(bytes.NewReader(frame)).ReadPacket()
 	if err != nil {
 		return
@@ -321,25 +351,37 @@ func (pt *packetTrace) recordFrame(dir string, frame []byte) {
 		if x.QoS == 0 {
 			return
 		}
+		e := traceEvent{at: at, conn: conn, out: out, typ: wire.PUBLISH, id: x.PacketID, qos: x.QoS, dup: x.Dup, topic: x.Topic}
+		if out && !x.Dup {
+			_, used := pt.byID[x.PacketID]
+			e.reuseEnded = !used || pt.ended[x.PacketID]
+			pt.ended[x.PacketID] = false
+		}
 		payload := string(x.Payload)
 		pt.byID[x.PacketID] = payload
-		pt.events[payload] = append(pt.events[payload], fmt.Sprintf("%v %s PUBLISH#%d qos=%d dup=%v topic=%q",
-			at, dir, x.PacketID, x.QoS, x.Dup, x.Topic))
+		pt.events[payload] = append(pt.events[payload], e)
 	case *wire.PubResp:
-		if payload, ok := pt.byID[x.PacketID]; ok {
-			pt.events[payload] = append(pt.events[payload], fmt.Sprintf("%v %s %s#%d rc=0x%02x",
-				at, dir, x.Type(), x.PacketID, byte(x.ReasonCode)))
+		payload, ok := pt.byID[x.PacketID]
+		if !ok {
+			return
 		}
+		if !out {
+			switch t := x.Type(); {
+			case t == wire.PUBACK, t == wire.PUBCOMP, t == wire.PUBREC && x.ReasonCode.IsError():
+				pt.ended[x.PacketID] = true
+			}
+		}
+		pt.events[payload] = append(pt.events[payload], traceEvent{at: at, conn: conn, out: out, typ: x.Type(), id: x.PacketID, rc: x.ReasonCode})
 	case *wire.Connack:
-		pt.connacks = append(pt.connacks, fmt.Sprintf("%v %s CONNACK sp=%v rc=0x%02x",
-			at, dir, x.SessionPresent, byte(x.ReasonCode)))
+		pt.connacks = append(pt.connacks, fmt.Sprintf("%v c%d< CONNACK sp=%v rc=0x%02x",
+			at, conn, x.SessionPresent, byte(x.ReasonCode)))
 	}
 }
 
-func (pt *packetTrace) history(payload string) []string {
+func (pt *packetTrace) history(payload string) []traceEvent {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
-	return pt.events[payload]
+	return append([]traceEvent(nil), pt.events[payload]...)
 }
 
 func (pt *packetTrace) sessions() []string {
