@@ -154,9 +154,17 @@ func SubAutoAck() SubscribeOption {
 // Subscribe sends one SUBSCRIBE for filters and returns a buffered
 // channel of matching inbound messages. Callers MUST call
 // [Message.Ack] on each. Returns once the SUBACK arrives — if the
-// connection drops first the SUBSCRIBE is sent again on the next one —
-// or when ctx ends. The channel closes on [Client.Unsubscribe] or
-// [Client.Disconnect], or when the broker refuses every filter.
+// client is not connected, or the connection drops first, the SUBSCRIBE
+// goes out on the next connection — or when ctx ends. The channel
+// closes on [Client.Unsubscribe] or [Client.Disconnect], or when the
+// broker refuses every filter.
+//
+// Called before [Client.Connect], or between Disconnect and the next
+// Connect, Subscribe returns at once and the SUBSCRIBE goes out first
+// on the connection Connect makes: messages a resumed session holds,
+// which the broker sends right after its CONNACK, reach the
+// subscription. token.Results() and token.Err() report the SUBACK once
+// it arrives; if that Connect fails, the subscription ends with it.
 //
 // When the broker refuses filters Subscribe returns a
 // [*SubscribeError] together with the channel and token: the channel
@@ -202,7 +210,8 @@ func (c *Client) Subscribe(ctx context.Context, filters []TopicFilter, opts ...S
 // [WithReceiveMaximum] more beyond the cap, as on [Client.Subscribe];
 // [DropOldest] dequeues and acks the head, whatever its QoS, and admits
 // the new one. Closes on [Client.Unsubscribe] or [Client.Disconnect].
-// Refusals and reconnects behave as for [Client.Subscribe].
+// Refusals, reconnects, and a call before Connect behave as for
+// [Client.Subscribe].
 func (c *Client) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (*Queue[*Message], SubscriptionToken, error) {
 	cfg := c.subscribeConfigFrom(opts)
 	cfg.room = c.qosRoom(cfg, filters)
@@ -340,8 +349,9 @@ func (c *Client) dropInbound(cfg subscribeConfig, m *Message) {
 // or [Client.SubscribeQueue] when ack must be deferred past h.
 //
 // Of the [SubscribeOption]s only [SubZeroCopy] applies; with it, the
-// message's fields are valid only until h returns.
-// Returns [ErrNilHandler] when h is nil.
+// message's fields are valid only until h returns. Refusals,
+// reconnects, and a call before Connect behave as for
+// [Client.Subscribe]. Returns [ErrNilHandler] when h is nil.
 func (c *Client) SubscribeCallback(ctx context.Context, filters []TopicFilter, h HandlerFunc, opts ...SubscribeOption) (SubscriptionToken, error) {
 	if h == nil {
 		return SubscriptionToken{}, ErrNilHandler

@@ -460,7 +460,9 @@ func (g *ClientGroup) publishStartingAt(ctx context.Context, opts PublishOptions
 // ctx ends — the members that did are unsubscribed again and a
 // [*GroupError] (or ctx's error) is returned. Otherwise the token map,
 // keyed by member name, holds the members that subscribed; failures of
-// the others are logged.
+// the others are logged. Called before [ClientGroup.Connect], it
+// returns at once, as [Client.Subscribe] does, and each member's
+// SUBSCRIBE goes out first on its connection.
 func (g *ClientGroup) Subscribe(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (<-chan *Message, map[string]SubscriptionToken, error) {
 	if g.closed.Load() {
 		return nil, nil, ErrClosed

@@ -637,15 +637,30 @@ func (c *Client) handlePublish(cs *connState, pub *wire.Publish) {
 	for id := range pub.Properties.SubscriptionIdentifiers() {
 		ids = append(ids, id)
 	}
+	foreign := len(ids) > 0
 	c.router.Match(pub.Topic, func(h trie.Handler) {
 		v := h.(*brokerSub).view.Load()
-		if len(ids) > 0 && !v.accepts(ids) {
-			return
+		if len(ids) > 0 {
+			foreign = foreign && !v.issuedAny(ids)
+			if !v.accepts(ids) {
+				return
+			}
 		}
 		for _, r := range v.routes {
 			add(r)
 		}
 	})
+	if first == nil && foreign && !c.retired(ids) {
+		// Tagged only with identifiers this client never gave a
+		// subscription to the topic: sent for one of an earlier process,
+		// whose session this connection resumed. Match it by topic, as
+		// without identifiers.
+		c.router.Match(pub.Topic, func(h trie.Handler) {
+			for _, r := range h.(*brokerSub).view.Load().routes {
+				add(r)
+			}
+		})
+	}
 
 	if first == nil {
 		if in != nil {

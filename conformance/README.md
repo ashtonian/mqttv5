@@ -27,6 +27,7 @@ their doc comments, and prints the block to paste.
 | `TestConnect_Disconnect` | `conformance_test.go` | Connect reaches the broker and reports the connection and client ID. |
 | `TestConnect_RoundTripsThroughBroker` | `conformance_test.go` | A connected client publishes and another receives it through the broker. |
 | `TestConnect_CleanStartWipesPriorSubscription` | `conformance_test.go` | CleanStart=1 discards the session a previous connection with the same client ID left, including its subscriptions. |
+| `TestSession_DurableConsumerRestart` | `conformance_test.go` | A durable consumer restarted as a new Client gets the messages that arrived while it was down: it subscribes before Connect, so its route is in place when the resumed session's messages arrive right after the CONNACK, tagged with the earlier process's Subscription Identifier. |
 | `TestConnect_WithCredentials` | `conformance_test.go` | A CONNECT with a user name and password is accepted. |
 | `TestPublish_QoS0_DeliveredToSubscriber` | `conformance_test.go` | A QoS 0 publish arrives at QoS 0 with its payload. |
 | `TestPublish_QoS1_DeliveredAndAcked` | `conformance_test.go` | A QoS 1 publish returns after PUBACK and arrives at QoS 1. |

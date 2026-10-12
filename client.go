@@ -80,6 +80,10 @@ type Client struct {
 	brokerSubs map[string]*brokerSub // by exact filter
 	identRefs  map[uint32]int        // Subscription Identifiers in use
 	nextIdent  uint32
+	// retiring holds the identifiers of broker subscriptions an
+	// UNSUBSCRIBE is ending, until the broker confirms; written under
+	// subsMu, read by the read loop.
+	retiring atomic.Pointer[[]uint32]
 
 	ctrlMu      sync.Mutex
 	ctrlQueue   []*ctrlOp          // unacknowledged, in send order

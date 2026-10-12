@@ -161,6 +161,76 @@ func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 	expectNoMessage(t, freshCh, 500*time.Millisecond)
 }
 
+// A durable consumer restarted as a new Client gets the messages that
+// arrived while it was down: it subscribes before Connect, so its route
+// is in place when the resumed session's messages arrive right after the
+// CONNACK, tagged with the earlier process's Subscription Identifier.
+func TestSession_DurableConsumerRestart(t *testing.T) {
+	requireBroker(t, brokerURL())
+	id := "conformance-durable-" + randSuffix()
+	topic := "conformance/durable/" + randSuffix()
+	opts := []mqttv5.Option{
+		mqttv5.WithBroker(brokerURL()),
+		mqttv5.WithClientID(id),
+		mqttv5.WithCleanStart(false),
+		mqttv5.WithSessionExpiry(60),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// The first process subscribes to another filter first, so the
+	// restarted one gives the topic's subscription another identifier.
+	first, err := mqttv5.New(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"conformance/durable-other/" + randSuffix(), topic} {
+		if _, _, err := first.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: f, QoS: 1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := first.Disconnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := connect(t)
+	const n = 5
+	for i := range n {
+		if err := pub.Publish(ctx, mqttv5.PublishOptions{Topic: topic, QoS: 1, Payload: fmt.Appendf(nil, "%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	second, err := mqttv5.New(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, _, err := second.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(n))
+	if err != nil {
+		t.Fatalf("Subscribe before Connect: %v", err)
+	}
+	if err := second.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		expiry := uint32(0)
+		_ = second.DisconnectWith(context.Background(), mqttv5.DisconnectOptions{SessionExpiryInterval: &expiry})
+	})
+	if info, _ := second.ServerInfo(); !info.SessionPresent {
+		t.Fatal("the broker did not resume the session")
+	}
+	for i := range n {
+		m := expectMessage(t, ch, 5*time.Second)
+		if want := fmt.Sprint(i); string(m.Payload) != want {
+			t.Errorf("message %d: payload %q, want %q", i, m.Payload, want)
+		}
+		_ = m.Ack()
+	}
+}
+
 // A CONNECT with a user name and password is accepted.
 func TestConnect_WithCredentials(t *testing.T) {
 	// allow_anonymous=true in mosquitto.conf, so any creds work.

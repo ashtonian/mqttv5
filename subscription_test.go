@@ -670,9 +670,6 @@ func runSubscriptionModel(t *testing.T, seed uint64, rounds int) {
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
 					ch, tok, err := cli.Subscribe(ctx, []TopicFilter{{Topic: filter}}, SubBuffer(64))
-					if errors.Is(err, ErrNotConnected) {
-						return
-					}
 					if err != nil {
 						t.Errorf("round %d: Subscribe(%s): %v", round, filter, err)
 						return
@@ -950,5 +947,205 @@ func TestReconnectBackoffGrowsWhileConnectionsDieAtOnce(t *testing.T) {
 	defer mu.Unlock()
 	if want := []int{1, 2, 3, 1}; !slices.Equal(attempts, want) {
 		t.Fatalf("reconnect attempts %v, want %v", attempts, want)
+	}
+}
+
+// A subscription made before Connect is in place when a resumed
+// session's queued messages arrive: right after the CONNACK, tagged with
+// the identifier an earlier process's subscription had.
+func TestSubscribeBeforeConnectReceivesResumedSession(t *testing.T) {
+	avail := byte(1)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptResume(wire.ConnackOpts{SubscriptionIdentifierAvailable: &avail})
+		c.PublishTagged(wire.PublishOpts{Topic: "plant/line-1", Payload: []byte("queued"), QoS: 1, PacketID: 1}, 40)
+		c.ServeAuto()
+	})
+	cli, err := New(WithBroker(b.URL()), WithClientID("durable"), WithCleanStart(false),
+		WithoutKeepAlive(), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, token, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "plant/#", QoS: 1}})
+	if err != nil {
+		t.Fatalf("Subscribe before Connect: %v", err)
+	}
+	if token.Results() != nil {
+		t.Fatal("results before any SUBACK")
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+
+	m := recvMsg(t, msgs, 2*time.Second)
+	if string(m.Payload) != "queued" {
+		t.Fatalf("got %q", m.Payload)
+	}
+	_ = m.Ack()
+	conn := b.Conn(0, time.Second)
+	waitLog(t, conn, wire.PUBACK, 1)
+	waitLog(t, conn, wire.SUBACK, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for token.Results() == nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if r := token.Results(); len(r) != 1 || !r[0].Granted() {
+		t.Fatalf("results = %v, want the filter granted", r)
+	}
+}
+
+// A message tagged with the identifier of a subscription being
+// unsubscribed reaches no other subscription to its topic.
+func TestRetiringIdentifierNotRerouted(t *testing.T) {
+	avail := byte(1)
+	unsubscribing := make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{SubscriptionIdentifierAvailable: &avail})
+		wide, _ := c.ServeSubscribe(-1)
+		narrow, _ := c.ServeSubscribe(-1)
+		unsub := c.Expect(wire.UNSUBSCRIBE, 0)
+		// The broker still sends for the subscription being removed.
+		c.PublishTagged(wire.PublishOpts{Topic: "s/x", Payload: []byte("wide")}, subIDOf(wide))
+		c.PublishTagged(wire.PublishOpts{Topic: "s/x", Payload: []byte("narrow")}, subIDOf(narrow))
+		close(unsubscribing)
+		_ = c.Write(func(w io.Writer) (int64, error) {
+			return wire.WriteUnsuback(w, wire.UnsubackOpts{PacketID: unsub.PacketID, ReasonCodes: []wire.ReasonCode{wire.ReasonSuccess}})
+		})
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b)
+	_, wide, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "s/#"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrow, _, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "s/x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Unsubscribe(context.Background(), wide); err != nil {
+		t.Fatal(err)
+	}
+	<-unsubscribing
+	if m := recvMsg(t, narrow, 2*time.Second); string(m.Payload) != "narrow" {
+		t.Fatalf("narrow subscription got %q", m.Payload)
+	}
+	select {
+	case m := <-narrow:
+		t.Fatalf("narrow subscription also got %q", m.Payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A Subscribe while the client reconnects waits for the next connection
+// and its SUBACK.
+func TestSubscribeWhileReconnecting(t *testing.T) {
+	up := make(chan struct{}, 4)
+	release := make(chan struct{})
+	b := testbroker.New(t,
+		func(c *testbroker.Conn) {
+			c.AcceptResume(wire.ConnackOpts{})
+			c.Close()
+		},
+		func(c *testbroker.Conn) {
+			<-release
+			c.AcceptResume(wire.ConnackOpts{})
+			c.ServeAuto()
+		})
+	cli := tbClient(t, b, WithOnConnectionDown(func() bool { up <- struct{}{}; return true }))
+	select {
+	case <-up:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first connection did not drop")
+	}
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, err := cli.Subscribe(ctx, []TopicFilter{{Topic: "late/#", QoS: 1}})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Subscribe returned %v while disconnected", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+}
+
+// Between spans a subscription waits for the next Connect; one
+// unsubscribed before it is never sent.
+func TestSubscribeBetweenConnects(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b)
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, kept, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "kept"}})
+	if err != nil {
+		t.Fatalf("Subscribe after Disconnect: %v", err)
+	}
+	_, dropped, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "dropped"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Unsubscribe(context.Background(), dropped); err != nil {
+		t.Fatalf("Unsubscribe before Connect: %v", err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	conn := b.Conn(1, time.Second)
+	waitLog(t, conn, wire.SUBACK, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for kept.Results() == nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var filters []string
+	for _, p := range conn.Log() {
+		if p.Type == wire.SUBSCRIBE {
+			for _, f := range p.Filters {
+				filters = append(filters, f.Topic)
+			}
+		}
+		if p.Type == wire.UNSUBSCRIBE {
+			t.Errorf("UNSUBSCRIBE %v for a filter never sent", p.Topics)
+		}
+	}
+	if !slices.Equal(filters, []string{"kept"}) {
+		t.Fatalf("SUBSCRIBE filters = %q, want [kept]", filters)
+	}
+}
+
+// A subscription queued before Connect that the broker's CONNACK rules
+// out ends with the reason instead of being sent.
+func TestSubscribeBeforeConnectCheckedAgainstConnack(t *testing.T) {
+	off := byte(0)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{SharedSubscriptionAvailable: &off})
+		c.ExpectNone(wire.SUBSCRIBE, 200*time.Millisecond)
+		c.ServeAuto()
+	})
+	cli, err := New(WithBroker(b.URL()), WithLogger(quietLogger()), WithoutKeepAlive())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, token, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "$share/g/jobs"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	expectClosed(t, msgs)
+	if !errors.Is(token.Err(), ErrSharedSubsUnsupported) {
+		t.Fatalf("token.Err() = %v, want ErrSharedSubsUnsupported", token.Err())
 	}
 }
