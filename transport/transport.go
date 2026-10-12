@@ -118,3 +118,58 @@ func defaultPort(u *url.URL) string {
 // hostname returns the host without any port, suitable for use as the
 // TLS ServerName.
 func hostname(u *url.URL) string { return u.Hostname() }
+
+// DialTCP dials addr (host:port) using opts.Dialer (or a default
+// net.Dialer) honouring ctx as the dial deadline.
+//
+// Returns the raw *net.TCPConn — callers that want to assert
+// (*net.TCPConn).WriteBuffers (zero-copy vectored write) can do so via
+// type assertion after the fact.
+func DialTCP(ctx context.Context, addr string, opts DialOpts) (Conn, error) {
+	dialer := opts.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{}
+	}
+	c, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5/transport: dial tcp %s: %w", addr, err)
+	}
+	return c, nil
+}
+
+// DialTLS dials addr (host:port) over TCP, then performs a TLS
+// handshake using opts.TLSConfig.
+//
+// serverName is set as ServerName on a cloned TLS config when the
+// caller's config has none — this is what enables proper SAN
+// validation when the URL hostname differs from the connect address
+// (rare but valid: e.g., a load-balancer fronting a cert with a SAN
+// list).
+//
+// ctx bounds both the dial and the handshake.
+func DialTLS(ctx context.Context, addr, serverName string, opts DialOpts) (Conn, error) {
+	rawDialer := opts.Dialer
+	if rawDialer == nil {
+		rawDialer = &net.Dialer{}
+	}
+	rawConn, err := rawDialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5/transport: dial tcp %s: %w", addr, err)
+	}
+
+	cfg := opts.TLSConfig
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
+	if cfg.ServerName == "" && serverName != "" {
+		cfg = cfg.Clone()
+		cfg.ServerName = serverName
+	}
+
+	tlsConn := tls.Client(rawConn, cfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("mqttv5/transport: tls handshake %s: %w", addr, err)
+	}
+	return tlsConn, nil
+}

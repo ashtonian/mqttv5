@@ -10,7 +10,7 @@ here and never by the core module.
 
 | Folder | What it shows | Broker |
 |---|---|---|
-| `basic/` | Connect, subscribe through a channel, publish QoS 1, shut down on SIGINT | MQTT on 1883 |
+| `readme/quickstart/` | The README's quick start: connect, subscribe through a channel, publish QoS 1 | MQTT on `localhost:1883` |
 | `typed/` | `Typed[T]` with `codec/json`: typed publish and subscribe | MQTT on 1883 |
 | `reconnect/` | The supervisor across a broker restart: lifecycle callbacks, QoS 1 replay, re-subscription | MQTT on 1883; restart it while running |
 | `group/` | `ClientGroup` across two brokers: broadcast publish, merged subscribe, per-member results | two brokers |
@@ -24,7 +24,7 @@ here and never by the core module.
 
 | Variable | Used by | Default | Description |
 |---|---|---|---|
-| `MQTT_BROKER` | all but `group` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`) | Broker URL. |
+| `MQTT_BROKER` | all but `group` and `readme/quickstart` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`) | Broker URL. |
 | `MQTT_BROKERS` | `group` | `mqtt://127.0.0.1:1883,mqtt://127.0.0.1:1884` | Comma-separated broker URLs, one group member each. |
 
 ## External dependencies
@@ -39,7 +39,7 @@ through `replace` directives to this repository.
 # A local broker:
 docker run -d --name mq -p 1883:1883 eclipse-mosquitto:2.1.2-alpine
 
-go -C examples run ./basic
+go -C examples run ./readme/quickstart
 go -C examples run ./typed
 go -C examples run ./reconnect     # then: docker restart mq
 go -C examples run ./stats
@@ -94,5 +94,7 @@ credentials belong. The OAuth token source in that example is a stub.
 | Path | What |
 |---|---|
 | `*/main.go` | one program per folder |
-| `readme/*.go` | README snippets, grouped by README section |
+| `readme/readme.go` | README snippets that show no imports |
+| `readme/typed.go`, `readme/queue.go`, `readme/websocket.go` | snippets whose import block the README shows, so each keeps a file of its own |
+| `readme/quickstart/main.go` | the quick start, a program of its own |
 | `readme/readme_test.go` | `TestREADMESnippets` |

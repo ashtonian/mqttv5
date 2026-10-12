@@ -143,12 +143,13 @@ supervisor:
 
 ## Examples
 
-[`examples/`](examples/) is one module of runnable programs. Each reads
-the broker from `MQTT_BROKER` (default `mqtt://127.0.0.1:1883`):
+[`examples/`](examples/) is one module of runnable programs. Each but the
+quick start reads the broker from `MQTT_BROKER` (default
+`mqtt://127.0.0.1:1883`):
 
 | Path | Shows |
 |---|---|
-| [`examples/basic`](examples/basic) | Connect, channel subscribe, publish |
+| [`examples/readme/quickstart`](examples/readme/quickstart) | The quick start above: connect, channel subscribe, publish |
 | [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
 | [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
 | [`examples/group`](examples/group) | `ClientGroup` multi-broker fan-out / fan-in |
@@ -159,7 +160,7 @@ the broker from `MQTT_BROKER` (default `mqtt://127.0.0.1:1883`):
 
 ```bash
 docker run -d -p 1883:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf
-go -C examples run ./basic
+go -C examples run ./readme/quickstart
 ```
 
 ---
