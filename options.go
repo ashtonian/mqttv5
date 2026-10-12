@@ -320,9 +320,12 @@ func WithBroker(url string) Option {
 	}
 }
 
-// WithBrokers sets the ordered broker URL list. The supervisor
-// rotates through it across reconnect attempts; [Client.SetBrokers]
-// replaces it at runtime.
+// WithBrokers sets the broker URL list for failover. Each client
+// starts at a random entry, so a fleet spreads across the list.
+// [Client.Connect] tries the next entry when one fails; each reconnect
+// attempt takes the next entry, so the first one leaves the broker that
+// just dropped. The client stays on whichever broker accepts it.
+// [Client.SetBrokers] replaces the list at runtime.
 //
 // Brokers that do not share session state answer a failover CONNECT
 // with Session Present = 0: unacknowledged QoS 1/2 publishes then
@@ -511,7 +514,8 @@ func WithFollowServerRedirects() Option {
 // [WithReconnectBackoff] as after a lost connection. Publish and
 // Subscribe return ErrNotConnected until then ([QueuePublisher] queues);
 // [Client.AwaitConnection] waits for the connection. Without it,
-// Connect returns the first failure.
+// Connect returns the failure: with [WithBrokers], once every broker
+// has failed.
 func WithRetryInitialConnect() Option {
 	return func(c *Config) error {
 		c.RetryInitialConnect = true

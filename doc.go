@@ -70,9 +70,9 @@
 // [WithOnStoreFailure]) run one at a time, in the order of the events
 // they report, on a goroutine of the client's own. They may call
 // [Client.Disconnect], [Client.Connect] and [Client.SetBrokers]. Before
-// each reconnect attempt the client waits for the callbacks posted so
-// far, so a SetBrokers call from one applies to that attempt, and a
-// slow callback delays it. Because they run apart from the calls that
+// each reconnect attempt, and before Connect tries the next broker, the
+// client waits for the callbacks posted so far, so a SetBrokers call
+// from one applies to that attempt, and a slow callback delays it. Because they run apart from the calls that
 // cause them, OnConnectionUp may run after Connect returns, and a
 // callback for an event before Disconnect may run after Disconnect
 // returns.

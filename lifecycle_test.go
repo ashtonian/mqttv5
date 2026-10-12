@@ -1649,6 +1649,79 @@ func TestMultiBrokerFailover(t *testing.T) {
 	}
 }
 
+// Connect moves past a broker that is down to the next one in the list.
+func TestConnectTriesEachBroker(t *testing.T) {
+	const down = "mqtt://127.0.0.1:1"
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		<-fb.Done()
+	})
+	failures := make(chan error, 4)
+	cli, err := New(
+		WithBrokers(down, fb.URL()),
+		WithStats(),
+		WithLogger(quietLogger()),
+		WithOnConnectError(func(err error) { failures <- err }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.brokerIdx.Store(0)
+
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	if info, _ := cli.ServerInfo(); info.Broker != fb.URL() {
+		t.Fatalf("ServerInfo().Broker = %q, want %q", info.Broker, fb.URL())
+	}
+	if n := cli.Stats().ConnectFailures; n != 1 {
+		t.Fatalf("ConnectFailures = %d, want 1", n)
+	}
+	select {
+	case err := <-failures:
+		if !isDialError(err) {
+			t.Fatalf("OnConnectError got %v, want a dial error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnConnectError not called for the broker that was down")
+	}
+}
+
+// When no broker accepts, Connect returns every broker's error.
+func TestConnectEveryBrokerFails(t *testing.T) {
+	const down = "mqtt://127.0.0.1:1"
+	refusing := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnectWith(t, c, wire.NewDecoder(c), wire.ConnackOpts{ReasonCode: wire.ReasonNotAuthorized})
+	})
+	cli, err := New(WithBrokers(down, refusing.URL()), WithStats(), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.brokerIdx.Store(0)
+
+	err = cli.Connect(context.Background())
+	if !isDialError(err) || !errors.Is(err, ErrNotAuthorized) {
+		t.Fatalf("Connect = %v, want both brokers' errors", err)
+	}
+	for _, u := range []string{down, refusing.URL()} {
+		if !strings.Contains(err.Error(), u) {
+			t.Fatalf("Connect error %q does not name %s", err, u)
+		}
+	}
+	if n := cli.Stats().ConnectFailures; n != 2 {
+		t.Fatalf("ConnectFailures = %d, want 2", n)
+	}
+}
+
+func isDialError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
 func TestReconnectAfterDrop(t *testing.T) {
 	connNum := atomic.Int32{}
 	secondAccepted := make(chan struct{}, 1)
