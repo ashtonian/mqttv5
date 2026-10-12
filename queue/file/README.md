@@ -128,7 +128,7 @@ queue and a `store/file` session store, kills it with SIGKILL while four
 exchanges are open, restarts on the same directories and checks the
 broker sees exactly the PUBREL and DUP resends of those four and one new
 PUBLISH for the fifth. The conformance suite is
-`github.com/ashtonian/mqttv5/queuetest`; run it against any custom
+`github.com/ashtonian/mqttv5/queue/queuetest`; run it against any custom
 `PublisherQueue`.
 
 ## Operations

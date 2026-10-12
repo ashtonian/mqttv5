@@ -66,8 +66,6 @@ func expectNoMessage(t *testing.T, ch <-chan *mqttv5.Message, d time.Duration) {
 	}
 }
 
-// ---------------- Connect ----------------
-
 // Connect reaches the broker and reports the connection and client ID.
 func TestConnect_Disconnect(t *testing.T) {
 	cli := connect(t)
@@ -163,6 +161,76 @@ func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 	expectNoMessage(t, freshCh, 500*time.Millisecond)
 }
 
+// A durable consumer restarted as a new Client gets the messages that
+// arrived while it was down: it subscribes before Connect, so its route
+// is in place when the resumed session's messages arrive right after the
+// CONNACK, tagged with the earlier process's Subscription Identifier.
+func TestSession_DurableConsumerRestart(t *testing.T) {
+	requireBroker(t, brokerURL())
+	id := "conformance-durable-" + randSuffix()
+	topic := "conformance/durable/" + randSuffix()
+	opts := []mqttv5.Option{
+		mqttv5.WithBroker(brokerURL()),
+		mqttv5.WithClientID(id),
+		mqttv5.WithCleanStart(false),
+		mqttv5.WithSessionExpiry(60),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// The first process subscribes to another filter first, so the
+	// restarted one gives the topic's subscription another identifier.
+	first, err := mqttv5.New(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"conformance/durable-other/" + randSuffix(), topic} {
+		if _, _, err := first.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: f, QoS: 1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := first.Disconnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := connect(t)
+	const n = 5
+	for i := range n {
+		if err := pub.Publish(ctx, mqttv5.PublishOptions{Topic: topic, QoS: 1, Payload: fmt.Appendf(nil, "%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	second, err := mqttv5.New(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, _, err := second.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(n))
+	if err != nil {
+		t.Fatalf("Subscribe before Connect: %v", err)
+	}
+	if err := second.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		expiry := uint32(0)
+		_ = second.DisconnectWith(context.Background(), mqttv5.DisconnectOptions{SessionExpiryInterval: &expiry})
+	})
+	if info, _ := second.ServerInfo(); !info.SessionPresent {
+		t.Fatal("the broker did not resume the session")
+	}
+	for i := range n {
+		m := expectMessage(t, ch, 5*time.Second)
+		if want := fmt.Sprint(i); string(m.Payload) != want {
+			t.Errorf("message %d: payload %q, want %q", i, m.Payload, want)
+		}
+		_ = m.Ack()
+	}
+}
+
 // A CONNECT with a user name and password is accepted.
 func TestConnect_WithCredentials(t *testing.T) {
 	// allow_anonymous=true in mosquitto.conf, so any creds work.
@@ -186,8 +254,6 @@ func TestConnect_WithCredentials(t *testing.T) {
 	}
 	_ = m.Ack()
 }
-
-// ---------------- Publish QoS levels (with subscriber verification) ----------------
 
 // A QoS 0 publish arrives at QoS 0 with its payload.
 func TestPublish_QoS0_DeliveredToSubscriber(t *testing.T) {
@@ -270,8 +336,6 @@ func TestPublish_QoS2_ExactlyOnce(t *testing.T) {
 	// QoS 2 guarantees exactly-once — no duplicate should arrive.
 	expectNoMessage(t, ch, 500*time.Millisecond)
 }
-
-// ---------------- Wildcards ----------------
 
 // "+" matches exactly one topic level.
 func TestSubscribe_PlusWildcard_MatchesOneLevel(t *testing.T) {
@@ -365,8 +429,6 @@ func TestSubscribe_HashWildcard_MatchesParentAndChildren(t *testing.T) {
 	}
 }
 
-// ---------------- Properties (every value verified) ----------------
-
 // Content type, response topic, correlation data and user properties
 // arrive as published.
 func TestPubSub_AllPublishProperties(t *testing.T) {
@@ -428,8 +490,6 @@ func TestPubSub_AllPublishProperties(t *testing.T) {
 	}
 }
 
-// ---------------- Retain ----------------
-
 // A retained message reaches a later subscriber with Retain set, and an
 // empty retained publish clears it.
 func TestPublish_Retain_DeliveredToLateSubscriber(t *testing.T) {
@@ -477,8 +537,6 @@ func TestPublish_Retain_DeliveredToLateSubscriber(t *testing.T) {
 	expectNoMessage(t, ch2, 500*time.Millisecond)
 }
 
-// ---------------- Queue subscribe (values + order) ----------------
-
 // SubscribeQueue delivers one publisher's QoS 1 messages in order.
 func TestSubscribeQueue_OrderedDelivery(t *testing.T) {
 	sub := connect(t)
@@ -518,8 +576,6 @@ func TestSubscribeQueue_OrderedDelivery(t *testing.T) {
 		_ = m.Ack()
 	}
 }
-
-// ---------------- Typed[T] ----------------
 
 type reading struct {
 	DeviceID string  `json:"device_id"`
@@ -561,8 +617,6 @@ func TestTypedJSON_FullStructEquality(t *testing.T) {
 	}
 }
 
-// ---------------- Large payload (bytes equality) ----------------
-
 // A 64 KiB payload arrives byte for byte.
 func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 	sub := connect(t)
@@ -602,8 +656,6 @@ func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 	}
 	_ = m.Ack()
 }
-
-// ---------------- Topic alias end-to-end ----------------
 
 // With WithOutboundTopicAliases a repeated QoS 0 topic is sent as an
 // alias, saving at least the topic's length, and the subscriber still
@@ -673,8 +725,6 @@ func (c countingConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// ---------------- Unsubscribe ----------------
-
 // Unsubscribe closes the subscription's channel and later publishes do
 // not arrive.
 func TestUnsubscribe_StopsDelivery(t *testing.T) {
@@ -723,8 +773,6 @@ func TestUnsubscribe_StopsDelivery(t *testing.T) {
 		t.Fatal("channel was not closed by Unsubscribe")
 	}
 }
-
-// ---------------- Multi-subscription dispatch ----------------
 
 // Two subscriptions of one client on the same filter each receive the
 // message.
@@ -823,8 +871,6 @@ func TestSubscribe_SameFilterSurvivesUnsubscribe(t *testing.T) {
 		t.Fatal("remaining subscription lost the broker subscription")
 	}
 }
-
-// ---------------- Shared subscriptions ----------------
 
 // A shared subscription ($share) delivers each message to exactly one
 // member of the group.
@@ -925,8 +971,6 @@ func TestSubscribe_SharedSub_RoundRobinAcrossGroup(t *testing.T) {
 	}
 }
 
-// ---------------- ClientGroup ----------------
-
 // A ClientGroup broadcast publish reaches subscribers on both brokers.
 func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 	requireBroker(t, secondaryBrokerURL())
@@ -950,8 +994,8 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 
 	g, err := mqttv5.NewClientGroup(
 		[]mqttv5.GroupMember{
-			{Broker: brokerURL()},
-			{Broker: secondaryBrokerURL()},
+			{Brokers: []string{brokerURL()}},
+			{Brokers: []string{secondaryBrokerURL()}},
 		},
 		mqttv5.WithGroupSharedOpts(
 			mqttv5.WithClientID("conformance-group-"+randSuffix()),
@@ -1000,5 +1044,54 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 		if p != string(want) {
 			t.Errorf("got payload %q, want %q", p, want)
 		}
+	}
+}
+
+// A pipelined QueuePublisher delivers every queued message once, in
+// order, through a real broker at QoS 1 and 2.
+func TestQueuePublisher_DrainsInOrderOnce(t *testing.T) {
+	for _, qos := range []byte{1, 2} {
+		t.Run(fmt.Sprint("qos", qos), func(t *testing.T) {
+			sub := connect(t)
+			pub := connect(t)
+			topic := "conformance/queue/" + randSuffix()
+			ctx := context.Background()
+			msgs, _, err := sub.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: topic, QoS: 2}}, mqttv5.SubBuffer(512))
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := mqttv5.NewMemoryPublisherQueue()
+			qp, err := mqttv5.NewQueuePublisher(pub, q, mqttv5.WithQueueWindow(16))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const n = 200
+			for i := range n {
+				if err := qp.Publish(ctx, mqttv5.PublishOptions{Topic: topic, QoS: qos, Payload: fmt.Appendf(nil, "%03d", i)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := range n {
+				select {
+				case m := <-msgs:
+					if want := fmt.Sprintf("%03d", i); string(m.Payload) != want {
+						t.Fatalf("message %d is %q, want %q", i, m.Payload, want)
+					}
+					_ = m.Ack()
+				case <-time.After(10 * time.Second):
+					t.Fatalf("received %d of %d messages", i, n)
+				}
+			}
+			select {
+			case m := <-msgs:
+				t.Fatalf("extra message %q", m.Payload)
+			case <-time.After(500 * time.Millisecond):
+			}
+			closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if err := qp.Close(closeCtx); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

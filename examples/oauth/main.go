@@ -11,7 +11,7 @@
 // belong in a background refresher that updates a cached value the
 // builder reads.
 //
-//	MQTT_BROKER=mqtt://127.0.0.1:1883 go run ./examples/oauth
+//	MQTT_BROKER=mqtt://127.0.0.1:1883 go -C examples run ./oauth
 package main
 
 import (
@@ -38,8 +38,15 @@ func (t *tokenSource) Token() string {
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	err := run(ctx)
+	stop()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "oauth:", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "mqtt://127.0.0.1:1883")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -60,10 +67,10 @@ func main() {
 		}),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	if err := cli.Connect(ctx); err != nil {
-		panic(err)
+		return err
 	}
 	defer func() {
 		shutdown, c := context.WithTimeout(context.Background(), 5*time.Second)
@@ -72,6 +79,7 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	return nil
 }
 
 func envOr(k, def string) string {

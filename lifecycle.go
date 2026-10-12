@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ashtonian/mqttv5/internal/inflight"
@@ -18,8 +19,10 @@ import (
 )
 
 // Connect performs the initial CONNECT/CONNACK handshake (bounded
-// by ctx) and starts the supervisor. Reconnect attempts run on
-// internal background contexts until [Client.Disconnect]. With
+// by ctx) and starts the supervisor. With [WithBrokers] it tries each
+// broker once, from a random one on, and fails only when none accepts,
+// with every broker's error. Reconnect attempts run on internal
+// background contexts until [Client.Disconnect]. With
 // [WithRetryInitialConnect] a failed handshake is retried the same way
 // and Connect returns nil; see [Client.AwaitConnection]. Returns
 // [ErrAlreadyConnected] when called twice without an intervening
@@ -123,21 +126,13 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 		}
 	}
 
-	brokerURL := c.nextBrokerURL()
-	result, err := c.connectOnce(ctx, brokerURL, cleanStart)
+	result, err := c.connectFirst(ctx, life, cleanStart)
 	connected := err == nil
 	if connected {
 		if err = c.runConnection(life, result); err != nil {
 			return err
 		}
 	} else {
-		if ended := life.endedErr(); ended != nil {
-			// The teardown cut the attempt short.
-			return ended
-		}
-		c.stats.addConnectFailure()
-		c.redirectFrom(err)
-		c.connectError(err)
 		if !c.cfg.RetryInitialConnect {
 			return err
 		}
@@ -149,8 +144,7 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 			}
 			return err
 		}
-		c.cfg.Logger.Warn("mqttv5: initial connect failed; retrying in the background",
-			slog.String("broker", brokerURL), slog.Any("error", err))
+		c.cfg.Logger.Warn("mqttv5: initial connect failed; retrying in the background", slog.Any("error", err))
 	}
 
 	if c.pool != nil {
@@ -448,6 +442,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				}
 			}
 			info := parseConnack(p, sent)
+			info.Broker = brokerURL
 			p.Release()
 			if !interrupt() {
 				// ctx ended as the CONNACK arrived.
@@ -756,7 +751,7 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 		c.brokerIdx.Add(1)
 		attempt++
 
-		brokerURL := c.nextBrokerURL()
+		brokerURL, _ := c.nextBrokerURL()
 		if fn := c.cfg.OnReconnectAttempt; fn != nil {
 			c.events.post(func() { fn(attempt, brokerURL) })
 			if !c.events.flush(life.shutdown) {
@@ -886,4 +881,188 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, cleanStart bool)
 	}
 	_, err := wire.WriteConnect(w, opts)
 	return opts, err
+}
+
+// events runs the lifecycle callbacks one at a time, in the order they
+// were posted, on a goroutine that exists while there are callbacks to
+// run. Nothing the client does waits on a callback without also watching
+// for its span to end, so a callback may call Disconnect or Connect.
+type events struct {
+	mu      sync.Mutex
+	pending []func()
+	running bool
+}
+
+// post queues fn to run after every callback posted before it.
+func (q *events) post(fn func()) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pending = append(q.pending, fn)
+	if !q.running {
+		q.running = true
+		go q.run()
+	}
+}
+
+func (q *events) run() {
+	for {
+		q.mu.Lock()
+		if len(q.pending) == 0 {
+			q.pending = nil
+			q.running = false
+			q.mu.Unlock()
+			return
+		}
+		fn := q.pending[0]
+		q.pending[0] = nil
+		q.pending = q.pending[1:]
+		q.mu.Unlock()
+		fn()
+	}
+}
+
+// flush waits until every callback posted before it has run and reports
+// true, or reports false once stop is closed.
+func (q *events) flush(stop <-chan struct{}) bool {
+	q.mu.Lock()
+	if !q.running {
+		q.mu.Unlock()
+		return true
+	}
+	done := make(chan struct{})
+	q.pending = append(q.pending, func() { close(done) })
+	q.mu.Unlock()
+	select {
+	case <-done:
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+// ServerRedirect is a broker's request that the client use another
+// server (§4.11): a CONNACK or DISCONNECT with reason 0x9C Use another
+// server or 0x9D Server moved, carrying a Server Reference.
+type ServerRedirect struct {
+	Packet    PacketType // CONNACK or DISCONNECT
+	Reason    ReasonCode
+	Reference string // as the broker sent it
+}
+
+// Permanent reports a move (0x9D Server moved) rather than a temporary
+// redirection (0x9C Use another server).
+func (r ServerRedirect) Permanent() bool { return r.Reason == ReasonServerMoved }
+
+// connectFirst makes a span's first connection. It makes one attempt
+// per listed broker, starting from the current one, so that Connect
+// fails only when none of them accepts; a redirect it follows takes one
+// of those attempts. Each failure is counted and reported as a reconnect
+// failure is, and the brokers' errors are joined, each naming its
+// broker.
+func (c *Client) connectFirst(ctx context.Context, life *lifecycle, cleanStart bool) (*connectResult, error) {
+	attempts := len(*c.brokerURLs.Load())
+	var errs []error
+	fromList := false
+	for i := range attempts {
+		if i > 0 {
+			// A callback may change the brokers, as in redial.
+			if !c.events.flush(ctx.Done()) {
+				break
+			}
+			if fromList {
+				c.brokerIdx.Add(1)
+			}
+		}
+		brokerURL, redirected := c.nextBrokerURL()
+		fromList = !redirected
+		result, err := c.connectOnce(ctx, brokerURL, cleanStart)
+		if err == nil {
+			return result, nil
+		}
+		if ended := life.endedErr(); ended != nil {
+			// The teardown cut the attempt short.
+			return nil, ended
+		}
+		c.stats.addConnectFailure()
+		c.redirectFrom(err)
+		c.connectError(err)
+		if attempts == 1 {
+			return nil, err
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", brokerURL, err))
+		if ctx.Err() != nil {
+			break
+		}
+		if i+1 < attempts {
+			c.cfg.Logger.Warn("mqttv5: connect failed; trying the next broker",
+				slog.String("broker", brokerURL), slog.Any("error", err))
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+// nextBrokerURL is the URL the next connection attempt dials: a pending
+// temporary redirect, once, else the current entry of the broker list.
+func (c *Client) nextBrokerURL() (url string, redirected bool) {
+	if u := c.redirectOnce.Swap(nil); u != nil {
+		return *u, true
+	}
+	return c.currentBrokerURL(), false
+}
+
+// redirectFrom handles a CONNACK refusal that redirects.
+func (c *Client) redirectFrom(err error) {
+	var rce *ReasonCodeError
+	if errors.As(err, &rce) && rce.Packet == CONNACK {
+		c.redirect(ServerRedirect{Packet: CONNACK, Reason: rce.Code, Reference: rce.ServerReference})
+	}
+}
+
+// redirect reports r and, with WithFollowServerRedirects, points the
+// next connection at its reference: a move replaces the broker list, a
+// temporary redirection applies to the next attempt only.
+func (c *Client) redirect(r ServerRedirect) {
+	if r.Reference == "" || (r.Reason != ReasonUseAnotherServer && r.Reason != ReasonServerMoved) {
+		return
+	}
+	if fn := c.cfg.OnServerRedirect; fn != nil {
+		c.events.post(func() { fn(r) })
+	}
+	if !c.cfg.FollowServerRedirects {
+		return
+	}
+	target, err := resolveServerReference(c.currentBrokerURL(), r.Reference)
+	if err == nil {
+		err = validateBrokerURLs([]string{target}, c.cfg.DialFunc != nil)
+	}
+	if err != nil {
+		c.cfg.Logger.Warn("mqttv5: ignoring a server redirect", slog.String("reference", r.Reference), slog.Any("error", err))
+		return
+	}
+	c.cfg.Logger.Info("mqttv5: following a server redirect", slog.String("to", target), slog.Bool("permanent", r.Permanent()))
+	if r.Permanent() {
+		_ = c.SetBrokers(target)
+		return
+	}
+	c.redirectOnce.Store(&target)
+}
+
+// resolveServerReference turns a Server Reference into a broker URL.
+// MQTT leaves its format open (§4.11): a full URL is used as is; a host
+// or host:port keeps the scheme and path of current. Of several
+// space-separated references the first is used.
+func resolveServerReference(current, ref string) (string, error) {
+	ref, _, _ = strings.Cut(strings.TrimSpace(ref), " ")
+	if strings.Contains(ref, "://") {
+		return ref, nil
+	}
+	u, err := url.Parse(current)
+	if err != nil {
+		return "", err
+	}
+	if ref == "" || strings.ContainsAny(ref, "/?#@") {
+		return "", fmt.Errorf("server reference %q is not a host or host:port", ref)
+	}
+	u.Host = ref
+	return u.String(), nil
 }

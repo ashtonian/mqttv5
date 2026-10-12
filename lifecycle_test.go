@@ -5,22 +5,172 @@ package mqttv5
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ashtonian/mqttv5/internal/clock"
 	"github.com/ashtonian/mqttv5/internal/testbroker"
 	"github.com/ashtonian/mqttv5/session"
+	"github.com/ashtonian/mqttv5/transport"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
+func TestClientConnect(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+		// Hold the connection open so the read loop is happy.
+		<-fb.Done()
+	})
+
+	cli, err := New(WithBroker(fb.URL()), WithClientID("test-client"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if !cli.Connected() {
+		t.Fatal("Connected() = false after Connect")
+	}
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if cli.Connected() {
+		t.Fatal("Connected() = true after Disconnect")
+	}
+}
+
+func TestClientConnectRefused(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		pkt, err := dec.ReadPacket()
+		if err != nil {
+			return
+		}
+		pkt.Release()
+		_, _ = wire.WriteConnack(c, wire.ConnackOpts{
+			ReasonCode: wire.ReasonBanned,
+		})
+	})
+
+	cli, _ := New(WithBroker(fb.URL()))
+	err := cli.Connect(context.Background())
+	if !errors.Is(err, ErrConnectRefused) {
+		t.Fatalf("got %v, want ErrConnectRefused", err)
+	}
+}
+
+func TestClientDoubleConnect(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+		<-fb.Done()
+	})
+
+	cli, _ := New(WithBroker(fb.URL()))
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	err := cli.Connect(context.Background())
+	if !errors.Is(err, ErrAlreadyConnected) {
+		t.Fatalf("got %v, want ErrAlreadyConnected", err)
+	}
+}
+
+func TestDialFailure(t *testing.T) {
+	cli, _ := New(WithBroker("mqtt://127.0.0.1:1"), WithConnectTimeout(200*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := cli.Connect(ctx); err == nil {
+		t.Fatal("expected dial failure")
+	}
+}
+
+func TestOnServerDisconnect(t *testing.T) {
+	// Broker accepts the CONNECT, then immediately sends a
+	// DISCONNECT with ServerMoved + ServerReference so the test can
+	// verify both the callback firing and the ability to redirect
+	// via SetBrokers.
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+		_, _ = wire.WriteDisconnect(c, wire.DisconnectOpts{
+			ReasonCode:      wire.ReasonServerMoved,
+			ServerReference: "mqtt://elsewhere.example:1883",
+			ReasonString:    "moved",
+		})
+		<-fb.Done()
+	})
+
+	var (
+		got      atomic.Pointer[DisconnectInfo]
+		fired    atomic.Int32
+		callDone = make(chan struct{}, 1)
+	)
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithClientID("server-disco-test"),
+		WithOnServerDisconnect(func(d DisconnectInfo) {
+			got.Store(&d)
+			fired.Add(1)
+			select {
+			case callDone <- struct{}{}:
+			default:
+			}
+		}),
+		// Tight backoff so the supervisor races to reconnect, which
+		// we don't want — fail any further dial since we redirected
+		// to a bogus address. The test only cares about the first
+		// callback firing.
+		WithReconnectBackoff(ConstantBackoff(50*time.Millisecond)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	select {
+	case <-callDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnServerDisconnect callback not fired")
+	}
+
+	d := got.Load()
+	if d == nil {
+		t.Fatal("callback received nil")
+	}
+	if d.ReasonCode != wire.ReasonServerMoved {
+		t.Fatalf("ReasonCode = 0x%02X, want ReasonServerMoved", byte(d.ReasonCode))
+	}
+	if d.ServerReference != "mqtt://elsewhere.example:1883" {
+		t.Fatalf("ServerReference = %q, want elsewhere", d.ServerReference)
+	}
+	if fired.Load() != 1 {
+		t.Fatalf("callback fired %d times, want 1", fired.Load())
+	}
+}
+
 func TestOnConnectionUpReceivesConnack(t *testing.T) {
 	maxQoS := byte(1)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		defer c.Close()
 		dec := wire.NewDecoder(c)
 		pkt, _ := dec.ReadPacket()
@@ -72,8 +222,8 @@ func TestOnConnectionUpReceivesConnack(t *testing.T) {
 func TestOnConnectErrorFiresOnFailedReconnect(t *testing.T) {
 	first := atomic.Bool{}
 	var fbMu sync.Mutex
-	var fbRef *fakeBroker
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	var fbRef *testbroker.Broker
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		dec := wire.NewDecoder(c)
 		pkt, _ := dec.ReadPacket()
 		if pkt != nil {
@@ -125,7 +275,7 @@ func TestOnConnectErrorFiresOnFailedReconnect(t *testing.T) {
 }
 
 func TestOnConnectionDownReturnFalseStopsSupervisor(t *testing.T) {
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		dec := wire.NewDecoder(c)
 		pkt, _ := dec.ReadPacket()
 		if pkt != nil {
@@ -176,7 +326,7 @@ func TestOnConnectionDownReturnFalseStopsSupervisor(t *testing.T) {
 
 func TestCleanStartOnReconnect(t *testing.T) {
 	cleanStarts := make(chan bool, 4)
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		defer c.Close()
 		dec := wire.NewDecoder(c)
 		pkt, err := dec.ReadPacket()
@@ -231,7 +381,7 @@ func TestCleanStartOnReconnect(t *testing.T) {
 
 func TestWithoutKeepAliveDisablesPingLoop(t *testing.T) {
 	sink := make(chan *wire.Connect, 1)
-	fb := newFakeBroker(t, connectInspector(t, sink, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess}))
+	fb := testbroker.NewRaw(t, connectInspector(t, sink, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess}))
 
 	cli, err := New(WithBroker(fb.URL()), WithoutKeepAlive())
 	if err != nil {
@@ -265,7 +415,7 @@ func TestWithKeepAliveZeroRejected(t *testing.T) {
 // supervisor reset.
 func TestDisconnectThenConnectCleanCycle(t *testing.T) {
 	connCount := atomic.Int32{}
-	fb := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		defer c.Close()
 		dec := wire.NewDecoder(c)
 		pkt, _ := dec.ReadPacket()
@@ -312,10 +462,10 @@ func TestDisconnectThenConnectCleanCycle(t *testing.T) {
 // member identity through the callback today).
 func TestClientGroupCallbacksFirePerMember(t *testing.T) {
 	const memberCount = 3
-	brokers := make([]*fakeBroker, memberCount)
+	brokers := make([]*testbroker.Broker, memberCount)
 	urls := make([]string, memberCount)
 	for i := range memberCount {
-		brokers[i] = newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+		brokers[i] = testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 			defer c.Close()
 			dec := wire.NewDecoder(c)
 			pkt, _ := dec.ReadPacket()
@@ -331,7 +481,7 @@ func TestClientGroupCallbacksFirePerMember(t *testing.T) {
 	var upCount atomic.Int32
 	members := make([]GroupMember, memberCount)
 	for i, u := range urls {
-		members[i] = GroupMember{Broker: u}
+		members[i] = GroupMember{Brokers: []string{u}}
 	}
 	group, err := NewClientGroup(members,
 		WithGroupSharedOpts(
@@ -363,7 +513,7 @@ func TestClientGroupCallbacksFirePerMember(t *testing.T) {
 // new broker on the next attempt.
 func TestSetBrokersAfterServerMoved(t *testing.T) {
 	moved := atomic.Bool{}
-	target := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	target := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		defer c.Close()
 		dec := wire.NewDecoder(c)
 		pkt, _ := dec.ReadPacket()
@@ -375,7 +525,7 @@ func TestSetBrokersAfterServerMoved(t *testing.T) {
 		<-fb.Done()
 	})
 
-	origin := newFakeBroker(t, func(fb *fakeBroker, c net.Conn) {
+	origin := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
 		defer c.Close()
 		dec := wire.NewDecoder(c)
 		pkt, _ := dec.ReadPacket()
@@ -741,4 +891,1286 @@ func TestDisconnectWaitsForAConnectBindingItsConnection(t *testing.T) {
 	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("after")}); err != nil {
 		t.Fatalf("QoS 1 on the next span: %v", err)
 	}
+}
+
+// connectInspector returns a raw testbroker handler that captures the first
+// CONNECT packet's decoded form into the returned channel. After
+// CONNACK, the connection is held open until the broker is closed so
+// the test can run normal lifecycle teardown.
+func connectInspector(t *testing.T, sink chan<- *wire.Connect, connack wire.ConnackOpts) func(*testbroker.Broker, net.Conn) {
+	return func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		pkt, err := dec.ReadPacket()
+		if err != nil {
+			t.Errorf("CONNECT read: %v", err)
+			return
+		}
+		conn, ok := pkt.(*wire.Connect)
+		if !ok {
+			t.Errorf("got %s, want CONNECT", pkt.Type())
+			pkt.Release()
+			return
+		}
+		sink <- conn
+		if _, err := wire.WriteConnack(c, connack); err != nil {
+			t.Errorf("CONNACK write: %v", err)
+			return
+		}
+		<-fb.Done()
+	}
+}
+
+func TestConnectExposesV5Properties(t *testing.T) {
+	sink := make(chan *wire.Connect, 1)
+	fb := testbroker.NewRaw(t, connectInspector(t, sink, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess}))
+
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithClientID("connect-props-test"),
+		WithMaximumPacketSize(1024*1024),
+		WithInboundTopicAliasMaximum(32),
+		WithRequestResponseInformation(true),
+		WithRequestProblemInformation(true),
+		WithConnectUserProperty("tenant", "acme"),
+		WithConnectUserProperty("region", "us-east-1"),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	conn := <-sink
+	defer conn.Release()
+
+	maxSize, ok := conn.Properties.Uint32(wire.PropMaximumPacketSize)
+	if !ok || maxSize != 1024*1024 {
+		t.Errorf("MaximumPacketSize = (%d, %v), want (1048576, true)", maxSize, ok)
+	}
+	aliasMax, ok := conn.Properties.Uint16(wire.PropTopicAliasMaximum)
+	if !ok || aliasMax != 32 {
+		t.Errorf("TopicAliasMaximum = (%d, %v), want (32, true)", aliasMax, ok)
+	}
+	rri, ok := conn.Properties.Byte(wire.PropRequestResponseInfo)
+	if !ok || rri != 1 {
+		t.Errorf("RequestResponseInformation = (%d, %v), want (1, true)", rri, ok)
+	}
+	// Requested (the default): the property is omitted, which means 1.
+	if rpi, ok := conn.Properties.Byte(wire.PropRequestProblemInfo); ok && rpi != 1 {
+		t.Errorf("RequestProblemInformation = %d, want absent or 1", rpi)
+	}
+	props := map[string]string{}
+	for k, v := range conn.Properties.UserProperties() {
+		props[k] = v
+	}
+	if props["tenant"] != "acme" || props["region"] != "us-east-1" {
+		t.Errorf("UserProperties = %+v, want tenant=acme region=us-east-1", props)
+	}
+}
+
+func TestConnectPacketBuilderMutates(t *testing.T) {
+	sink := make(chan *wire.Connect, 1)
+	fb := testbroker.NewRaw(t, connectInspector(t, sink, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess}))
+
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithClientID("from-config"),
+		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
+			opts.Username = "from-builder"
+			opts.Password = []byte("rotated-token")
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	conn := <-sink
+	defer conn.Release()
+	if conn.Username != "from-builder" {
+		t.Errorf("Username = %q, want from-builder", conn.Username)
+	}
+	if string(conn.Password) != "rotated-token" {
+		t.Errorf("Password = %q, want rotated-token", conn.Password)
+	}
+}
+
+func TestConnectPacketBuilderErrorFailsAttempt(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		_, _ = c.Read(make([]byte, 64))
+	})
+	wantErr := errors.New("builder rejected the attempt")
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
+			return wantErr
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = cli.Connect(context.Background())
+	if err == nil {
+		t.Fatal("Connect succeeded but ConnectPacketBuilder returned an error")
+	}
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Errorf("Connect err = %v, want one wrapping %v", err, wantErr)
+	}
+}
+
+// TestConnectPacketBuilderRotatesCredentialsAcrossAttempts verifies the
+// headline use case the godoc advertises: a builder that returns a
+// fresh credential per attempt should produce distinct CONNECT
+// Username values across reconnects.
+func TestConnectPacketBuilderRotatesCredentialsAcrossAttempts(t *testing.T) {
+	captured := make(chan string, 8)
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		pkt, err := dec.ReadPacket()
+		if err != nil {
+			return
+		}
+		conn, ok := pkt.(*wire.Connect)
+		if !ok {
+			pkt.Release()
+			return
+		}
+		// conn.Username aliases the pooled frame buffer; clone so the
+		// string survives Release + frame reuse on the next CONNECT.
+		username := strings.Clone(conn.Username)
+		conn.Release()
+		captured <- username
+		_, _ = wire.WriteConnack(c, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess})
+		// Drop quickly so the supervisor reconnects.
+		time.Sleep(10 * time.Millisecond)
+	})
+
+	var counter atomic.Int32
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
+		WithConnectTimeout(200*time.Millisecond),
+		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
+			n := counter.Add(1)
+			opts.Username = fmt.Sprintf("token-%d", n)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	seen := map[string]bool{}
+	deadline := time.After(3 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case u := <-captured:
+			seen[u] = true
+		case <-deadline:
+			t.Fatalf("captured %d distinct usernames in 3s, want >= 2; seen=%v",
+				len(seen), seen)
+		}
+	}
+	if !seen["token-1"] {
+		keys := make([]string, 0, len(seen))
+		for k := range seen {
+			keys = append(keys, fmt.Sprintf("%q", k))
+		}
+		t.Errorf("first attempt didn't carry token-1; keys=%v", keys)
+	}
+}
+
+func TestValidateBrokerURLsRejectsBad(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"empty", ""},
+		{"no scheme", "broker.example:1883"},
+		{"unsupported scheme", "http://broker.example:1883"},
+		{"missing host", "mqtt://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New(WithBroker(tc.url))
+			if err == nil {
+				t.Fatalf("New(WithBroker(%q)) succeeded; want error", tc.url)
+			}
+		})
+	}
+}
+
+func TestValidateBrokerURLsAllowsDialFuncScheme(t *testing.T) {
+	dialFn := func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+		return nil, errors.New("not used")
+	}
+	_, err := New(
+		WithBroker("custom://anything"),
+		WithDialFunc(dialFn),
+	)
+	if err != nil {
+		t.Fatalf("New with custom scheme + DialFunc: %v", err)
+	}
+}
+
+func TestWithDialFuncNilRejected(t *testing.T) {
+	_, err := New(
+		WithBroker("mqtt://127.0.0.1:1"),
+		WithDialFunc(nil),
+	)
+	if err == nil {
+		t.Fatal("WithDialFunc(nil) accepted; want error")
+	}
+	if !strings.Contains(err.Error(), "nil") {
+		t.Errorf("err = %v, want mention of nil", err)
+	}
+}
+
+// TestClientIDReportsAssignedID verifies that Client.ClientID()
+// returns the broker-assigned identifier from CONNACK when the
+// caller passed WithClientID("").
+func TestClientIDReportsAssignedID(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		pkt, _ := dec.ReadPacket()
+		if pkt != nil {
+			pkt.Release()
+		}
+		_, _ = wire.WriteConnack(c, wire.ConnackOpts{
+			ReasonCode:               wire.ReasonSuccess,
+			AssignedClientIdentifier: "broker-assigned-xyz",
+		})
+		<-fb.Done()
+	})
+
+	cli, err := New(WithBroker(fb.URL()), WithClientID(""))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cli.ClientID() == "broker-assigned-xyz" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("ClientID() = %q, want broker-assigned-xyz", cli.ClientID())
+}
+
+// With WithRetryInitialConnect a client starts while the
+// broker refuses it and connects once the broker accepts.
+func TestRetryInitialConnect(t *testing.T) {
+	refuse := func(c *testbroker.Conn) { c.Close() }
+	b := testbroker.New(t, refuse, refuse, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	var failures int
+	cli, err := New(WithBroker(b.URL()), WithClientID("retry"), WithLogger(quietLogger()),
+		WithReconnectBackoff(ConstantBackoff(10*time.Millisecond)), WithRetryInitialConnect(),
+		WithOnConnectError(func(error) { failures++ }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatalf("Connect with the broker refusing: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	if err := cli.AwaitConnection(ctx); err != nil {
+		t.Fatalf("AwaitConnection: %v", err)
+	}
+	if failures != 2 {
+		t.Fatalf("%d connect errors reported, want 2", failures)
+	}
+	if _, _, err := cli.Subscribe(ctx, []TopicFilter{{Topic: "up"}}); err != nil {
+		t.Fatalf("Subscribe once connected: %v", err)
+	}
+}
+
+// Without the option Connect fails fast, as before.
+func TestInitialConnectFailsFast(t *testing.T) {
+	b := testbroker.New(t, func(c *testbroker.Conn) { c.Close() })
+	cli, err := New(WithBroker(b.URL()), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded against a refusing broker")
+	}
+	if cli.Connected() {
+		t.Fatal("client reports connected")
+	}
+}
+
+// AwaitConnection ends with ErrClosed when the client is disconnected
+// while it waits, and with ctx.
+func TestAwaitConnectionEnds(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) { c.Close() })
+	cli, err := New(WithBroker(b.URL()), WithLogger(quietLogger()), WithRetryInitialConnect(),
+		WithReconnectBackoff(ConstantBackoff(10*time.Millisecond)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := cli.AwaitConnection(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AwaitConnection = %v, want the deadline", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cli.AwaitConnection(context.Background()) }()
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("AwaitConnection = %v, want ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AwaitConnection still waiting after Disconnect")
+	}
+}
+
+// TestDisconnectWithCarriesOpts verifies the DisconnectWith path sends
+// the supplied DisconnectOpts on the wire (reason code + ReasonString
+// + SessionExpiryInterval override).
+func TestDisconnectWithCarriesOpts(t *testing.T) {
+	got := make(chan *wire.Disconnect, 1)
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		pkt, _ := dec.ReadPacket()
+		if pkt != nil {
+			pkt.Release()
+		}
+		_, _ = wire.WriteConnack(c, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess})
+		for {
+			pkt, err := dec.ReadPacket()
+			if err != nil {
+				return
+			}
+			if d, ok := pkt.(*wire.Disconnect); ok {
+				got <- d.Clone()
+				pkt.Release()
+				return
+			}
+			pkt.Release()
+		}
+	})
+
+	cli, err := New(WithBroker(fb.URL()))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	expiry := uint32(0)
+	if err := cli.DisconnectWith(context.Background(), DisconnectOptions{
+		ReasonCode:            wire.ReasonAdministrativeAction,
+		ReasonString:          "test teardown",
+		SessionExpiryInterval: &expiry,
+	}); err != nil {
+		t.Fatalf("DisconnectWith: %v", err)
+	}
+
+	select {
+	case d := <-got:
+		if d.ReasonCode != wire.ReasonAdministrativeAction {
+			t.Errorf("ReasonCode = 0x%02X, want 0x%02X",
+				byte(d.ReasonCode), byte(wire.ReasonAdministrativeAction))
+		}
+		rs, _ := d.Properties.String(wire.PropReasonString)
+		if rs != "test teardown" {
+			t.Errorf("ReasonString = %q, want test teardown", rs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker never received DISCONNECT")
+	}
+}
+
+// Callbacks run one at a time in the order posted, and flush waits for
+// those posted before it unless stop closes first.
+func TestEventsRunInOrder(t *testing.T) {
+	var q events
+	var got []int
+	held := make(chan struct{})
+	q.post(func() { <-held })
+	for i := range 100 {
+		q.post(func() { got = append(got, i) })
+	}
+	stop := make(chan struct{})
+	close(stop)
+	if q.flush(stop) {
+		t.Fatal("flush reported the queue flushed while a callback was held")
+	}
+	close(held)
+	if !q.flush(nil) {
+		t.Fatal("flush did not complete")
+	}
+	for i, v := range got {
+		if v != i {
+			t.Fatalf("callback %d ran as %d", v, i)
+		}
+	}
+	if len(got) != 100 {
+		t.Fatalf("%d of 100 callbacks ran", len(got))
+	}
+}
+
+// Every lifecycle callback may call Disconnect: it returns, and the
+// client ends disconnected.
+func TestDisconnectFromALifecycleCallback(t *testing.T) {
+	refuse := func(rc wire.ReasonCode, ref string) testbroker.Script {
+		return func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{ReasonCode: rc, ServerReference: ref})
+		}
+	}
+	held := func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	}
+	drop := func(_ *testing.T, _ *Client, b *testbroker.Broker) { b.Conn(0, time.Second).Close() }
+	for _, tc := range []struct {
+		name     string
+		first    testbroker.Script // nil: the broker's default
+		fallback testbroker.Script
+		opts     func(stop func()) []Option
+		trigger  func(*testing.T, *Client, *testbroker.Broker)
+	}{
+		{name: "OnConnectionUp", opts: func(stop func()) []Option {
+			return []Option{WithOnConnectionUp(func(ConnackInfo) { stop() })}
+		}},
+		{name: "OnConnectionUp after a reconnect", first: held, trigger: drop, opts: func(stop func()) []Option {
+			var ups int
+			return []Option{WithOnConnectionUp(func(ConnackInfo) {
+				if ups++; ups == 2 {
+					stop()
+				}
+			})}
+		}},
+		{name: "OnConnectionDown", first: held, trigger: drop, opts: func(stop func()) []Option {
+			return []Option{WithOnConnectionDown(func() bool { stop(); return true })}
+		}},
+		{name: "OnServerDisconnect", first: func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{})
+			_ = c.Disconnect(wire.DisconnectOpts{ReasonCode: wire.ReasonServerShuttingDown})
+		}, opts: func(stop func()) []Option {
+			return []Option{WithOnServerDisconnect(func(DisconnectInfo) { stop() })}
+		}},
+		{name: "OnReconnectAttempt", first: held, trigger: drop, opts: func(stop func()) []Option {
+			return []Option{WithOnReconnectAttempt(func(int, string) { stop() })}
+		}},
+		{name: "OnConnectError", fallback: refuse(wire.ReasonNotAuthorized, ""), opts: func(stop func()) []Option {
+			return []Option{WithRetryInitialConnect(), WithOnConnectError(func(error) { stop() })}
+		}},
+		{name: "OnServerRedirect", fallback: refuse(wire.ReasonServerMoved, "127.0.0.1:1"), opts: func(stop func()) []Option {
+			return []Option{WithRetryInitialConnect(), WithOnServerRedirect(func(ServerRedirect) { stop() })}
+		}},
+		{name: "OnResubscribeError", first: func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{})
+			c.ServeSubscribe(-1)
+			<-c.Gone()
+		}, fallback: func(c *testbroker.Conn) {
+			c.AcceptConnect(wire.ConnackOpts{})
+			p := c.Expect(wire.SUBSCRIBE, 0)
+			_ = c.Suback(p.PacketID, wire.ReasonNotAuthorized)
+			c.ServeAuto()
+		}, trigger: func(t *testing.T, cli *Client, b *testbroker.Broker) {
+			if _, _, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "acl/#"}}); err != nil {
+				t.Fatal(err)
+			}
+			b.Conn(0, time.Second).Close()
+		}, opts: func(stop func()) []Option {
+			return []Option{WithOnResubscribeError(func(SubscriptionToken, error) { stop() })}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var scripts []testbroker.Script
+			if tc.first != nil {
+				scripts = append(scripts, tc.first)
+			}
+			b := testbroker.New(t, scripts...)
+			if tc.fallback != nil {
+				b.SetFallback(tc.fallback)
+			}
+			var cli *Client
+			var once sync.Once
+			stopped := make(chan error, 1)
+			stop := func() {
+				once.Do(func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					stopped <- cli.Disconnect(ctx)
+				})
+			}
+			opts := append([]Option{WithBroker(b.URL()), WithClientID("callback-" + t.Name()), WithoutKeepAlive(),
+				WithLogger(quietLogger()), WithReconnectBackoff(ConstantBackoff(10 * time.Millisecond))}, tc.opts(stop)...)
+			var err error
+			cli, err = New(opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := cli.Connect(ctx); err != nil && !errors.Is(err, ErrClosed) {
+				t.Fatalf("Connect: %v", err)
+			}
+			if tc.trigger != nil {
+				tc.trigger(t, cli, b)
+			}
+			select {
+			case err := <-stopped:
+				if err != nil {
+					t.Fatalf("Disconnect: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("Disconnect called from the callback did not return")
+			}
+			if cli.Connected() {
+				t.Fatal("connected after Disconnect")
+			}
+		})
+	}
+}
+
+// OnStoreFailure may start the client again from what the store holds.
+func TestConnectFromOnStoreFailure(t *testing.T) {
+	st := &phaseFailStore{MemoryStore: session.NewMemoryStore(), phase: session.AwaitPubcomp}
+	st.fail.Store(true)
+	b := testbroker.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var cli *Client
+	restarted := make(chan error, 1)
+	cli = tbClient(t, b, WithStore(st), WithOnStoreFailure(func(error) {
+		st.fail.Store(false)
+		restarted <- cli.Connect(ctx)
+	}))
+	if err := cli.Publish(ctx, PublishOptions{Topic: "s", QoS: 2, Payload: []byte("x")}); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("Publish returned %v, want the store failure", err)
+	}
+	select {
+	case err := <-restarted:
+		if err != nil {
+			t.Fatalf("Connect from OnStoreFailure: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Connect from OnStoreFailure did not return")
+	}
+	if err := cli.AwaitConnection(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// recordingLog keeps the messages logged at Warn and above.
+type recordingLog struct {
+	slog.Handler
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *recordingLog) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelWarn }
+
+func (h *recordingLog) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *recordingLog) logged(prefix string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range h.msgs {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// A teardown held up by a SubscribeCallback handler says so in the log,
+// and completes once the handler returns.
+func TestTeardownReportsAHandlerThatDoesNotReturn(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	log := &recordingLog{Handler: slog.Default().Handler()}
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeSubscribe(-1)
+		_ = c.Publish(wire.PublishOpts{Topic: "t", Payload: []byte("held")})
+		c.Hold(0)
+	})
+	cli, err := New(WithBroker(b.URL()), WithClientID("stall"), WithoutKeepAlive(), WithLogger(slog.New(log)), withClock(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	entered, held := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	t.Cleanup(release)
+	if _, err := cli.SubscribeCallback(ctx, []TopicFilter{{Topic: "t"}}, func(*Message) {
+		close(entered)
+		<-held
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	timers := clk.Pending()
+	stopped := make(chan error, 1)
+	go func() { stopped <- cli.Disconnect(ctx) }()
+	if !clk.WaitPending(timers+1, 5*time.Second) {
+		t.Fatal("the teardown did not start waiting for the handler")
+	}
+	clk.Advance(joinStallWarning)
+	const warning = "mqttv5: disconnect is waiting for a SubscribeCallback handler"
+	for deadline := time.Now().Add(5 * time.Second); !log.logged(warning); {
+		if time.Now().After(deadline) {
+			t.Fatal("no warning about the handler holding the teardown")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("Disconnect returned while the handler was running")
+	default:
+	}
+	release()
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReconnectAfterDrop simulates a broker that drops the connection
+// after the handshake on the first attempt and accepts the second.
+// Verifies the supervisor reconnects and Connected() returns true.
+// TestMultiBrokerFailover verifies the supervisor rotates through the
+// BrokerURLs list on reconnect. The first broker is dialled, drops the
+// connection, the supervisor advances to the second broker for the
+// next attempt.
+func TestMultiBrokerFailover(t *testing.T) {
+	connsA := atomic.Int32{}
+	connsB := atomic.Int32{}
+	acceptedOnB := make(chan struct{}, 1)
+
+	fbA := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		connsA.Add(1)
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+		// Drop right after the first CONNACK so the supervisor
+		// rotates to broker B for the next attempt.
+	})
+	fbB := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		connsB.Add(1)
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+		select {
+		case acceptedOnB <- struct{}{}:
+		default:
+		}
+		<-fb.Done()
+	})
+
+	cli, err := New(
+		WithBrokers(fbA.URL(), fbB.URL()),
+		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force initial pick to be A. brokerIdx.Load() % 2 must equal 0.
+	// Set to a known value then verify currentBrokerURL.
+	cli.brokerIdx.Store(0)
+	if cli.currentBrokerURL() != fbA.URL() {
+		t.Fatalf("currentBrokerURL = %q, want %q", cli.currentBrokerURL(), fbA.URL())
+	}
+
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	select {
+	case <-acceptedOnB:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("did not failover to broker B within 2s (connsA=%d connsB=%d)",
+			connsA.Load(), connsB.Load())
+	}
+	// ServerInfo names the broker the client failed over to.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if info, ok := cli.ServerInfo(); ok && info.Broker == fbB.URL() {
+			break
+		}
+		if time.Now().After(deadline) {
+			info, _ := cli.ServerInfo()
+			t.Fatalf("ServerInfo().Broker = %q, want %q", info.Broker, fbB.URL())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if cli.currentBrokerURL() != fbB.URL() {
+		t.Fatalf("after failover, currentBrokerURL = %q, want %q",
+			cli.currentBrokerURL(), fbB.URL())
+	}
+}
+
+// Connect moves past a broker that is down to the next one in the list.
+func TestConnectTriesEachBroker(t *testing.T) {
+	const down = "mqtt://127.0.0.1:1"
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		<-fb.Done()
+	})
+	failures := make(chan error, 4)
+	cli, err := New(
+		WithBrokers(down, fb.URL()),
+		WithStats(),
+		WithLogger(quietLogger()),
+		WithOnConnectError(func(err error) { failures <- err }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.brokerIdx.Store(0)
+
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	if info, _ := cli.ServerInfo(); info.Broker != fb.URL() {
+		t.Fatalf("ServerInfo().Broker = %q, want %q", info.Broker, fb.URL())
+	}
+	if n := cli.Stats().ConnectFailures; n != 1 {
+		t.Fatalf("ConnectFailures = %d, want 1", n)
+	}
+	select {
+	case err := <-failures:
+		if !isDialError(err) {
+			t.Fatalf("OnConnectError got %v, want a dial error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnConnectError not called for the broker that was down")
+	}
+}
+
+// When no broker accepts, Connect returns every broker's error.
+func TestConnectEveryBrokerFails(t *testing.T) {
+	const down = "mqtt://127.0.0.1:1"
+	refusing := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnectWith(t, c, wire.NewDecoder(c), wire.ConnackOpts{ReasonCode: wire.ReasonNotAuthorized})
+	})
+	cli, err := New(WithBrokers(down, refusing.URL()), WithStats(), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.brokerIdx.Store(0)
+
+	err = cli.Connect(context.Background())
+	if !isDialError(err) || !errors.Is(err, ErrNotAuthorized) {
+		t.Fatalf("Connect = %v, want both brokers' errors", err)
+	}
+	for _, u := range []string{down, refusing.URL()} {
+		if !strings.Contains(err.Error(), u) {
+			t.Fatalf("Connect error %q does not name %s", err, u)
+		}
+	}
+	if n := cli.Stats().ConnectFailures; n != 2 {
+		t.Fatalf("ConnectFailures = %d, want 2", n)
+	}
+}
+
+func isDialError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
+func TestReconnectAfterDrop(t *testing.T) {
+	connNum := atomic.Int32{}
+	secondAccepted := make(chan struct{}, 1)
+
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		n := connNum.Add(1)
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+		if n == 1 {
+			// Drop right after CONNACK.
+			return
+		}
+		select {
+		case secondAccepted <- struct{}{}:
+		default:
+		}
+		<-fb.Done()
+	})
+
+	cli, _ := New(
+		WithBroker(fb.URL()),
+		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
+	)
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	select {
+	case <-secondAccepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not reconnect within 2s")
+	}
+
+	// Give the runConnection a moment to update Connected().
+	deadline := time.Now().Add(time.Second)
+	for !cli.Connected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cli.Connected() {
+		t.Fatal("Connected() = false after reconnect")
+	}
+}
+
+// TestResubscribeOnReconnect verifies the supervisor re-issues
+// SUBSCRIBE after a reconnect so prior subscriptions remain active.
+func TestResubscribeOnReconnect(t *testing.T) {
+	subsSeen := make(chan uint16, 8)
+	connNum := atomic.Int32{}
+
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		n := connNum.Add(1)
+		dec := wire.NewDecoder(c)
+		acceptConnect(t, c, dec)
+
+		for {
+			pkt, err := dec.ReadPacket()
+			if err != nil {
+				return
+			}
+			if sub, ok := pkt.(*wire.Subscribe); ok {
+				subsSeen <- sub.PacketID
+				_, _ = wire.WriteSuback(c, wire.SubackOpts{
+					PacketID:    sub.PacketID,
+					ReasonCodes: []wire.ReasonCode{wire.ReasonGrantedQoS1},
+				})
+				pkt.Release()
+				if n == 1 {
+					return // drop after first SUBSCRIBE
+				}
+				continue
+			}
+			pkt.Release()
+		}
+	})
+
+	cli, _ := New(
+		WithBroker(fb.URL()),
+		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
+	)
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	if _, err := cli.SubscribeCallback(context.Background(),
+		[]TopicFilter{{Topic: "topic/x", QoS: 1}},
+		func(*Message) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// First subscribe.
+	select {
+	case <-subsSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker did not see initial SUBSCRIBE")
+	}
+
+	// After the drop + reconnect, resubscribeAll should re-issue the SUBSCRIBE.
+	select {
+	case <-subsSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("supervisor did not resubscribe after reconnect")
+	}
+}
+
+// TestReplayQoS1OnReconnect verifies that a QoS 1 publish in-flight
+// when the connection drops is resent with DUP=1 when the broker resumes
+// the session, and the original Publish() call completes successfully.
+func TestReplayQoS1OnReconnect(t *testing.T) {
+	connNum := atomic.Int32{}
+	publishesSeen := make(chan *publishSeen, 8)
+
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		n := connNum.Add(1)
+		dec := wire.NewDecoder(c)
+		acceptConnectWith(t, c, dec, wire.ConnackOpts{SessionPresent: n > 1})
+
+		for {
+			pkt, err := dec.ReadPacket()
+			if err != nil {
+				return
+			}
+			if pub, ok := pkt.(*wire.Publish); ok {
+				publishesSeen <- &publishSeen{
+					connNum: int(n),
+					id:      pub.PacketID,
+					dup:     pub.Dup,
+					topic:   string([]byte(pub.Topic)),
+				}
+				id := pub.PacketID
+				pkt.Release()
+				if n == 1 {
+					// First connection: read PUBLISH but DROP before PUBACK.
+					return
+				}
+				// Second connection: ACK the replay.
+				_, _ = wire.WritePuback(c, wire.PubRespOpts{PacketID: id})
+				continue
+			}
+			pkt.Release()
+		}
+	})
+
+	cli, _ := New(
+		WithBroker(fb.URL()),
+		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
+	)
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	pubDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		pubDone <- cli.Publish(ctx, PublishOptions{
+			Topic:   "events/important",
+			Payload: []byte("hello"),
+			QoS:     1,
+		})
+	}()
+
+	// First broker connection should see the PUBLISH (DUP=false).
+	first, err := waitForPublish(publishesSeen, 2*time.Second)
+	if err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	if first.connNum != 1 || first.dup {
+		t.Errorf("first publish: connNum=%d dup=%v (want 1, false)", first.connNum, first.dup)
+	}
+
+	// After reconnect, supervisor replays — DUP must be set.
+	second, err := waitForPublish(publishesSeen, 3*time.Second)
+	if err != nil {
+		t.Fatalf("replay publish: %v", err)
+	}
+	if second.connNum < 2 || !second.dup {
+		t.Errorf("replay: connNum=%d dup=%v (want >=2, true)", second.connNum, second.dup)
+	}
+	if second.id != first.id {
+		t.Errorf("replay packet id changed: first=%d replay=%d", first.id, second.id)
+	}
+
+	// The original Publish() call must complete with no error.
+	select {
+	case err := <-pubDone:
+		if err != nil {
+			t.Errorf("Publish() returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Publish() did not complete after replay+PUBACK")
+	}
+}
+
+// publishSeen is a per-connection record of a PUBLISH the broker saw.
+type publishSeen struct {
+	connNum int
+	id      uint16
+	dup     bool
+	topic   string
+}
+
+func waitForPublish(ch <-chan *publishSeen, d time.Duration) (*publishSeen, error) {
+	select {
+	case p := <-ch:
+		return p, nil
+	case <-time.After(d):
+		return nil, errors.New("timeout waiting for publish")
+	}
+}
+
+// silence unused-import linter warnings on future test additions
+var _ = io.EOF
+
+func TestResolveServerReference(t *testing.T) {
+	for _, tt := range []struct{ current, ref, want string }{
+		{"mqtts://a.example:8883", "b.example:9883", "mqtts://b.example:9883"},
+		{"mqtt://a.example", "b.example", "mqtt://b.example"},
+		{"ws://a.example/mqtt", "b.example:80", "ws://b.example:80/mqtt"},
+		{"mqtt://a.example", "mqtts://c.example:8883 d.example", "mqtts://c.example:8883"},
+		{"mqtt://a.example", " b.example c.example ", "mqtt://b.example"},
+	} {
+		if got, err := resolveServerReference(tt.current, tt.ref); err != nil || got != tt.want {
+			t.Errorf("resolve(%q, %q) = %q, %v; want %q", tt.current, tt.ref, got, err, tt.want)
+		}
+	}
+	for _, ref := range []string{"", "b.example/path", "user@b.example"} {
+		if got, err := resolveServerReference("mqtt://a.example", ref); err == nil {
+			t.Errorf("resolve(%q) = %q, want an error", ref, got)
+		}
+	}
+}
+
+func hostOf(b *testbroker.Broker) string { return strings.TrimPrefix(b.URL(), "mqtt://") }
+
+// 0x9D Server moved on CONNACK: the client follows and keeps the new
+// broker for later reconnects.
+func TestFollowServerMoved(t *testing.T) {
+	target := testbroker.New(t)
+	target.SetFallback(func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	origin := testbroker.New(t)
+	origin.SetFallback(func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{ReasonCode: wire.ReasonServerMoved, ServerReference: hostOf(target)})
+	})
+	var got []ServerRedirect
+	cli, err := New(WithBroker(origin.URL()), WithClientID("moved"), WithLogger(quietLogger()),
+		WithReconnectBackoff(ConstantBackoff(10*time.Millisecond)), WithRetryInitialConnect(),
+		WithFollowServerRedirects(), WithOnServerRedirect(func(r ServerRedirect) { got = append(got, r) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	if err := cli.AwaitConnection(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].Permanent() || got[0].Packet != CONNACK {
+		t.Fatalf("redirects reported %+v", got)
+	}
+	target.Conn(0, time.Second).Close()
+	if c := target.Conn(1, 3*time.Second); c == nil {
+		t.Fatal("the client did not reconnect to the broker it moved to")
+	}
+	if origin.Accepted() != 1 {
+		t.Fatalf("the client went back to the old broker (%d connections)", origin.Accepted())
+	}
+}
+
+// 0x9C Use another server on DISCONNECT: the next attempt only goes to
+// the reference.
+func TestFollowUseAnotherServerOnce(t *testing.T) {
+	other := testbroker.New(t)
+	other.SetFallback(func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	origin := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.Disconnect(wire.DisconnectOpts{ReasonCode: wire.ReasonUseAnotherServer, ServerReference: hostOf(other)})
+	})
+	origin.SetFallback(func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	cli := tbClient(t, origin, WithFollowServerRedirects())
+	if c := other.Conn(0, 3*time.Second); c == nil {
+		t.Fatal("the client did not use the other server")
+	}
+	if err := cli.AwaitConnection(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	other.Conn(0, 0).Close()
+	if c := origin.Conn(1, 3*time.Second); c == nil {
+		t.Fatal("after the temporary redirect the client did not return to its broker")
+	}
+}
+
+// Without WithFollowServerRedirects a redirect is reported, not followed.
+func TestServerRedirectReportedNotFollowed(t *testing.T) {
+	other := testbroker.New(t)
+	origin := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.Disconnect(wire.DisconnectOpts{ReasonCode: wire.ReasonServerMoved, ServerReference: hostOf(other)})
+	})
+	origin.SetFallback(func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	})
+	reported := make(chan ServerRedirect, 1)
+	tbClient(t, origin, WithOnServerRedirect(func(r ServerRedirect) { reported <- r }))
+	select {
+	case r := <-reported:
+		if r.Packet != DISCONNECT || r.Reference != hostOf(other) {
+			t.Fatalf("reported %+v", r)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("redirect not reported")
+	}
+	if c := origin.Conn(1, 3*time.Second); c == nil {
+		t.Fatal("the client did not reconnect to its own broker")
+	}
+	if other.Accepted() != 0 {
+		t.Fatal("the client followed the redirect")
+	}
+}
+
+// A client used every way there is — every subscription kind, every
+// QoS, a publisher pool, a QueuePublisher, Typed, a reconnect, and a
+// second Connect — leaves no goroutine behind once it is disconnected.
+func TestLifecycleLeavesNoGoroutines(t *testing.T) {
+	check := noLeaks(t)
+	b := testbroker.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cli, err := New(WithBroker(b.URL()), WithClientID("leak"), WithLogger(quietLogger()),
+		WithPublisherPool(2), WithStats(), WithReconnectBackoff(ConstantBackoff(10*time.Millisecond)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cycle := range 2 {
+		if err := cli.Connect(ctx); err != nil {
+			t.Fatalf("cycle %d: Connect: %v", cycle, err)
+		}
+		ch, _, err := cli.Subscribe(ctx, []TopicFilter{{Topic: "leak/chan", QoS: 1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for m := range ch {
+				_ = m.Ack()
+			}
+		}()
+		if _, _, err := cli.SubscribeQueue(ctx, []TopicFilter{{Topic: "leak/queue", QoS: 2}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cli.SubscribeCallback(ctx, []TopicFilter{{Topic: "leak/cb"}}, func(*Message) {}); err != nil {
+			t.Fatal(err)
+		}
+		typed := NewTyped(cli, testJSONCodec[string]{})
+		if _, _, err := typed.Subscribe(ctx, []TopicFilter{{Topic: "leak/typed"}}); err != nil {
+			t.Fatal(err)
+		}
+		for qos := byte(0); qos <= 2; qos++ {
+			if err := cli.Publish(ctx, PublishOptions{Topic: "leak/pub", QoS: qos, Payload: []byte("x")}); err != nil {
+				t.Fatalf("publish QoS %d: %v", qos, err)
+			}
+		}
+		qp, err := NewQueuePublisher(cli, NewMemoryPublisherQueue())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := qp.Publish(ctx, PublishOptions{Topic: "leak/queued", QoS: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := qp.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Drop the connections; the supervisors reconnect.
+		connects := cli.Stats().Connects
+		b.DropAll()
+		for cli.Stats().Connects == connects {
+			if ctx.Err() != nil {
+				t.Fatal("no reconnect after the drop")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err := cli.Disconnect(ctx); err != nil {
+			t.Fatalf("cycle %d: Disconnect: %v", cycle, err)
+		}
+	}
+	b.Close()
+	check()
+}
+
+// A client that never reaches its broker, and one whose supervisor
+// stops on OnConnectionDown, leave nothing behind either.
+func TestStoppedSupervisorsLeaveNoGoroutines(t *testing.T) {
+	t.Run("retrying initial connect", func(t *testing.T) {
+		check := noLeaks(t)
+		b := testbroker.New(t)
+		b.SetFallback(func(c *testbroker.Conn) { c.Close() })
+		cli, err := New(WithBroker(b.URL()), WithLogger(quietLogger()), WithRetryInitialConnect(),
+			WithReconnectBackoff(ConstantBackoff(5*time.Millisecond)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cli.Connect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond) // a few failed attempts
+		if err := cli.Disconnect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := cli.AwaitConnection(context.Background()); !errors.Is(err, ErrClosed) {
+			t.Fatalf("AwaitConnection after Disconnect: %v", err)
+		}
+		b.Close()
+		check()
+	})
+	t.Run("OnConnectionDown returns false", func(t *testing.T) {
+		check := noLeaks(t)
+		b := testbroker.New(t)
+		down := make(chan struct{})
+		cli, err := New(WithBroker(b.URL()), WithLogger(quietLogger()),
+			WithOnConnectionDown(func() bool { close(down); return false }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cli.Connect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "t"}}); err != nil {
+			t.Fatal(err)
+		}
+		b.DropAll()
+		<-down
+		b.Close()
+		check()
+	})
 }

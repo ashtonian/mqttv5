@@ -8,114 +8,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"slices"
-	"strings"
 	"sync/atomic"
 
 	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/internal/trie"
 	"github.com/ashtonian/mqttv5/wire"
 )
-
-// SubscribeResult is the broker's answer for one filter of a SUBSCRIBE.
-type SubscribeResult struct {
-	Filter TopicFilter
-	// Reason is the SUBACK reason code: 0x00–0x02 grant that QoS,
-	// 0x80 and above refuse the filter.
-	Reason wire.ReasonCode
-}
-
-// Granted reports whether the broker accepted the filter.
-func (r SubscribeResult) Granted() bool { return !r.Reason.IsError() }
-
-// QoS is the maximum QoS the broker granted; meaningful when Granted.
-func (r SubscribeResult) QoS() byte { return byte(r.Reason) }
-
-// SubscribeError reports filters the broker refused. Results holds the
-// outcome of every filter of the SUBSCRIBE. When some filters were
-// granted the subscription is active for those; when none were, its
-// channel or queue is closed.
-type SubscribeError struct {
-	Results []SubscribeResult
-}
-
-func (e *SubscribeError) Error() string {
-	var refused []string
-	for _, r := range e.Results {
-		if !r.Granted() {
-			refused = append(refused, fmt.Sprintf("%q (0x%02X %s)", r.Filter.Topic, byte(r.Reason), reasonName(r.Reason)))
-		}
-	}
-	return fmt.Sprintf("mqttv5: broker refused %d of %d filters: %s", len(refused), len(e.Results), strings.Join(refused, ", "))
-}
-
-// Is matches the sentinel of any refusal's reason code (see
-// [ReasonCodeError]).
-func (e *SubscribeError) Is(target error) bool {
-	for _, r := range e.Results {
-		if !r.Granted() && (&ReasonCodeError{Packet: wire.SUBACK, Code: r.Reason}).Is(target) {
-			return true
-		}
-	}
-	return false
-}
-
-// UnsubscribeResult is the broker's answer for one topic filter of an
-// UNSUBSCRIBE.
-type UnsubscribeResult struct {
-	Topic string
-	// Reason is the UNSUBACK reason code: 0x00 success, 0x11 there was no
-	// such subscription (not an error), 0x80 and above refused.
-	Reason wire.ReasonCode
-}
-
-// UnsubscribeError reports topic filters the broker refused to
-// unsubscribe. The local subscription is closed regardless; the broker
-// may keep delivering messages for them, which the client then drops.
-type UnsubscribeError struct {
-	Results []UnsubscribeResult
-}
-
-func (e *UnsubscribeError) Error() string {
-	var refused []string
-	for _, r := range e.Results {
-		if r.Reason.IsError() {
-			refused = append(refused, fmt.Sprintf("%q (0x%02X %s)", r.Topic, byte(r.Reason), reasonName(r.Reason)))
-		}
-	}
-	return "mqttv5: broker refused to unsubscribe " + strings.Join(refused, ", ")
-}
-
-// SubscriptionToken identifies a subscription for [Client.Unsubscribe]
-// and reports what the broker decided.
-type SubscriptionToken struct {
-	client *Client
-	sub    *activeSub
-}
-
-// Results returns the broker's answer per filter from the subscription's
-// SUBACK, or nil before it arrived.
-func (t SubscriptionToken) Results() []SubscribeResult {
-	if t.sub == nil {
-		return nil
-	}
-	t.client.subsMu.Lock()
-	defer t.client.subsMu.Unlock()
-	return slices.Clone(t.sub.results)
-}
-
-// Err reports why the subscription ended other than by Unsubscribe or
-// Disconnect: the broker refused every filter, initially or when the
-// client re-subscribed after a session loss. Nil while it is active.
-func (t SubscriptionToken) Err() error {
-	if t.sub == nil {
-		return nil
-	}
-	t.client.subsMu.Lock()
-	defer t.client.subsMu.Unlock()
-	return t.sub.err
-}
 
 type subState uint8
 
@@ -159,6 +60,11 @@ type brokerSub struct {
 	// messages with, oldest first: the one it holds and those of
 	// SUBSCRIBEs sent since (§3.3.4).
 	ids []uint32
+	// issued is every identifier given to this filter in the broker's
+	// current session, newest last, up to maxIssued: a message tagged
+	// with one the broker no longer uses is stale, while one tagged with
+	// none was sent for a subscription of an earlier process.
+	issued []uint32
 	// granted is set once a SUBACK granted the filter in the broker's
 	// current session. pending counts SUBSCRIBEs carrying the filter
 	// that were sent and whose answer is not yet applied. With neither,
@@ -169,10 +75,19 @@ type brokerSub struct {
 	view atomic.Pointer[subView] // read by the read loop
 }
 
+// maxIssued bounds brokerSub.issued.
+const maxIssued = 64
+
 // subView is an immutable snapshot of a brokerSub for routing.
 type subView struct {
 	ids    []uint32
+	issued []uint32
 	routes []*route
+}
+
+// issuedAny reports whether this client gave the subscription any of ids.
+func (v *subView) issuedAny(ids []uint32) bool {
+	return slices.ContainsFunc(ids, func(id uint32) bool { return slices.Contains(v.issued, id) })
 }
 
 // accepts reports whether a PUBLISH tagged with Subscription Identifiers
@@ -204,8 +119,8 @@ type ctrlOp struct {
 
 	topics []string // UNSUBSCRIBE
 	// UNSUBSCRIBE: identifiers of the subscriptions it removes, reserved
-	// until the broker confirms.
-	retired []uint32
+	// until the broker confirms, and every identifier those were issued.
+	retired, retiredIssued []uint32
 
 	// Guarded by Client.ctrlMu.
 	queued bool
@@ -271,34 +186,64 @@ func (c *Client) lockCtrl(ctx context.Context, stop <-chan struct{}) error {
 
 func (c *Client) unlockCtrl() { <-c.ctrlSem }
 
-// subscribe registers a subscription and sends its SUBSCRIBE, then waits
-// for the SUBACK across reconnects, ctx, or shutdown.
-func (c *Client) subscribe(ctx context.Context, filters []TopicFilter, r *route, onUnsub func()) (SubscriptionToken, error) {
-	cs := c.cur.Load()
-	if cs == nil {
-		return SubscriptionToken{}, ErrNotConnected
+// span returns the end of the running Connect…Disconnect span, or idle
+// when there is none: before Connect, or after Disconnect, when a
+// subscription is made for the next Connect.
+func (c *Client) span() (end <-chan struct{}, idle bool) {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	if !c.started {
+		return nil, true
 	}
+	return c.life.Load().shutdown, false
+}
+
+// lockCtrlFor takes ctrlSem for an operation in the span ending with
+// end, or, idle, for one made between spans, which no teardown stops.
+func (c *Client) lockCtrlFor(ctx context.Context, end <-chan struct{}, idle bool) error {
+	if !idle {
+		return c.lockCtrl(ctx, end)
+	}
+	select {
+	case c.ctrlSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// subscribe registers a subscription and queues its SUBSCRIBE. In a
+// running span it then waits for the SUBACK across reconnects, ctx, or
+// shutdown; between spans it returns at once, and the SUBSCRIBE goes
+// out on the next Connect's first connection.
+func (c *Client) subscribe(ctx context.Context, filters []TopicFilter, r *route, onUnsub func()) (SubscriptionToken, error) {
 	if len(filters) == 0 {
 		return SubscriptionToken{}, wire.ErrEmptyFilterList
 	}
 	if r == nil || r.deliver == nil {
 		return SubscriptionToken{}, ErrNilHandler
 	}
-	if err := checkFilterCapabilities(cs, filters); err != nil {
-		return SubscriptionToken{}, err
-	}
-	// Validate (and size-check) the packet before anything is
-	// registered; sendCtrl encodes it again with the real identifiers.
-	if _, err := c.encodeSubscribe(cs, 1, wire.MaxVarintValue, filters); err != nil {
+	// Validate the packet before anything is registered; sendCtrl
+	// encodes it again with the real identifiers, and checks it against
+	// the connection it goes out on.
+	if cs := c.cur.Load(); cs != nil {
+		if err := checkFilterCapabilities(cs, filters); err != nil {
+			return SubscriptionToken{}, err
+		}
+		if _, err := c.encodeSubscribe(cs, 1, wire.MaxVarintValue, filters); err != nil {
+			return SubscriptionToken{}, err
+		}
+	} else if _, err := wire.WriteSubscribe(io.Discard, wire.SubscribeOpts{PacketID: 1, Filters: wireFilters(filters)}); err != nil {
 		return SubscriptionToken{}, err
 	}
 
-	if err := c.lockCtrl(ctx, c.done()); err != nil {
+	end, idle := c.span()
+	if err := c.lockCtrlFor(ctx, end, idle); err != nil {
 		return SubscriptionToken{}, err
 	}
-	sub, op, err := c.addSub(filters, r, onUnsub)
+	sub, op, err := c.addSub(filters, r, onUnsub, end)
 	if err == nil {
-		err = c.flushCtrl(ctx, c.done())
+		err = c.flushCtrl(ctx, end)
 	}
 	c.unlockCtrl()
 	if sub == nil {
@@ -309,13 +254,16 @@ func (c *Client) subscribe(ctx context.Context, filters []TopicFilter, r *route,
 		c.abandon(sub)
 		return SubscriptionToken{}, err
 	}
+	if idle {
+		return SubscriptionToken{client: c, sub: sub}, nil
+	}
 
 	select {
 	case <-op.done:
 	case <-ctx.Done():
 		c.abandon(sub)
 		return SubscriptionToken{}, ctx.Err()
-	case <-c.done():
+	case <-end:
 		return SubscriptionToken{}, ErrClosed
 	}
 	if op.result.err != nil {
@@ -335,13 +283,14 @@ func (c *Client) subscribe(ctx context.Context, filters []TopicFilter, r *route,
 }
 
 // addSub registers a pending subscription and queues its SUBSCRIBE.
-// Routes go in first: a matching PUBLISH can arrive before the SUBACK.
-// The caller holds ctrlSem.
-func (c *Client) addSub(filters []TopicFilter, r *route, onUnsub func()) (*activeSub, *ctrlOp, error) {
+// Routes go in first: a matching PUBLISH can arrive before the SUBACK,
+// or, from a resumed session, right after the CONNACK. end is the
+// span's end, nil between spans. The caller holds ctrlSem.
+func (c *Client) addSub(filters []TopicFilter, r *route, onUnsub func(), end <-chan struct{}) (*activeSub, *ctrlOp, error) {
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
 	select {
-	case <-c.done():
+	case <-end:
 		return nil, nil, ErrClosed
 	default:
 	}
@@ -382,6 +331,10 @@ func (c *Client) queueSubscribeLocked(op *ctrlOp) {
 	for _, f := range op.filters {
 		bs := c.brokerSubs[f.Topic]
 		bs.ids = append(bs.ids, op.ident)
+		if len(bs.issued) == maxIssued {
+			bs.issued = slices.Delete(bs.issued, 0, 1)
+		}
+		bs.issued = append(bs.issued, op.ident)
 		c.identRefs[op.ident]++
 		c.publishLocked(bs)
 	}
@@ -425,7 +378,7 @@ func (c *Client) releaseIdentsLocked(ids ...uint32) {
 // publishLocked makes bs's current identifiers and holders visible to
 // the read loop.
 func (c *Client) publishLocked(bs *brokerSub) {
-	v := &subView{ids: slices.Clone(bs.ids)}
+	v := &subView{ids: slices.Clone(bs.ids), issued: slices.Clone(bs.issued)}
 	for _, h := range bs.holders {
 		if !slices.Contains(v.routes, h.route) {
 			v.routes = append(v.routes, h.route)
@@ -507,13 +460,53 @@ func (c *Client) settle() *ctrlOp {
 		}
 		op.topics = append(op.topics, filter)
 		op.retired = append(op.retired, bs.ids...)
+		op.retiredIssued = append(op.retiredIssued, bs.issued...)
 	}
 	if op == nil {
 		return nil
 	}
 	slices.Sort(op.topics)
+	c.retireLocked(op.retiredIssued)
 	c.enqueue(op)
 	return op
+}
+
+// retireLocked records ids as issued to broker subscriptions an
+// UNSUBSCRIBE is ending. The caller holds subsMu.
+func (c *Client) retireLocked(ids []uint32) {
+	if len(ids) == 0 {
+		return
+	}
+	var cur []uint32
+	if p := c.retiring.Load(); p != nil {
+		cur = *p
+	}
+	next := append(slices.Clone(cur), ids...)
+	c.retiring.Store(&next)
+}
+
+// unretireLocked releases the identifiers of an UNSUBSCRIBE that is
+// done. The caller holds subsMu.
+func (c *Client) unretireLocked(op *ctrlOp) {
+	c.releaseIdentsLocked(op.retired...)
+	p := c.retiring.Load()
+	if p == nil || len(op.retiredIssued) == 0 {
+		return
+	}
+	next := slices.Clone(*p)
+	for _, id := range op.retiredIssued {
+		if i := slices.Index(next, id); i >= 0 {
+			next = slices.Delete(next, i, i+1)
+		}
+	}
+	c.retiring.Store(&next)
+}
+
+// retired reports whether any of ids belongs to a broker subscription
+// an UNSUBSCRIBE is ending.
+func (c *Client) retired(ids []uint32) bool {
+	p := c.retiring.Load()
+	return p != nil && slices.ContainsFunc(ids, func(id uint32) bool { return slices.Contains(*p, id) })
 }
 
 // markSent records that op is about to be written, so it may reach
@@ -570,7 +563,8 @@ func (c *Client) Unsubscribe(ctx context.Context, token SubscriptionToken) error
 	if sub == nil {
 		return nil
 	}
-	if err := c.lockCtrl(ctx, c.done()); err != nil {
+	end, idle := c.span()
+	if err := c.lockCtrlFor(ctx, end, idle); err != nil {
 		return err
 	}
 	c.subsMu.Lock()
@@ -595,7 +589,7 @@ func (c *Client) Unsubscribe(ctx context.Context, token SubscriptionToken) error
 	if op != nil {
 		c.stats.addUnsubscribeSent()
 	}
-	err := c.flushCtrl(ctx, c.done())
+	err := c.flushCtrl(ctx, end)
 	c.unlockCtrl()
 	if err != nil {
 		return err
@@ -786,7 +780,7 @@ func (c *Client) resetSession() {
 	for _, op := range old {
 		switch {
 		case op.kind == wire.UNSUBSCRIBE:
-			c.releaseIdentsLocked(op.retired...)
+			c.unretireLocked(op)
 			finished = append(finished, finish{op, ctrlResult{codes: make([]wire.ReasonCode, len(op.topics))}})
 		case op.sub.state == subClosed:
 			finished = append(finished, finish{op, ctrlResult{err: ErrClosed}})
@@ -794,7 +788,7 @@ func (c *Client) resetSession() {
 	}
 	for filter, bs := range c.brokerSubs {
 		c.releaseIdentsLocked(bs.ids...)
-		bs.ids = nil
+		bs.ids, bs.issued = nil, nil
 		bs.granted, bs.pending = false, 0
 		if len(bs.holders) == 0 {
 			c.router.Unregister(bs.trieKey, bs.trieID)
@@ -834,6 +828,13 @@ func (c *Client) resetSession() {
 // packet. ErrNotConnected means cs went away first; op stays queued for
 // the next connection. A packet this connection cannot carry fails op.
 func (c *Client) sendCtrl(ctx context.Context, stop <-chan struct{}, cs *connState, op *ctrlOp) error {
+	if op.kind == wire.SUBSCRIBE {
+		// Queued before this connection's CONNACK said what it allows.
+		if err := checkFilterCapabilities(cs, op.filters); err != nil {
+			c.failCtrl(op, err)
+			return nil
+		}
+	}
 	id, err := c.engine.AllocateID(ctx, op.owner(), stop)
 	if errors.Is(err, inflight.ErrStopped) {
 		return ErrClosed
@@ -906,7 +907,7 @@ func (c *Client) failCtrl(op *ctrlOp, err error) {
 		c.untagLocked(op)
 		closeRoute = c.closeSubLocked(op.sub, err)
 	} else {
-		c.releaseIdentsLocked(op.retired...)
+		c.unretireLocked(op)
 	}
 	c.subsMu.Unlock()
 	if stale != 0 {
@@ -1094,7 +1095,7 @@ func (c *Client) reportResubscribeError(sub *activeSub, err error) {
 
 func (c *Client) completeUnsubscribe(op *ctrlOp, codes []wire.ReasonCode, rejected error) {
 	c.subsMu.Lock()
-	c.releaseIdentsLocked(op.retired...)
+	c.unretireLocked(op)
 	c.subsMu.Unlock()
 	op.complete(ctrlResult{codes: codes, err: rejected})
 }
@@ -1181,6 +1182,7 @@ func (c *Client) closeAllSubs() {
 	}
 	c.brokerSubs = make(map[string]*brokerSub)
 	c.identRefs = make(map[uint32]int)
+	c.retiring.Store(nil)
 	c.router.Reset()
 	c.subsMu.Unlock()
 

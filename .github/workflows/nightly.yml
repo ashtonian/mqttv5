@@ -95,6 +95,9 @@ jobs:
           MQTT_BROKER: ${{ matrix.broker.url }}
           MQTT_BROKER_2: ${{ matrix.broker.second }}
           MQTTV5_SOAK: ${{ inputs.soak || '10m' }}
+          # Records the soak's packets, so a broker's fault is told from
+          # the client's (conformance/README.md, Broker notes).
+          MQTTV5_SOAK_TRACE: "1"
         run: go test -tags conformance -race -count=1 -v -timeout 45m ./...
         working-directory: conformance
 

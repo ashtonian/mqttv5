@@ -6,19 +6,31 @@
 // Compare with the plain Disconnect path which always sends
 // ReasonNormalDisconnection with no properties.
 //
-//	MQTT_BROKER=mqtt://127.0.0.1:1883 go run ./examples/disconnect
+//	MQTT_BROKER=mqtt://127.0.0.1:1883 go -C examples run ./disconnect
 package main
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/ashtonian/mqttv5"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := run(ctx)
+	stop()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "disconnect:", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "mqtt://127.0.0.1:1883")
 
 	cli, err := mqttv5.New(
@@ -29,14 +41,14 @@ func main() {
 		mqttv5.WithSessionExpiry(3600),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	if err := cli.Connect(context.Background()); err != nil {
-		panic(err)
+	if err := cli.Connect(ctx); err != nil {
+		return err
 	}
 
 	// Do some work.
-	_ = cli.Publish(context.Background(), mqttv5.PublishOptions{
+	_ = cli.Publish(ctx, mqttv5.PublishOptions{
 		Topic:   "demo/disconnect",
 		Payload: []byte("about to leave"),
 		QoS:     1,
@@ -47,7 +59,7 @@ func main() {
 	// the broker's logs (when RequestProblemInformation was set on
 	// CONNECT — otherwise the broker is free to omit it).
 	expiry := uint32(0)
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := cli.DisconnectWith(shutdown, mqttv5.DisconnectOptions{
 		ReasonCode:            mqttv5.ReasonAdministrativeAction,
@@ -56,6 +68,7 @@ func main() {
 	}); err != nil {
 		fmt.Printf("disconnect err: %v\n", err)
 	}
+	return nil
 }
 
 func envOr(k, def string) string {

@@ -29,3 +29,16 @@ func queuePublisher() {
 
 	_ = pub.Publish(ctx, mqttv5.PublishOptions{Topic: "logs", Payload: data, QoS: 1})
 }
+
+func durableOutbox() {
+	st, _ := sfile.Open("/var/lib/gateway/session")
+	q, _ := qfile.Open("/var/lib/gateway/outbound")
+	cli, _ := mqttv5.New(
+		mqttv5.WithBrokers("mqtts://mqtt-1.example.com:8883", "mqtts://mqtt-2.example.com:8883"),
+		mqttv5.WithClientID("gateway-12"),
+		mqttv5.WithStore(st),
+		mqttv5.WithRetryInitialConnect(),
+	)
+	pub, _ := mqttv5.NewQueuePublisher(cli, q, mqttv5.WithQueueIdempotencyKey())
+	_ = pub
+}

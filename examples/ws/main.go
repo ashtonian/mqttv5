@@ -8,7 +8,7 @@
 // Run a broker with WebSocket listener (e.g., mosquitto configured
 // for port 8083 with listener "8083 protocol websockets") then:
 //
-//	MQTT_BROKER=ws://127.0.0.1:8083/mqtt go run ./examples/ws
+//	MQTT_BROKER=ws://127.0.0.1:8083/mqtt go -C examples run ./ws
 package main
 
 import (
@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/ashtonian/mqttv5"
 	"github.com/ashtonian/mqttv5/transport/ws"
@@ -26,8 +27,15 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	err := run(ctx)
+	stop()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ws:", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "ws://127.0.0.1:8083/mqtt")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -42,18 +50,21 @@ func main() {
 		mqttv5.WithLogger(logger),
 	)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "new:", err)
-		os.Exit(1)
+		return err
 	}
 
 	if err := cli.Connect(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "connect:", err)
-		os.Exit(1)
+		return err
 	}
-	defer cli.Disconnect(context.Background())
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = cli.Disconnect(shutdown)
+	}()
 
 	logger.Info("connected over websocket", "broker", broker)
 	<-ctx.Done()
+	return nil
 }
 
 func envOr(k, def string) string {

@@ -43,8 +43,8 @@ The rules that make the comparison fair:
    the adapters only translate calls. Every library runs the same
    workload with the same topics, payloads and QoS.
 2. **Library-neutral load.** Scenarios that measure the receiving side
-   are fed by `rawClient` ([`e2e_raw_test.go`](e2e_raw_test.go)) or
-   `rawServer` ([`e2e_stream_test.go`](e2e_stream_test.go)), minimal
+   are fed by `rawClient` ([`harness_test.go`](harness_test.go)) or
+   `rawServer` ([`e2e_test.go`](e2e_test.go)), minimal
    MQTT sources that write pre-encoded packets in batches and allocate
    nothing per message. They run in the benchmark process, so their CPU
    time is part of `cpu-ns/op`, and how often they wake and flush
@@ -745,9 +745,9 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 | `max_inflight_messages 20` | `broker/mosquitto.conf` | 20 | Receive Maximum granted to publishers; window towards MQTT 3.1.1 subscribers. |
 | `persistent_client_expiration 1h` | `broker/mosquitto.conf` | — | Keeps sessions for the reconnect scenario. |
 | port `1893` | `docker-compose.yml` | — | Port of the benchmark broker, published on 127.0.0.1 only (the conformance brokers use 1883–1887 and 18084). |
-| `receiveWindow` | `e2e_receive_test.go` | 20 | Receive Maximum advertised by MQTT 5 subscribers, and `rawServer`'s QoS 1 window for MQTT 3.1.1 ones. |
-| `replayWindow` | `e2e_reconnect_test.go` | 20 | QoS 1 publishes in flight at each cut. |
-| `latencyWorkers` | `e2e_roundtrip_test.go` | 32 | Goroutines publishing on the open-loop schedule. |
+| `receiveWindow` | `e2e_test.go` | 20 | Receive Maximum advertised by MQTT 5 subscribers, and `rawServer`'s QoS 1 window for MQTT 3.1.1 ones. |
+| `replayWindow` | `e2e_test.go` | 20 | QoS 1 publishes in flight at each cut. |
+| `latencyWorkers` | `e2e_test.go` | 32 | Goroutines publishing on the open-loop schedule. |
 
 ## External dependencies
 
@@ -802,11 +802,9 @@ when the run is done. The suite sends synthetic payloads only.
 
 | Path | What |
 |---|---|
-| `e2e_helpers_test.go` | broker address, sizes, CPU meter |
+| `harness_test.go` | broker address, sizes, CPU meter, `rawClient` (the library-neutral publisher and subscriber), and the tests of the harness: the sink, the adapters, the scenarios' rejection of corrupted deliveries |
 | `e2e_libs_test.go` | per-library adapters, the gated `subscription`, `sink`, subscription probe |
-| `e2e_raw_test.go` | `rawClient`, the library-neutral publisher and subscriber |
-| `e2e_stream_test.go` | `rawServer`, the library-neutral source for `ReceiveStream`, and that scenario |
-| `e2e_publish_test.go`, `e2e_receive_test.go`, `e2e_roundtrip_test.go`, `e2e_reconnect_test.go`, `e2e_slowconsumer_test.go` | scenarios |
+| `e2e_test.go` | the scenarios, and `rawServer`, the library-neutral source for `ReceiveStream` |
 | `codec_bench_test.go`, `fixtures.go` | codec benchmarks and their packets |
 | `cmd/benchtab` | Markdown table generator |
 | `scripts/run.sh` | records a run with its conditions |

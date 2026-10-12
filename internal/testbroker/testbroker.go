@@ -45,11 +45,13 @@ var (
 // closed, which the client observes as a network drop.
 type Script func(c *Conn)
 
-// Broker accepts TCP connections on 127.0.0.1 and hands each to a Script.
+// Broker accepts TCP connections on 127.0.0.1 and hands each to a Script,
+// or, made by NewRaw, to a raw handler.
 type Broker struct {
 	t        testing.TB
 	ln       net.Listener
 	scripts  []Script
+	raw      func(*Broker, net.Conn)
 	fallback atomic.Pointer[Script]
 	accepted atomic.Int32
 	done     chan struct{}
@@ -76,6 +78,28 @@ func New(t testing.TB, scripts ...Script) *Broker {
 	t.Cleanup(b.Close)
 	return b
 }
+
+// NewRaw starts a broker that hands every accepted connection to handle on
+// a goroutine of its own. The handler speaks to the client directly:
+// nothing reads the connection for it or records packets, and the
+// connection stays open when it returns. Cleanup closes the listener and
+// every accepted connection and closes Done, but does not wait for
+// handlers.
+func NewRaw(t testing.TB, handle func(b *Broker, nc net.Conn)) *Broker {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("testbroker: listen: %v", err)
+	}
+	b := &Broker{t: t, ln: ln, raw: handle, done: make(chan struct{})}
+	b.wg.Add(1)
+	go b.serve()
+	t.Cleanup(b.Close)
+	return b
+}
+
+// Addr is the host:port the broker listens on.
+func (b *Broker) Addr() string { return b.ln.Addr().String() }
 
 // SetFallback replaces the script used once the scripted connections run out.
 func (b *Broker) SetFallback(s Script) { b.fallback.Store(&s) }
@@ -139,6 +163,13 @@ func (b *Broker) serve() {
 			return
 		}
 		i := int(b.accepted.Add(1)) - 1
+		if b.raw != nil {
+			b.mu.Lock()
+			b.conns = append(b.conns, &Conn{T: b.t, Index: i, net: nc, broker: b, gone: make(chan struct{})})
+			b.mu.Unlock()
+			go b.raw(b, nc)
+			continue
+		}
 		c := &Conn{
 			T: b.t, Index: i, net: nc, broker: b,
 			arrived: make(chan struct{}, 1),

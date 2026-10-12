@@ -24,8 +24,10 @@
 //     itself: [ClientGroup]. Configurable per-broker auth / TLS /
 //     ClientID via [GroupMember.Opts]; pluggable publish policy
 //     ([GroupPublishBroadcast], [GroupPublishRoundRobin],
-//     [GroupPublishHashByTopic]).
-//   - Publisher pool against one broker: [WithPublisherPool].
+//     [GroupPublishHashByTopic]). A member with several
+//     [GroupMember.Brokers] fails over among them.
+//   - Publishing over N connections to the client's brokers:
+//     [WithPublisherPool].
 //
 // Typed publish / subscribe goes through the generic [Codec] interface;
 // JSON and msgpack ship in separate submodules so the core stays
@@ -70,9 +72,9 @@
 // [WithOnStoreFailure]) run one at a time, in the order of the events
 // they report, on a goroutine of the client's own. They may call
 // [Client.Disconnect], [Client.Connect] and [Client.SetBrokers]. Before
-// each reconnect attempt the client waits for the callbacks posted so
-// far, so a SetBrokers call from one applies to that attempt, and a
-// slow callback delays it. Because they run apart from the calls that
+// each reconnect attempt, and before Connect tries the next broker, the
+// client waits for the callbacks posted so far, so a SetBrokers call
+// from one applies to that attempt, and a slow callback delays it. Because they run apart from the calls that
 // cause them, OnConnectionUp may run after Connect returns, and a
 // callback for an event before Disconnect may run after Disconnect
 // returns.

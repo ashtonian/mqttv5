@@ -3,10 +3,10 @@
 // Typed example: publish + subscribe with JSON codec and a strongly
 // typed payload.
 //
-// Run a local broker (e.g., `docker run -p 1883:1883 eclipse-mosquitto`)
+// Run a local broker (e.g., `docker run -p 1883:1883 eclipse-mosquitto mosquitto -c /mosquitto-no-auth.conf`)
 // then:
 //
-//	MQTT_BROKER=mqtt://127.0.0.1:1883 go run ./examples/typed
+//	MQTT_BROKER=mqtt://127.0.0.1:1883 go -C examples run ./typed
 package main
 
 import (
@@ -29,8 +29,15 @@ type Reading struct {
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	err := run(ctx)
+	stop()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "typed:", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "mqtt://127.0.0.1:1883")
 
 	cli, err := mqttv5.New(
@@ -38,10 +45,10 @@ func main() {
 		mqttv5.WithClientID("mqttv5-typed"),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	if err = cli.Connect(ctx); err != nil {
-		panic(err)
+		return err
 	}
 	defer func() {
 		shutdown, c := context.WithTimeout(context.Background(), 5*time.Second)
@@ -54,7 +61,7 @@ func main() {
 	msgs, _, err := typed.Subscribe(ctx,
 		[]mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}}, mqttv5.SubBuffer(64))
 	if err != nil {
-		panic(err)
+		return err
 	}
 	go func() {
 		for m := range msgs {
@@ -81,7 +88,7 @@ func main() {
 				fmt.Printf("publish err: %v\n", err)
 			}
 		case <-ctx.Done():
-			return
+			return nil
 		}
 	}
 }

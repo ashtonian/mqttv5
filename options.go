@@ -1,11 +1,5 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
-// Package mqttv5 is a high-performance MQTT v5 client.
-//
-// The client speaks raw bytes by default. Callers that want typed
-// payloads can wrap with Typed[T] via a Codec[T] from one of the
-// sibling codec submodules. See the package doc in doc.go for an
-// architecture overview.
 package mqttv5
 
 import (
@@ -15,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"time"
@@ -325,9 +320,12 @@ func WithBroker(url string) Option {
 	}
 }
 
-// WithBrokers sets the ordered broker URL list. The supervisor
-// rotates through it across reconnect attempts; [Client.SetBrokers]
-// replaces it at runtime.
+// WithBrokers sets the broker URL list for failover. Each client
+// starts at a random entry, so a fleet spreads across the list.
+// [Client.Connect] tries the next entry when one fails; each reconnect
+// attempt takes the next entry, so the first one leaves the broker that
+// just dropped. The client stays on whichever broker accepts it.
+// [Client.SetBrokers] replaces the list at runtime.
 //
 // Brokers that do not share session state answer a failover CONNECT
 // with Session Present = 0: unacknowledged QoS 1/2 publishes then
@@ -516,7 +514,8 @@ func WithFollowServerRedirects() Option {
 // [WithReconnectBackoff] as after a lost connection. Publish and
 // Subscribe return ErrNotConnected until then ([QueuePublisher] queues);
 // [Client.AwaitConnection] waits for the connection. Without it,
-// Connect returns the first failure.
+// Connect returns the failure: with [WithBrokers], once every broker
+// has failed.
 func WithRetryInitialConnect() Option {
 	return func(c *Config) error {
 		c.RetryInitialConnect = true
@@ -1273,4 +1272,51 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mqttv5: CONNECT from these options: %w", err)
 	}
 	return nil
+}
+
+// Backoff returns the delay before retry attempt N. The first retry
+// after a failed connect is attempt 0 (the initial connect itself
+// runs immediately, no backoff). Implementations must be safe for
+// concurrent use.
+type Backoff func(attempt int) time.Duration
+
+// ConstantBackoff returns the same delay for every attempt.
+// Predictable but vulnerable to thundering-herd reconnect storms;
+// ExponentialBackoff is usually preferable.
+func ConstantBackoff(d time.Duration) Backoff {
+	return func(int) time.Duration { return d }
+}
+
+// ExponentialBackoff doubles min each attempt up to max with
+// ±jitter added (range [computed-jitter, computed+jitter]).
+func ExponentialBackoff(min, max, jitter time.Duration) Backoff {
+	if min <= 0 {
+		min = time.Second
+	}
+	if max < min {
+		max = min
+	}
+	return func(attempt int) time.Duration {
+		if attempt < 0 {
+			attempt = 0
+		}
+		// Cap shift at 30 to keep the math sane on absurd attempt counts.
+		shift := attempt
+		if shift > 30 {
+			shift = 30
+		}
+		d := min << shift
+		if d > max || d < min { // overflow guard
+			d = max
+		}
+		if jitter > 0 {
+			// Symmetric jitter in the range [-jitter, +jitter].
+			j := time.Duration(rand.Int64N(int64(jitter*2)+1)) - jitter
+			d += j
+		}
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
 }

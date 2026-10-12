@@ -422,3 +422,540 @@ func writeWillProps(buf []byte, off int, w *WillOpts) int {
 	off = writePropertyBinary(buf, off, PropCorrelationData, w.CorrelationData)
 	return writePropertyUserProps(buf, off, w.UserProperties)
 }
+
+// Connack is a decoded CONNACK packet (§3.2). Properties is a lazy view
+// over the property section.
+type Connack struct {
+	SessionPresent bool
+	ReasonCode     ReasonCode
+	Properties     Properties
+
+	frame *[]byte
+}
+
+// Type implements Packet.
+func (*Connack) Type() PacketType { return CONNACK }
+
+// Clone returns a deep copy of c that is safe to retain past the
+// originating frame's lifetime. The clone is not pooled — let it be
+// garbage-collected; do not call Release on it.
+func (c *Connack) Clone() *Connack {
+	var props Properties
+	if raw := c.Properties.Raw(); len(raw) > 0 {
+		props = PropertiesFromBytes(append([]byte(nil), raw...))
+	}
+	return &Connack{
+		SessionPresent: c.SessionPresent,
+		ReasonCode:     c.ReasonCode,
+		Properties:     props,
+	}
+}
+
+// Release returns the packet and its frame to their pools.
+func (c *Connack) Release() {
+	if c.frame != nil {
+		releaseBuf(c.frame)
+		c.frame = nil
+	}
+	*c = Connack{}
+	connackPool.Put(c)
+}
+
+var connackPool = sync.Pool{New: func() any { return new(Connack) }}
+
+// ConnackOpts is the input for WriteConnack.
+type ConnackOpts struct {
+	SessionPresent bool
+	ReasonCode     ReasonCode
+
+	SessionExpiryInterval           *uint32
+	ReceiveMaximum                  *uint16
+	MaximumQoS                      *byte
+	RetainAvailable                 *byte
+	MaximumPacketSize               *uint32
+	AssignedClientIdentifier        string
+	TopicAliasMaximum               uint16
+	ReasonString                    string
+	UserProperties                  []UserProperty
+	WildcardSubscriptionAvailable   *byte
+	SubscriptionIdentifierAvailable *byte
+	SharedSubscriptionAvailable     *byte
+	ServerKeepAlive                 *uint16
+	ResponseInformation             string
+	ServerReference                 string
+	AuthenticationMethod            string
+	AuthenticationData              []byte
+}
+
+// WriteConnack emits a CONNACK packet.
+func WriteConnack(w io.Writer, opts ConnackOpts) (int64, error) {
+	if err := validateConnackOpts(&opts); err != nil {
+		return 0, err
+	}
+	propsLen := connackPropsLen(&opts)
+	bodyLen := 1 + 1 + VarintSize(uint32(propsLen)) + propsLen
+
+	var fixedHdr [5]byte
+	fixedHdr[0] = byte(CONNACK) << 4
+	vbiN, err := EncodeVarint(fixedHdr[1:], uint32(bodyLen))
+	if err != nil {
+		return 0, err
+	}
+
+	bp := acquireBuf(bodyLen)
+	defer releaseBuf(bp)
+	buf := *bp
+
+	if opts.SessionPresent {
+		buf[0] = 0x01
+	} else {
+		buf[0] = 0x00
+	}
+	buf[1] = byte(opts.ReasonCode)
+
+	off := writePropertiesPrefix(buf, 2, propsLen)
+	off = writeProperty4(buf, off, PropSessionExpiryInterval, opts.SessionExpiryInterval)
+	off = writeProperty2P(buf, off, PropReceiveMaximum, opts.ReceiveMaximum)
+	off = writeProperty1(buf, off, PropMaximumQoS, opts.MaximumQoS)
+	off = writeProperty1(buf, off, PropRetainAvailable, opts.RetainAvailable)
+	off = writeProperty4(buf, off, PropMaximumPacketSize, opts.MaximumPacketSize)
+	off = writePropertyString(buf, off, PropAssignedClientID, opts.AssignedClientIdentifier)
+	off = writeProperty2(buf, off, PropTopicAliasMaximum, opts.TopicAliasMaximum)
+	off = writePropertyString(buf, off, PropReasonString, opts.ReasonString)
+	off = writePropertyUserProps(buf, off, opts.UserProperties)
+	off = writeProperty1(buf, off, PropWildcardSubAvailable, opts.WildcardSubscriptionAvailable)
+	off = writeProperty1(buf, off, PropSubscriptionIDAvailable, opts.SubscriptionIdentifierAvailable)
+	off = writeProperty1(buf, off, PropSharedSubAvailable, opts.SharedSubscriptionAvailable)
+	off = writeProperty2P(buf, off, PropServerKeepAlive, opts.ServerKeepAlive)
+	off = writePropertyString(buf, off, PropResponseInformation, opts.ResponseInformation)
+	off = writePropertyString(buf, off, PropServerReference, opts.ServerReference)
+	off = writePropertyString(buf, off, PropAuthMethod, opts.AuthenticationMethod)
+	_ = writePropertyBinary(buf, off, PropAuthData, opts.AuthenticationData)
+
+	bufs := net.Buffers{fixedHdr[:1+vbiN], buf}
+	return bufs.WriteTo(w)
+}
+
+// decodeConnack parses a CONNACK body. flags must be 0x00.
+func decodeConnack(frame *[]byte, flags byte) (*Connack, error) {
+	if flags != 0x00 {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: CONNACK reserved flags must be 0", ErrInvalidPacket)
+	}
+
+	buf := *frame
+	if len(buf) < 2 {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: CONNACK truncated", ErrInvalidPacket)
+	}
+
+	ackFlags := buf[0]
+	if ackFlags&0xFE != 0 {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: CONNACK reserved flag bits set", ErrInvalidPacket)
+	}
+	sessionPresent := ackFlags&0x01 != 0
+	reason := ReasonCode(buf[1])
+	buf = buf[2:]
+
+	// Unlike the acknowledgement packets, CONNACK always carries its
+	// Property Length (§3.2.2.3.1).
+	props, n, err := readProperties(buf)
+	if err == nil && n != len(buf) {
+		err = errTrailing
+	}
+	if err != nil {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: CONNACK properties: %w", ErrInvalidPacket, err)
+	}
+
+	c := connackPool.Get().(*Connack)
+	c.SessionPresent = sessionPresent
+	c.ReasonCode = reason
+	c.Properties = props
+	c.frame = frame
+	return c, nil
+}
+
+func connackPropsLen(o *ConnackOpts) int {
+	n := 0
+	if o.SessionExpiryInterval != nil {
+		n += 5
+	}
+	if o.ReceiveMaximum != nil {
+		n += 3
+	}
+	if o.MaximumQoS != nil {
+		n += 2
+	}
+	if o.RetainAvailable != nil {
+		n += 2
+	}
+	if o.MaximumPacketSize != nil {
+		n += 5
+	}
+	if o.AssignedClientIdentifier != "" {
+		n += 1 + 2 + len(o.AssignedClientIdentifier)
+	}
+	if o.TopicAliasMaximum != 0 {
+		n += 3
+	}
+	if o.ReasonString != "" {
+		n += 1 + 2 + len(o.ReasonString)
+	}
+	if o.WildcardSubscriptionAvailable != nil {
+		n += 2
+	}
+	if o.SubscriptionIdentifierAvailable != nil {
+		n += 2
+	}
+	if o.SharedSubscriptionAvailable != nil {
+		n += 2
+	}
+	if o.ServerKeepAlive != nil {
+		n += 3
+	}
+	if o.ResponseInformation != "" {
+		n += 1 + 2 + len(o.ResponseInformation)
+	}
+	if o.ServerReference != "" {
+		n += 1 + 2 + len(o.ServerReference)
+	}
+	if o.AuthenticationMethod != "" {
+		n += 1 + 2 + len(o.AuthenticationMethod)
+	}
+	if o.AuthenticationData != nil {
+		n += 1 + 2 + len(o.AuthenticationData)
+	}
+	return n + userPropertiesLen(o.UserProperties)
+}
+
+// Auth is a decoded AUTH packet (MQTT v5 §3.15).
+//
+// Per §3.15.2.2.1, when RemainingLength == 0 the Reason Code is implied
+// Success and no properties are present.
+type Auth struct {
+	ReasonCode ReasonCode
+	Properties Properties
+
+	frame *[]byte
+}
+
+// Type implements Packet.
+func (*Auth) Type() PacketType { return AUTH }
+
+// Release returns the packet and its frame to their pools.
+func (a *Auth) Release() {
+	if a.frame != nil {
+		releaseBuf(a.frame)
+		a.frame = nil
+	}
+	a.ReasonCode = 0
+	a.Properties = Properties{}
+	authPool.Put(a)
+}
+
+var authPool = sync.Pool{
+	New: func() any { return new(Auth) },
+}
+
+// AuthOpts is the input for WriteAuth.
+type AuthOpts struct {
+	ReasonCode           ReasonCode
+	AuthenticationMethod string
+	AuthenticationData   []byte
+	ReasonString         string
+	UserProperties       []UserProperty
+}
+
+// WriteAuth emits an AUTH packet.
+func WriteAuth(w io.Writer, opts AuthOpts) (int64, error) {
+	if err := validateAuthOpts(&opts); err != nil {
+		return 0, err
+	}
+	propsLen := 0
+	if opts.AuthenticationMethod != "" {
+		propsLen += 1 + 2 + len(opts.AuthenticationMethod)
+	}
+	if opts.AuthenticationData != nil {
+		propsLen += 1 + 2 + len(opts.AuthenticationData)
+	}
+	if opts.ReasonString != "" {
+		propsLen += 1 + 2 + len(opts.ReasonString)
+	}
+	propsLen += userPropertiesLen(opts.UserProperties)
+
+	hasProps := propsLen > 0
+	hasReason := hasProps || opts.ReasonCode != ReasonSuccess
+
+	bodyLen := 0
+	if hasReason {
+		bodyLen++
+		if hasProps {
+			bodyLen += VarintSize(uint32(propsLen)) + propsLen
+		}
+	}
+
+	var fixedHdr [5]byte
+	fixedHdr[0] = byte(AUTH) << 4
+	vbiN, err := EncodeVarint(fixedHdr[1:], uint32(bodyLen))
+	if err != nil {
+		return 0, err
+	}
+
+	if bodyLen == 0 {
+		bufs := net.Buffers{fixedHdr[:1+vbiN]}
+		return bufs.WriteTo(w)
+	}
+
+	bp := acquireBuf(bodyLen)
+	defer releaseBuf(bp)
+	buf := *bp
+
+	buf[0] = byte(opts.ReasonCode)
+	off := 1
+	if hasProps {
+		off = writePropertiesPrefix(buf, off, propsLen)
+		off = writePropertyString(buf, off, PropAuthMethod, opts.AuthenticationMethod)
+		off = writePropertyBinary(buf, off, PropAuthData, opts.AuthenticationData)
+		off = writePropertyString(buf, off, PropReasonString, opts.ReasonString)
+		_ = writePropertyUserProps(buf, off, opts.UserProperties)
+	}
+
+	bufs := net.Buffers{fixedHdr[:1+vbiN], buf}
+	return bufs.WriteTo(w)
+}
+
+// decodeAuth parses an AUTH body. flags must be 0x00.
+func decodeAuth(frame *[]byte, flags byte) (*Auth, error) {
+	if flags != 0x00 {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: AUTH reserved flags must be 0", ErrInvalidPacket)
+	}
+
+	buf := *frame
+	var (
+		reason = ReasonSuccess
+		props  Properties
+	)
+	if len(buf) > 0 {
+		reason = ReasonCode(buf[0])
+		buf = buf[1:]
+		if len(buf) > 0 {
+			p, n, err := readProperties(buf)
+			if err == nil && n != len(buf) {
+				err = errTrailing
+			}
+			if err != nil {
+				releaseBuf(frame)
+				return nil, fmt.Errorf("%w: AUTH properties: %w", ErrInvalidPacket, err)
+			}
+			props = p
+		}
+	}
+
+	a := authPool.Get().(*Auth)
+	a.ReasonCode = reason
+	a.Properties = props
+	a.frame = frame
+	return a, nil
+}
+
+// Disconnect is a decoded DISCONNECT packet (MQTT v5 §3.14).
+//
+// Per §3.14.2.2.1, the Reason Code defaults to 0x00 (Normal
+// Disconnection) when RemainingLength == 0; the Properties section is
+// implied empty when RemainingLength <= 1.
+type Disconnect struct {
+	ReasonCode ReasonCode
+	Properties Properties
+
+	frame *[]byte
+}
+
+// Type implements Packet.
+func (*Disconnect) Type() PacketType { return DISCONNECT }
+
+// Clone returns a deep copy of d that is safe to retain past the
+// originating frame's lifetime. The clone is not pooled — let it be
+// garbage-collected; do not call Release on it.
+func (d *Disconnect) Clone() *Disconnect {
+	var props Properties
+	if raw := d.Properties.Raw(); len(raw) > 0 {
+		props = PropertiesFromBytes(append([]byte(nil), raw...))
+	}
+	return &Disconnect{
+		ReasonCode: d.ReasonCode,
+		Properties: props,
+	}
+}
+
+// Release returns the packet and its frame to their pools.
+func (d *Disconnect) Release() {
+	if d.frame != nil {
+		releaseBuf(d.frame)
+		d.frame = nil
+	}
+	d.ReasonCode = 0
+	d.Properties = Properties{}
+	disconnectPool.Put(d)
+}
+
+var disconnectPool = sync.Pool{
+	New: func() any { return new(Disconnect) },
+}
+
+// DisconnectOpts is the input for WriteDisconnect. ReasonCode default
+// (zero = NormalDisconnection) plus no properties yields a minimal
+// 2-byte packet.
+type DisconnectOpts struct {
+	ReasonCode            ReasonCode
+	SessionExpiryInterval *uint32
+	ReasonString          string
+	ServerReference       string
+	UserProperties        []UserProperty
+}
+
+// WriteDisconnect emits a DISCONNECT packet.
+func WriteDisconnect(w io.Writer, opts DisconnectOpts) (int64, error) {
+	if err := validateDisconnectOpts(&opts); err != nil {
+		return 0, err
+	}
+	propsLen := 0
+	if opts.SessionExpiryInterval != nil {
+		propsLen += 5
+	}
+	if opts.ReasonString != "" {
+		propsLen += 1 + 2 + len(opts.ReasonString)
+	}
+	if opts.ServerReference != "" {
+		propsLen += 1 + 2 + len(opts.ServerReference)
+	}
+	propsLen += userPropertiesLen(opts.UserProperties)
+
+	hasProps := propsLen > 0
+	hasReason := hasProps || opts.ReasonCode != ReasonNormalDisconnection
+
+	bodyLen := 0
+	if hasReason {
+		bodyLen++
+		if hasProps {
+			bodyLen += VarintSize(uint32(propsLen)) + propsLen
+		}
+	}
+
+	var fixedHdr [5]byte
+	fixedHdr[0] = byte(DISCONNECT) << 4
+	vbiN, err := EncodeVarint(fixedHdr[1:], uint32(bodyLen))
+	if err != nil {
+		return 0, err
+	}
+
+	if bodyLen == 0 {
+		bufs := net.Buffers{fixedHdr[:1+vbiN]}
+		return bufs.WriteTo(w)
+	}
+
+	bp := acquireBuf(bodyLen)
+	defer releaseBuf(bp)
+	buf := *bp
+
+	buf[0] = byte(opts.ReasonCode)
+	off := 1
+	if hasProps {
+		off = writePropertiesPrefix(buf, off, propsLen)
+		off = writeProperty4(buf, off, PropSessionExpiryInterval, opts.SessionExpiryInterval)
+		off = writePropertyString(buf, off, PropReasonString, opts.ReasonString)
+		off = writePropertyString(buf, off, PropServerReference, opts.ServerReference)
+		_ = writePropertyUserProps(buf, off, opts.UserProperties)
+	}
+
+	bufs := net.Buffers{fixedHdr[:1+vbiN], buf}
+	return bufs.WriteTo(w)
+}
+
+// decodeDisconnect parses a DISCONNECT body. flags must be 0x00.
+func decodeDisconnect(frame *[]byte, flags byte) (*Disconnect, error) {
+	if flags != 0x00 {
+		releaseBuf(frame)
+		return nil, fmt.Errorf("%w: DISCONNECT reserved flags must be 0", ErrInvalidPacket)
+	}
+
+	buf := *frame
+	var (
+		reason = ReasonNormalDisconnection
+		props  Properties
+	)
+	if len(buf) > 0 {
+		reason = ReasonCode(buf[0])
+		buf = buf[1:]
+		if len(buf) > 0 {
+			p, n, err := readProperties(buf)
+			if err == nil && n != len(buf) {
+				err = errTrailing
+			}
+			if err != nil {
+				releaseBuf(frame)
+				return nil, fmt.Errorf("%w: DISCONNECT properties: %w", ErrInvalidPacket, err)
+			}
+			props = p
+		}
+	}
+
+	d := disconnectPool.Get().(*Disconnect)
+	d.ReasonCode = reason
+	d.Properties = props
+	d.frame = frame
+	return d, nil
+}
+
+// Pingreq is a PINGREQ packet (MQTT v5 §3.12). Empty body.
+type Pingreq struct{}
+
+// Type implements Packet.
+func (*Pingreq) Type() PacketType { return PINGREQ }
+
+// Release is a no-op — Pingreq is a singleton with no pooled state.
+func (*Pingreq) Release() {}
+
+// Pingresp is a PINGRESP packet (MQTT v5 §3.13). Empty body.
+type Pingresp struct{}
+
+// Type implements Packet.
+func (*Pingresp) Type() PacketType { return PINGRESP }
+
+// Release is a no-op — Pingresp is a singleton with no pooled state.
+func (*Pingresp) Release() {}
+
+// Single shared instances. Decoder returns these unchanged; their zero
+// state is correct.
+var (
+	pingreqInstance  = &Pingreq{}
+	pingrespInstance = &Pingresp{}
+)
+
+// decodePingreq returns the shared PINGREQ singleton. The frame buffer
+// is empty for PINGREQ (RemainingLength == 0) so we hand it straight
+// back to the pool.
+func decodePingreq(frame *[]byte, _ byte) (*Pingreq, error) {
+	releaseBuf(frame)
+	return pingreqInstance, nil
+}
+
+func decodePingresp(frame *[]byte, _ byte) (*Pingresp, error) {
+	releaseBuf(frame)
+	return pingrespInstance, nil
+}
+
+// WritePingreq emits a PINGREQ packet (2 bytes: type byte + 0 remaining
+// length).
+func WritePingreq(w io.Writer) (int64, error) {
+	n, err := w.Write([]byte{byte(PINGREQ) << 4, 0x00})
+	return int64(n), err
+}
+
+// WritePingresp emits a PINGRESP packet (2 bytes).
+func WritePingresp(w io.Writer) (int64, error) {
+	n, err := w.Write([]byte{byte(PINGRESP) << 4, 0x00})
+	return int64(n), err
+}

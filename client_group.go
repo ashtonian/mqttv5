@@ -23,8 +23,10 @@ import (
 // Opts are applied AFTER [WithGroupSharedOpts] so per-member settings
 // win.
 type GroupMember struct {
-	// Broker is the URL this member dials. Required.
-	Broker string
+	// Brokers are the URLs this member dials: one, or several the
+	// member fails over between as a [Client] with [WithBrokers] does.
+	// Required; neither Opts nor [WithGroupSharedOpts] may set brokers.
+	Brokers []string
 
 	// Name is an optional identifier surfaced in logs, returned in
 	// the Subscribe token map, and accepted by ClientGroup.Member.
@@ -180,9 +182,10 @@ func WithGroupSequentialLifecycle() ClientGroupOption {
 // bridges across independent brokers, multi-tenant SaaS with
 // per-broker credentials, or a clustered broker fleet you want N
 // parallel sessions into. For HA failover use [WithBrokers] on a
-// single [Client] instead — [ClientGroup] does not failover between
-// members. A group is used once: after Disconnect its methods return
-// [ErrClosed].
+// single [Client] instead — [ClientGroup] does not fail over between
+// members, though a member with several [GroupMember.Brokers] fails
+// over among them. A group is used once: after Disconnect its methods
+// return [ErrClosed].
 type ClientGroup struct {
 	cfg     clientGroupConfig
 	members []*Client
@@ -200,8 +203,9 @@ type ClientGroup struct {
 // configured publish policy on top.
 //
 // Member ClientIDs are deduped: if two members resolve to the same
-// ClientID, the second gets a "-N" suffix appended. Set
-// GroupMember.Opts with WithClientID for explicit per-member IDs.
+// ClientID, the second gets a "-N" suffix appended; members without one
+// get one each from their broker. Set GroupMember.Opts with
+// WithClientID for explicit per-member IDs.
 //
 // Defaults: GroupPublishBroadcast, parallel Connect/Disconnect.
 func NewClientGroup(members []GroupMember, opts ...ClientGroupOption) (*ClientGroup, error) {
@@ -230,8 +234,8 @@ func NewClientGroup(members []GroupMember, opts ...ClientGroupOption) (*ClientGr
 	seenName := make(map[string]bool, len(members))
 
 	for i, m := range members {
-		if m.Broker == "" {
-			return nil, fmt.Errorf("mqttv5: ClientGroup members[%d]: Broker is required", i)
+		if len(m.Brokers) == 0 {
+			return nil, fmt.Errorf("mqttv5: ClientGroup members[%d]: Brokers is required", i)
 		}
 		name := m.Name
 		if name == "" {
@@ -254,17 +258,20 @@ func NewClientGroup(members []GroupMember, opts ...ClientGroupOption) (*ClientGr
 				return nil, fmt.Errorf("mqttv5: ClientGroup members[%d] (%q): %w", i, name, err)
 			}
 		}
+		if len(probe.BrokerURLs) > 0 {
+			return nil, fmt.Errorf("mqttv5: ClientGroup members[%d] (%q): set brokers in GroupMember.Brokers, not with WithBroker or WithBrokers", i, name)
+		}
 		intendedID := probe.ClientID
 		memberID := intendedID
-		if n, dup := seenClientID[intendedID]; dup {
+		// An empty ClientID asks each broker to assign one.
+		if n, dup := seenClientID[intendedID]; dup && intendedID != "" {
 			memberID = fmt.Sprintf("%s-%d", intendedID, n+1)
 		}
 		seenClientID[intendedID]++
 
 		memberOpts := make([]Option, 0, len(combined)+2)
-		memberOpts = append(memberOpts, WithBroker(m.Broker))
 		memberOpts = append(memberOpts, combined...)
-		memberOpts = append(memberOpts, WithClientID(memberID))
+		memberOpts = append(memberOpts, WithBrokers(m.Brokers...), WithClientID(memberID))
 
 		c, err := New(memberOpts...)
 		if err != nil {
@@ -453,7 +460,9 @@ func (g *ClientGroup) publishStartingAt(ctx context.Context, opts PublishOptions
 // ctx ends — the members that did are unsubscribed again and a
 // [*GroupError] (or ctx's error) is returned. Otherwise the token map,
 // keyed by member name, holds the members that subscribed; failures of
-// the others are logged.
+// the others are logged. Called before [ClientGroup.Connect], it
+// returns at once, as [Client.Subscribe] does, and each member's
+// SUBSCRIBE goes out first on its connection.
 func (g *ClientGroup) Subscribe(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (<-chan *Message, map[string]SubscriptionToken, error) {
 	if g.closed.Load() {
 		return nil, nil, ErrClosed
