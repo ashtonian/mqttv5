@@ -1,7 +1,8 @@
 # codec/json
 
-A JSON `Codec[T]` for [`mqttv5.Typed[T]`](../../README.md#typed-publish--subscribe),
-built on the standard library's `encoding/json`.
+A JSON `Encoding` for mqttv5's [typed calls](../../README.md#typed-publish--subscribe)
+(`Client.PublishValue`, `Client.SubscribeAs` and their variants), built
+on the standard library's `encoding/json`.
 
 ```go
 import jsoncodec "github.com/ashtonian/mqttv5/codec/json"
@@ -11,31 +12,33 @@ type Reading struct {
     Temp   float64 `json:"temp"`
 }
 
-readings := mqttv5.NewTyped(cli, jsoncodec.Codec[Reading]{})
-_ = readings.Publish(ctx, mqttv5.PublishOptions{Topic: "t/a1", QoS: 1}, Reading{Device: "a1", Temp: 21.5})
+cli, _ := mqttv5.New(mqttv5.WithBroker(url), mqttv5.WithEncoding(jsoncodec.Encoding{}))
+_ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "t/a1", QoS: 1}, Reading{Device: "a1", Temp: 21.5})
+readings, _, _ := cli.SubscribeAs[Reading](ctx, []mqttv5.TopicFilter{{Topic: "t/+", QoS: 1}})
 ```
 
 | | |
 |---|---|
 | Module | `github.com/ashtonian/mqttv5/codec/json` |
-| Depends on | the Go standard library only (not even on `mqttv5`: `Codec[T]` satisfies `mqttv5.Codec[T]` structurally) |
+| Depends on | the Go standard library only (not even on `mqttv5`: `Encoding` satisfies `mqttv5.Encoding` structurally) |
 
 ## Overview
 
-`Codec[T]` encodes a value with `json.Marshal` and decodes a payload into
-a new `T` with `json.Unmarshal`. `Typed[T].Publish` sends the encoded
-bytes as the payload; `Typed[T].Subscribe` and `SubscribeQueue` decode
-each message before delivering it. A payload that does not decode is
-logged at Warn (`mqttv5/typed: decode failed`, with the topic),
-acknowledged so the broker does not resend it, and not delivered.
+`Encoding` marshals any value with `json.Marshal` and unmarshals a
+payload with `json.Unmarshal`. One `Encoding` serves every payload type
+the client publishes or subscribes to; the type is named per call. A
+publish made with it declares the MQTT 5 Content Type
+`application/json` unless `PublishOptions.ContentType` says otherwise.
 
-The codec sets no MQTT properties: set `ContentType: "application/json"`
-or `PayloadFormatIndicator` in `PublishOptions` if receivers need them.
+A payload that does not decode is not delivered: the client acks it so
+the broker does not resend it, logs it at Warn (`mqttv5: payload decode
+failed`, with the topic), counts it in `Stats().DecodeFailures` and
+hands it to the subscription's `SubOnDecodeError`, if any.
 
 ## Configuration
 
-None: the zero value `Codec[T]{}` is the codec. Field names and
-omission follow `encoding/json` struct tags on `T`.
+None: the zero value `Encoding{}` is the encoding. Field names and
+omission follow `encoding/json` struct tags.
 
 ## External dependencies
 
@@ -45,9 +48,11 @@ None beyond the standard library.
 
 | Symbol | Description |
 |---|---|
-| `Codec[T any]` | JSON codec for `T`; zero value usable. |
-| `(Codec[T]) Encode(v T) ([]byte, error)` | `json.Marshal(v)`. |
-| `(Codec[T]) Decode(b []byte) (T, error)` | `json.Unmarshal` into a fresh `T`. |
+| `Encoding` | JSON encoding; zero value usable, safe for concurrent use. |
+| `(Encoding) ContentType() string` | `MediaType`. |
+| `(Encoding) Marshal(v any) ([]byte, error)` | `json.Marshal(v)`. |
+| `(Encoding) Unmarshal(data []byte, v any) error` | `json.Unmarshal(data, v)`; keeps nothing of `data`. |
+| `MediaType` | `"application/json"`. |
 
 ## Build, run, test
 
@@ -61,7 +66,7 @@ go -C codec/json test -race ./...
 
 | Symptom | Check | Then |
 |---|---|---|
-| `mqttv5/typed: decode failed` in the logs | the topic in the log entry; what publishes there | The publisher sends something other than JSON for `T`, or a different shape; such messages are acknowledged and dropped. |
+| `mqttv5: payload decode failed` in the logs; `Stats().DecodeFailures` rising | the topic in the log entry; what publishes there | The publisher sends something other than JSON, or another shape than the subscription's type; such messages are acknowledged and not delivered. |
 | Fields arrive empty | JSON field names | Unexported fields and mismatched tags are ignored by `encoding/json`. |
 
 ## Security
@@ -74,5 +79,5 @@ code.
 
 | File | What |
 |---|---|
-| `json.go` | `Codec[T]` |
-| `json_test.go` | round trips and decode errors |
+| `json.go` | `Encoding`, `MediaType` |
+| `json_test.go` | round trips, decode errors, and that a decoded value keeps nothing of its input |

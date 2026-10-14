@@ -5,8 +5,11 @@ package mqttv5
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"net/url"
+	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -450,5 +453,53 @@ func TestNewValidatesOptions(t *testing.T) {
 	}
 	if _, err := New(WithBroker("ws://broker:80/mqtt"), WithDialFunc(func(context.Context, *url.URL) (transport.Conn, error) { return nil, nil })); err != nil {
 		t.Fatalf("ws with a dial function: %v", err)
+	}
+}
+
+// SetBrokers gives the pool's connections the new list too, so a
+// reconnect never takes a pool member back to a broker the client left.
+func TestSetBrokersMovesThePool(t *testing.T) {
+	a := testbroker.New(t)
+	b := testbroker.New(t)
+	cli := tbClient(t, a, WithPublisherPool(2))
+	waitForPoolReady(t, cli, 2, 3*time.Second)
+
+	if err := cli.SetBrokers(b.URL()); err != nil {
+		t.Fatal(err)
+	}
+	a.Close() // every connection drops, and a accepts no more
+
+	missing := map[string]bool{cli.ClientID(): true, cli.ClientID() + "-pub-1": true, cli.ClientID() + "-pub-2": true}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(missing) > 0 && time.Now().Before(deadline) {
+		for i := range b.Accepted() {
+			if c := b.Conn(i, time.Second); c != nil {
+				if log := c.Log(); len(log) > 0 && log[0].Connect != nil {
+					delete(missing, log[0].Connect.ClientID)
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(missing) > 0 {
+		t.Fatalf("never reached the new broker: %v", slices.Sorted(maps.Keys(missing)))
+	}
+}
+
+// Stats.add must sum every field, or a field added later would leave
+// the pool members' share out of Client.Stats.
+func TestStatsAddSumsEveryField(t *testing.T) {
+	var one Stats
+	v := reflect.ValueOf(&one).Elem()
+	for i := range v.NumField() {
+		v.Field(i).SetUint(1)
+	}
+	sum := one
+	sum.add(one)
+	sv := reflect.ValueOf(sum)
+	for i := range sv.NumField() {
+		if sv.Field(i).Uint() != 2 {
+			t.Errorf("Stats.add leaves out %s", sv.Type().Field(i).Name)
+		}
 	}
 }

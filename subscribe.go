@@ -54,6 +54,9 @@ type subscribeConfig struct {
 	onDrop             func(*Message) // optional: fires before a dropped message is acked
 	autoAck            bool           // SubAutoAck: ack before delivery
 	zeroCopy           bool           // SubZeroCopy: fields alias the network frame
+
+	encoding      Encoding              // SubEncoding: typed subscriptions only
+	onDecodeError func(*Message, error) // SubOnDecodeError: typed subscriptions only
 }
 
 func newSubscribeConfig(c *Client) subscribeConfig {
@@ -186,20 +189,7 @@ func SubAutoAck() SubscribeOption {
 // Returns [ErrChanDropOldestUnsupported] when called with explicit
 // [SubDropPolicy] of [DropOldest].
 func (c *Client) Subscribe(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (<-chan *Message, SubscriptionToken, error) {
-	cfg, err := c.chanSubscribeConfig(opts)
-	if err != nil {
-		return nil, SubscriptionToken{}, err
-	}
-	cfg.room = c.qosRoom(cfg, filters)
-	ch := make(chan *Message, cfg.bufferSize+cfg.room)
-	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(c, cfg, ch, ownMessage)}
-	token, err := c.subscribe(ctx, filters, r, func() { close(ch) })
-	if token.sub == nil {
-		return nil, token, err
-	}
-	// A *SubscribeError still comes with the subscription: active for
-	// the granted filters, or closed when none were.
-	return ch, token, err
+	return c.subscribeChan(ctx, filters, opts, ownMessages)
 }
 
 // SubscribeQueue sends one SUBSCRIBE and returns a [Queue] of
@@ -213,10 +203,56 @@ func (c *Client) Subscribe(ctx context.Context, filters []TopicFilter, opts ...S
 // Refusals, reconnects, and a call before Connect behave as for
 // [Client.Subscribe].
 func (c *Client) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (*Queue[*Message], SubscriptionToken, error) {
-	cfg := c.subscribeConfigFrom(opts)
+	return c.subscribeQueue(ctx, filters, opts, ownMessages, sameMessage)
+}
+
+// wrapper builds the function a subscription of c delivers through: it
+// turns each *Message into the subscription's element type, or reports
+// false to drop and ack the message.
+type wrapper[T any] func(c *Client, cfg subscribeConfig) (func(*Message) (T, bool), error)
+
+// ownMessages is the wrapper of an untyped subscription.
+func ownMessages(*Client, subscribeConfig) (func(*Message) (*Message, bool), error) {
+	return func(m *Message) (*Message, bool) { return m, true }, nil
+}
+
+func sameMessage(m *Message) *Message { return m }
+
+// subscribeChan subscribes filters with a channel of the elements wrap
+// makes; see [Client.Subscribe].
+func (c *Client) subscribeChan[T any](ctx context.Context, filters []TopicFilter, opts []SubscribeOption, wrap wrapper[T]) (<-chan T, SubscriptionToken, error) {
+	cfg, err := c.chanSubscribeConfig(opts)
+	if err != nil {
+		return nil, SubscriptionToken{}, err
+	}
+	conv, err := wrap(c, cfg)
+	if err != nil {
+		return nil, SubscriptionToken{}, err
+	}
 	cfg.room = c.qosRoom(cfg, filters)
-	q := NewQueue[*Message]()
-	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(c, cfg, q, ownMessage, func(m *Message) *Message { return m })}
+	ch := make(chan T, cfg.bufferSize+cfg.room)
+	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(c, cfg, ch, conv)}
+	token, err := c.subscribe(ctx, filters, r, func() { close(ch) })
+	if token.sub == nil {
+		return nil, token, err
+	}
+	// A *SubscribeError still comes with the subscription: active for
+	// the granted filters, or closed when none were.
+	return ch, token, err
+}
+
+// subscribeQueue subscribes filters with a queue of the elements wrap
+// makes; message recovers the *Message an evicted element carries. See
+// [Client.SubscribeQueue].
+func (c *Client) subscribeQueue[T any](ctx context.Context, filters []TopicFilter, opts []SubscribeOption, wrap wrapper[T], message func(T) *Message) (*Queue[T], SubscriptionToken, error) {
+	cfg := c.subscribeConfigFrom(opts)
+	conv, err := wrap(c, cfg)
+	if err != nil {
+		return nil, SubscriptionToken{}, err
+	}
+	cfg.room = c.qosRoom(cfg, filters)
+	q := NewQueue[T]()
+	r := &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(c, cfg, q, conv, message)}
 	token, err := c.subscribe(ctx, filters, r, q.Close)
 	if token.sub == nil {
 		return nil, token, err
@@ -224,7 +260,25 @@ func (c *Client) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts
 	return q, token, err
 }
 
-func ownMessage(m *Message) (*Message, bool) { return m, true }
+// subscribeCallback subscribes filters with h called, on the read
+// goroutine, with the element wrap makes of each message; the message
+// is acked when h returns. See [Client.SubscribeCallback].
+func (c *Client) subscribeCallback[T any](ctx context.Context, filters []TopicFilter, opts []SubscribeOption, wrap wrapper[T], h func(T)) (SubscriptionToken, error) {
+	cfg := c.subscribeConfigFrom(opts)
+	cfg.autoAck = false // a callback's message is acked after it returns
+	conv, err := wrap(c, cfg)
+	if err != nil {
+		return SubscriptionToken{}, err
+	}
+	r := &route{zeroCopy: cfg.zeroCopyDelivery(), sync: true}
+	r.deliver = func(m *Message) {
+		if v, ok := conv(m); ok {
+			h(v)
+		}
+		m.ackOnReader()
+	}
+	return c.subscribe(ctx, filters, r, nil)
+}
 
 func (c *Client) subscribeConfigFrom(opts []SubscribeOption) subscribeConfig {
 	cfg := newSubscribeConfig(c)
@@ -356,16 +410,7 @@ func (c *Client) SubscribeCallback(ctx context.Context, filters []TopicFilter, h
 	if h == nil {
 		return SubscriptionToken{}, ErrNilHandler
 	}
-	cfg := newSubscribeConfig(c)
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	r := &route{zeroCopy: cfg.zeroCopy, sync: true}
-	r.deliver = func(m *Message) {
-		h(m)
-		m.ackOnReader()
-	}
-	return c.subscribe(ctx, filters, r, nil)
+	return c.subscribeCallback(ctx, filters, opts, ownMessages, func(m *Message) { h(m) })
 }
 
 // stripShareGroup removes a leading "$share/{group}/" prefix if

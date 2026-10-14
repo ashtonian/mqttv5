@@ -12,7 +12,7 @@ here and never by the core module.
 |---|---|---|
 | `readme/quickstart/` | The README's quick start: connect, subscribe through a channel, publish QoS 1 | MQTT on `localhost:1883` |
 | `subscribe/` | Channel, queue and callback subscriptions; a slow channel reader loses QoS 0 messages, never QoS 1; a `DropOldest` queue keeps the freshest | MQTT on 1883 |
-| `typed/` | `Typed[T]` with `codec/json`: typed publish and subscribe | MQTT on 1883 |
+| `typed/` | `SubscribeAs[T]` and `PublishValue` with `codec/json`: two payload types on one client, and a payload that does not decode | MQTT on 1883 |
 | `request/` | MQTT 5 request/response: a responder on a shared subscription, a requester matching replies by Correlation Data | MQTT on 1883 |
 | `durable/` | `QueuePublisher` on `queue/file` with the session in `store/file`: stores while no broker is up, delivers in order once one is, and a restart neither loses nor repeats a message | MQTT on 1883; stop and start it, or the program, while running |
 | `reconnect/` | The supervisor across a broker restart: lifecycle callbacks, QoS 1 replay, re-subscription | MQTT on 1883; restart it while running |
@@ -85,15 +85,17 @@ configuration allows them; the image's `/mosquitto-no-auth.conf`, used
 above, does, as does the repository's
 [`conformance/mosquitto.conf`](../conformance/mosquitto.conf).
 
-## Plugging in a different codec
+## Plugging in a different encoding
 
-`Typed[T]` accepts any `mqttv5.Codec[T]`:
+`WithEncoding` (or `SubEncoding` for one subscription) accepts any
+`mqttv5.Encoding`:
 
 - [`codec/json`](../codec/json) — standard library `encoding/json`
 - [`codec/msgpack`](../codec/msgpack) — `github.com/vmihailenco/msgpack/v5`
 
-A custom codec is any type with `Encode(T) ([]byte, error)` and
-`Decode([]byte) (T, error)`; it needs nothing from this repository.
+A custom encoding is any type with `ContentType() string`,
+`Marshal(any) ([]byte, error)` and `Unmarshal([]byte, any) error`; it
+needs nothing from this repository.
 
 ## Operations
 
@@ -105,7 +107,7 @@ A custom codec is any type with `Encode(T) ([]byte, error)` and
 | `TestREADMESnippets` fails | the README snippet it names | Change the README and the matching file in `readme/` together. |
 | `failover` never moves | which broker `UP` names; whether you stopped that one | Stop the broker it reports; with one broker up it stays there. |
 | `durable` or `bridge` repeats old messages at start | `MQTT_DATA_DIR`, and the brokers' sessions for the example's ClientID | They resume earlier runs on purpose; delete `MQTT_DATA_DIR` or let the sessions expire to start over. |
-| `pool` shows no gain | the broker's Receive Maximum (`ServerInfo().ReceiveMaximum`) and its threading | A broker with a large window and one core gains little; the example measures it. |
+| `pool` shows no gain | the round trip to the broker; its Receive Maximum (`ServerInfo().ReceiveMaximum`) and threading | A pool widens the window of unacknowledged QoS 1 publishes, which limits publishing only when the round trip is long or the window small. Against a broker on the same host or LAN the broker's own processing is the limit, and a single-threaded broker (mosquitto) gains little. |
 
 ## Security
 

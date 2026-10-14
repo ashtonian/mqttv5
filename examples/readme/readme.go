@@ -39,6 +39,16 @@ func publish() {
 	_ = err
 }
 
+func publisherPool() {
+	cli, _ := mqttv5.New(
+		mqttv5.WithBroker("mqtts://mqtt.example.com:8883"),
+		mqttv5.WithClientID("telemetry-gw"),
+		mqttv5.WithPublisherPool(4), // members telemetry-gw-pub-1 … -4
+		mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
+	)
+	_ = cli
+}
+
 func subscribeChannel() {
 	msgs, token, err := cli.Subscribe(ctx,
 		[]mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},
@@ -122,7 +132,8 @@ func subscribeCallback() {
 	cli.SubscribeCallback(ctx,
 		[]mqttv5.TopicFilter{{Topic: "ctrl/+", QoS: 0}},
 		func(m *mqttv5.Message) {
-			// Runs on the read goroutine — MUST be non-blocking.
+			// Runs on the read goroutine — MUST be non-blocking: the
+			// acks of this client's own publishes wait behind it.
 			process(m)
 			// Ack auto-fires after return.
 		},

@@ -4,6 +4,7 @@ package mqttv5
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -165,8 +166,10 @@ type reauthCall struct {
 	result chan error
 }
 
-// Reauthenticate initiates MQTT v5 re-authentication (§4.12) on the live
-// connection: it sends an AUTH 0x19 carrying the configured
+// Reauthenticate initiates MQTT v5 re-authentication (§4.12) on each live
+// connection the client holds: the main one and, with
+// [WithPublisherPool], every connected pool member, all at once. On each
+// connection it sends an AUTH 0x19 carrying the configured
 // Authenticator's Method() and a fresh Begin(ctx) payload, services any
 // broker 0x18 Continue challenges via Authenticator.Continue, and returns
 // when the broker concludes the exchange — without dropping the
@@ -194,10 +197,39 @@ type reauthCall struct {
 // may observe ErrReauthInProgress until then. On a broker rejection the
 // connection is torn down and the supervisor reconnects through the normal
 // CONNECT path (which re-presents credentials).
+//
+// With a publisher pool the outcomes above describe the main connection,
+// joined with any pool member's failure (prefixed with the member), so
+// errors.Is sees every one: a rejected member reconnects as the main
+// connection would. A member that is not connected is skipped; its next
+// CONNECT presents a fresh credential.
 func (c *Client) Reauthenticate(ctx context.Context) error {
 	if c.cfg.Authenticator == nil {
 		return ErrNoAuthenticator
 	}
+	if c.pool == nil {
+		return c.reauthenticate(ctx)
+	}
+	poolDone := make(chan error, 1)
+	go func() {
+		poolDone <- c.pool.each(func(m *Client) error {
+			if err := m.reauthenticate(ctx); !errors.Is(err, ErrNotConnected) {
+				return err
+			}
+			return nil
+		})
+	}()
+	err := c.reauthenticate(ctx)
+	poolErr := <-poolDone
+	if poolErr == nil {
+		return err
+	}
+	return errors.Join(err, poolErr)
+}
+
+// reauthenticate re-authenticates the client's own connection; see
+// [Client.Reauthenticate].
+func (c *Client) reauthenticate(ctx context.Context) error {
 	cs := c.cur.Load()
 	if cs == nil {
 		return ErrNotConnected

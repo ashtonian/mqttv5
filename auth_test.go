@@ -1077,3 +1077,63 @@ func TestReauthenticateExchange(t *testing.T) {
 		waitLog(t, b.Conn(0, time.Second), wire.DISCONNECT, 1)
 	})
 }
+
+// Reauthenticate re-authenticates every connection the client publishes
+// on, so a pool member's credential does not expire under it. A member
+// that is not connected gets a fresh credential with its next CONNECT.
+func TestReauthenticateCoversThePool(t *testing.T) {
+	var mu sync.Mutex
+	reauthed := map[string]bool{}
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		connect, ok := c.Await(wire.CONNECT, 0)
+		if !ok {
+			return
+		}
+		id := connect.Connect.ClientID
+		if strings.HasSuffix(id, "-pub-2") {
+			_ = c.Write(func(w io.Writer) (int64, error) {
+				return wire.WriteConnack(w, wire.ConnackOpts{ReasonCode: wire.ReasonServerUnavailable})
+			})
+			return
+		}
+		if err := c.Write(func(w io.Writer) (int64, error) { return wire.WriteConnack(w, wire.ConnackOpts{}) }); err != nil {
+			return
+		}
+		for {
+			p, ok, err := c.Next(time.Minute)
+			if !ok {
+				if errors.Is(err, testbroker.ErrTimeout) {
+					continue
+				}
+				return
+			}
+			switch p.Type {
+			case wire.AUTH:
+				mu.Lock()
+				reauthed[id] = true
+				mu.Unlock()
+				_ = c.Write(func(w io.Writer) (int64, error) {
+					return wire.WriteAuth(w, wire.AuthOpts{ReasonCode: wire.ReasonSuccess, AuthenticationMethod: "ECHO"})
+				})
+			case wire.PINGREQ:
+				_ = c.Write(wire.WritePingresp)
+			case wire.DISCONNECT:
+				return
+			}
+		}
+	})
+	cli := tbClient(t, b, WithPublisherPool(2), WithAuthenticator(&countingAuth{}))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	if err := cli.Reauthenticate(context.Background()); err != nil {
+		t.Fatalf("Reauthenticate: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, id := range []string{cli.ClientID(), cli.ClientID() + "-pub-1"} {
+		if !reauthed[id] {
+			t.Errorf("%s was not re-authenticated", id)
+		}
+	}
+}

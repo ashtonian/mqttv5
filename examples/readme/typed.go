@@ -15,16 +15,33 @@ type Reading struct {
 	Temp   float64
 }
 
-func typedPubSub() {
-	typed := mqttv5.NewTyped[Reading](cli, jsoncodec.Codec[Reading]{})
+type Command struct {
+	Op string
+}
 
-	_ = typed.Publish(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
+func typedPubSub() {
+	cli, _ := mqttv5.New(
+		mqttv5.WithBroker(url),
+		mqttv5.WithEncoding(jsoncodec.Encoding{}), // one Encoding, any payload type
+	)
+
+	readings, _, _ := cli.SubscribeAs[Reading](ctx,
+		[]mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
+	commands, _, _ := cli.SubscribeAs[Command](ctx,
+		[]mqttv5.TopicFilter{{Topic: "devices/+/cmd", QoS: 1}})
+
+	// Declares Content Type application/json.
+	_ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
 		Reading{Device: "a1", Temp: 22.5})
 
-	ch, _, _ := typed.Subscribe(ctx,
-		[]mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
-	for m := range ch {
-		fmt.Println(m.Topic, m.Value.Temp)
-		_ = m.Ack()
+	for {
+		select {
+		case m := <-readings:
+			fmt.Println(m.Topic, m.Value.Temp)
+			_ = m.Ack()
+		case m := <-commands:
+			fmt.Println(m.Topic, m.Value.Op)
+			_ = m.Ack()
+		}
 	}
 }

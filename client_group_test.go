@@ -492,6 +492,27 @@ func TestClientGroupMemberClientIDs(t *testing.T) {
 	}
 }
 
+// A suffix never repeats another member's ClientID, configured or
+// assigned: two members with one ClientID take each other's connection
+// over at the broker.
+func TestClientGroupMemberClientIDsStayUnique(t *testing.T) {
+	var members []GroupMember
+	for i, id := range []string{"svc", "svc", "svc-2", "svc"} {
+		members = append(members, GroupMember{Brokers: []string{fmt.Sprintf("mqtt://127.0.0.1:%d", i+1)}, Opts: []Option{WithClientID(id)}})
+	}
+	g, err := NewClientGroup(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, m := range g.Members() {
+		if seen[m.ClientID()] {
+			t.Fatalf("two members use ClientID %q", m.ClientID())
+		}
+		seen[m.ClientID()] = true
+	}
+}
+
 // A member with several brokers connects through whichever accepts it.
 func TestClientGroupMemberFailover(t *testing.T) {
 	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
@@ -874,10 +895,9 @@ func TestTypedSubscriptionLeavesNothingBehind(t *testing.T) {
 		}
 		c.ServeAuto()
 	})
-	cli := tbClient(t, b, WithStats())
-	typed := NewTyped(cli, testJSONCodec[string]{})
+	cli := tbClient(t, b, WithStats(), WithEncoding(testJSON{}))
 	before := runtime.NumGoroutine()
-	ch, tok, err := typed.Subscribe(context.Background(), []TopicFilter{{Topic: "t"}}, SubBuffer(2))
+	ch, tok, err := cli.SubscribeAs[string](context.Background(), []TopicFilter{{Topic: "t"}}, SubBuffer(2))
 	if err != nil {
 		t.Fatal(err)
 	}

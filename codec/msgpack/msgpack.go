@@ -1,29 +1,34 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
-// Package msgpack is the MessagePack Codec[T] implementation.
+// Package msgpack is a MessagePack Encoding for mqttv5's typed calls
+// (Client.PublishValue, Client.SubscribeAs and their variants).
 //
-// External dependency: github.com/vmihailenco/msgpack/v5 — well-known
-// API mirroring encoding/json (Marshal/Unmarshal). Pull in this
-// package only when you need msgpack; the core mqttv5 module is
-// stdlib-only by design.
+// External dependency: github.com/vmihailenco/msgpack/v5, whose API
+// mirrors encoding/json. Pull in this module only when you need
+// msgpack; the core mqttv5 module is stdlib-only by design. Encoding
+// satisfies mqttv5.Encoding structurally, so this module does not
+// import mqttv5.
 //
-// For other encodings (Protobuf, FlatBuffers, Avro, custom binary)
-// implement the mqttv5.Codec[T] interface directly — there is nothing
-// in this package that the rest of mqttv5 depends on.
+// For other formats (Protobuf, FlatBuffers, Avro, custom binary)
+// implement mqttv5.Encoding directly.
 package msgpack
 
 import "github.com/vmihailenco/msgpack/v5"
 
-// Codec is a MessagePack encoder/decoder for T. The zero value is
-// usable.
-type Codec[T any] struct{}
+// MediaType is the MQTT 5 Content Type a publish encoded by Encoding
+// declares: MessagePack's IANA registration.
+const MediaType = "application/vnd.msgpack"
 
-// Encode marshals v to MessagePack.
-func (Codec[T]) Encode(v T) ([]byte, error) { return msgpack.Marshal(v) }
+// Encoding encodes payloads as MessagePack. The zero value is ready to
+// use and safe for concurrent use.
+type Encoding struct{}
 
-// Decode unmarshals b into a fresh T.
-func (Codec[T]) Decode(b []byte) (T, error) {
-	var v T
-	err := msgpack.Unmarshal(b, &v)
-	return v, err
-}
+// ContentType returns [MediaType].
+func (Encoding) ContentType() string { return MediaType }
+
+// Marshal is msgpack.Marshal.
+func (Encoding) Marshal(v any) ([]byte, error) { return msgpack.Marshal(v) }
+
+// Unmarshal is msgpack.Unmarshal; the decoded value keeps nothing of
+// data.
+func (Encoding) Unmarshal(data []byte, v any) error { return msgpack.Unmarshal(data, v) }

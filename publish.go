@@ -47,7 +47,7 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 	}
 	if c.pool != nil {
 		err := c.pool.publish(ctx, po)
-		if !errors.Is(err, ErrNoHealthyPublishers) {
+		if !errors.Is(err, errNoHealthyPublishers) {
 			return err
 		}
 		// No member could send it: use the main connection.
@@ -316,10 +316,10 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref [
 	return flow, nil
 }
 
-// ErrNoHealthyPublishers is returned by publisherPool.publish when no
-// pool member could send the message. The Client falls back to the main
-// connection in this case (and increments PoolFallbacks).
-var ErrNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
+// errNoHealthyPublishers is the pool's signal that no member could send
+// a message; [Client.Publish] then sends it on the main connection,
+// counted in Stats.PoolFallbacks.
+var errNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
 
 // notSent reports whether a Publish error guarantees the message never
 // reached the network, so another connection may send it instead.
@@ -328,8 +328,9 @@ func notSent(err error) bool {
 }
 
 // publisherPool is a set of N publish-only Clients. Each member has
-// its own session and supervisor, so QoS 1/2 acks land on the member
-// that emitted the publish.
+// its own connection, transient session and supervisor, so QoS 1/2 acks
+// land on the member that emitted the publish. The parent's SetBrokers,
+// Reauthenticate and Stats cover every member.
 //
 // Spec-compliant but easy to miss:
 //
@@ -345,7 +346,8 @@ func notSent(err error) bool {
 //
 // What is propagated to pool members from the parent Config:
 //
-//   - Wire layer: BrokerURLs, Username/Password, TLSConfig, Dialer,
+//   - Wire layer: BrokerURLs (and later SetBrokers calls),
+//     Username/Password, TLSConfig, Dialer,
 //     DialFunc (required for WebSocket / proxy transports),
 //     Authenticator.
 //   - CONNECT v5 properties: ReceiveMaximum, MaximumPacketSize,
@@ -385,7 +387,16 @@ type publisherPool struct {
 	cursor  atomic.Uint64
 	routing PoolRoutingPolicy
 	logger  *slog.Logger
+
+	// calls counts the Publish calls running through the pool, with
+	// poolClosing set while the client disconnects; the call that ends
+	// the last of them then closes drained.
+	calls   atomic.Int64
+	drained atomic.Pointer[chan struct{}]
 }
+
+// poolClosing marks publisherPool.calls while the pool admits no calls.
+const poolClosing = 1 << 62
 
 // newPublisherPool constructs the pool but does not connect it. Pool
 // members inherit the parent's broker URL + credentials + TLS config
@@ -492,7 +503,49 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 // supervisor, so an error means ctx ended or the client stopped first;
 // the pool stays usable either way.
 func (p *publisherPool) connect(ctx context.Context) error {
+	p.calls.And(^poolClosing)
+	p.drained.Store(nil)
 	return p.each(func(m *Client) error { return m.Connect(ctx) })
+}
+
+// enter admits a Publish call unless the pool is closing. It counts the
+// call first and backs out when closing is set, so admission costs one
+// atomic add however many goroutines publish.
+func (p *publisherPool) enter() bool {
+	if p.calls.Add(1)&poolClosing != 0 {
+		p.exit()
+		return false
+	}
+	return true
+}
+
+// exit ends a call enter counted. Calls backing out of a closing pool
+// can reach zero more than once, so the channel is taken before it is
+// closed.
+func (p *publisherPool) exit() {
+	if p.calls.Add(-1) == poolClosing {
+		if d := p.drained.Swap(nil); d != nil {
+			close(*d)
+		}
+	}
+}
+
+// drain stops admitting Publish calls and waits, bounded by ctx, for
+// those running to return. A member's session ends with its connection,
+// so a publish it still awaits an acknowledgement for has nothing to
+// finish it once the member disconnects.
+func (p *publisherPool) drain(ctx context.Context) error {
+	done := make(chan struct{})
+	p.drained.Store(&done)
+	if p.calls.Or(poolClosing)&^poolClosing == 0 {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // publish picks a starting member per the routing policy and tries
@@ -500,8 +553,12 @@ func (p *publisherPool) connect(ctx context.Context) error {
 // when a member could not send it at all (see notSent): any other
 // outcome, a broker refusal or ctx ending included, is the caller's, so
 // one Publish never puts the message on two connections. Returns
-// ErrNoHealthyPublishers when no member could send it.
+// errNoHealthyPublishers when no member could send it.
 func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error {
+	if !p.enter() {
+		return ErrClosed
+	}
+	defer p.exit()
 	n := len(p.members)
 	start := p.startIndex(opts)
 	var lastErr error
@@ -515,7 +572,7 @@ func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error 
 		p.logger.Debug("mqttv5: pool member could not send; trying the next",
 			slog.String("client_id", m.ClientID()), slog.Any("error", err))
 	}
-	return fmt.Errorf("%w: %w", ErrNoHealthyPublishers, lastErr)
+	return fmt.Errorf("%w: %w", errNoHealthyPublishers, lastErr)
 }
 
 // startIndex returns the member-index to start the probe loop at,

@@ -1169,3 +1169,304 @@ func TestPoolMemberInheritsPublishBehaviour(t *testing.T) {
 		}
 	}
 }
+
+// WithPublisherPool(1) moves publishing onto one publish-only
+// connection beside the main one.
+func TestPoolOfOne(t *testing.T) {
+	rec := &publishRecorder{}
+	fb := testbroker.NewRaw(t, recordingHandler(t, rec))
+	cli, err := New(WithBroker(fb.URL()), WithClientID("one"), WithPublisherPool(1), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(context.Background())
+	if cli.pool == nil {
+		t.Fatal("WithPublisherPool(1) built no pool")
+	}
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if pubs := rec.snapshot(); len(pubs) != 1 || pubs[0].clientID != "one-pub-1" {
+		t.Fatalf("publishes = %+v, want one from one-pub-1", pubs)
+	}
+}
+
+// A client whose broker assigns its ClientID leaves its pool members'
+// to the broker as well: a derived "-pub-N" would be the same in every
+// process, and each would take the others' connections over.
+func TestPoolOfAnUnnamedClient(t *testing.T) {
+	b := testbroker.New(t)
+	cli, err := New(WithBroker(b.URL()), WithPublisherPool(2), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(context.Background())
+	waitForPoolReady(t, cli, 2, 3*time.Second)
+
+	for i := range 3 {
+		c := b.Conn(i, time.Second)
+		if c == nil {
+			t.Fatalf("broker accepted %d connections, want 3", b.Accepted())
+		}
+		if id := c.Log()[0].Connect.ClientID; id != "" {
+			t.Errorf("connection %d: CONNECT ClientID %q, want empty", i, id)
+		}
+	}
+}
+
+// Stats covers the pool's connections as well as the main one: the
+// publishes a caller made through the pool count as the client's.
+func TestStatsCoverThePool(t *testing.T) {
+	b, _ := countingBroker(t, wire.ReasonSuccess, nil)
+	cli := tbClient(t, b, WithPublisherPool(2), WithStats())
+	waitForPoolReady(t, cli, 2, 3*time.Second)
+
+	const n = 6
+	for range n {
+		if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var s Stats
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s = cli.Stats()
+		if s.PublishesSent == n && s.PublishesAcked == n && s.Connects == 3 && s.PoolConnected == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.PublishesSent != n || s.PublishesAcked != n {
+		t.Errorf("PublishesSent = %d, PublishesAcked = %d; want %d each", s.PublishesSent, s.PublishesAcked, n)
+	}
+	if s.Connects != 3 || s.PoolConnected != 2 {
+		t.Errorf("Connects = %d, PoolConnected = %d; want 3 and 2", s.Connects, s.PoolConnected)
+	}
+	if s.PoolFallbacks != 0 {
+		t.Errorf("PoolFallbacks = %d with every member connected", s.PoolFallbacks)
+	}
+}
+
+// A pool member reads its own acknowledgements, so a SubscribeCallback
+// handler holding the main connection's read loop does not hold up a
+// pooled publish.
+func TestPooledPublishDoesNotWaitOnCallbackHandler(t *testing.T) {
+	b := testbroker.New(t)
+	cli := tbClient(t, b, WithPublisherPool(1))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	entered := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	defer close(gate)
+	_, err := cli.SubscribeCallback(context.Background(), []TopicFilter{{Topic: "in"}}, func(*Message) {
+		entered <- struct{}{}
+		<-gate
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var main *testbroker.Conn
+	for i := range b.Accepted() {
+		if c := b.Conn(i, time.Second); c != nil && c.Log()[0].Connect.ClientID == cli.ClientID() {
+			main = c
+		}
+	}
+	if main == nil {
+		t.Fatal("no main connection at the broker")
+	}
+	if err := main.Publish(wire.PublishOpts{Topic: "in", Payload: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cli.Publish(ctx, PublishOptions{Topic: "out", QoS: 1}); err != nil {
+		t.Fatalf("pooled publish while the main read loop is held: %v", err)
+	}
+}
+
+// heldPubackBroker accepts every connection; the pool member's first
+// PUBLISH is reported on got and acknowledged only once release closes.
+func heldPubackBroker(t *testing.T, got chan<- uint16, release <-chan struct{}) *testbroker.Broker {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		info := c.AcceptConnect(wire.ConnackOpts{})
+		if info == nil {
+			return
+		}
+		if !strings.HasSuffix(info.ClientID, "-pub-1") {
+			c.ServeAuto()
+			return
+		}
+		p, ok := c.Await(wire.PUBLISH, 0)
+		if !ok {
+			return
+		}
+		got <- p.PacketID
+		select {
+		case <-release:
+		case <-c.Gone():
+			return
+		}
+		_ = c.Puback(p.PacketID, wire.ReasonSuccess)
+		c.ServeAuto()
+	})
+	return b
+}
+
+// Disconnect waits for publishes in flight on pool members: a member has
+// no session to finish them later.
+func TestDisconnectDrainsPooledPublishes(t *testing.T) {
+	got := make(chan uint16, 1)
+	release := make(chan struct{})
+	cli := tbClient(t, heldPubackBroker(t, got, release), WithPublisherPool(1))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	pubErr := make(chan error, 1)
+	go func() { pubErr <- cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}) }()
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pooled publish never reached the broker")
+	}
+	discErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		discErr <- cli.Disconnect(ctx)
+	}()
+	select {
+	case err := <-discErr:
+		t.Fatalf("Disconnect returned (%v) while a pooled publish was in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-pubErr; err != nil {
+		t.Errorf("in-flight pooled publish = %v, want its PUBACK", err)
+	}
+	if err := <-discErr; err != nil {
+		t.Errorf("Disconnect = %v", err)
+	}
+	if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Publish after Disconnect = %v, want ErrClosed", err)
+	}
+}
+
+// Disconnect's ctx bounds the wait; a publish it cuts short returns
+// ErrClosed.
+func TestDisconnectDrainIsBoundedByCtx(t *testing.T) {
+	got := make(chan uint16, 1)
+	release := make(chan struct{})
+	defer close(release)
+	cli := tbClient(t, heldPubackBroker(t, got, release), WithPublisherPool(1))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	pubErr := make(chan error, 1)
+	go func() { pubErr <- cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}) }()
+	<-got
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- cli.Disconnect(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Disconnect outlived its ctx")
+	}
+	select {
+	case err := <-pubErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("cut-short publish = %v, want ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the in-flight publish never returned")
+	}
+}
+
+// A client connected again after Disconnect publishes through its pool.
+func TestPoolPublishesAfterReconnect(t *testing.T) {
+	b, publishes := countingBroker(t, wire.ReasonSuccess, nil)
+	cli := tbClient(t, b, WithPublisherPool(1))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+	if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); err != nil {
+		t.Fatalf("Publish after reconnect = %v", err)
+	}
+	if n := publishes.Load(); n != 1 {
+		t.Errorf("broker saw %d PUBLISHes, want 1", n)
+	}
+}
+
+// A drain racing with publishers that back out of the closing pool
+// neither hangs nor closes its channel twice, and admits nothing after.
+func TestPoolDrainRacesWithPublishers(t *testing.T) {
+	for range 500 {
+		p := &publisherPool{}
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				for range 50 {
+					if p.enter() {
+						p.exit()
+					}
+				}
+			})
+		}
+		if err := p.drain(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		if p.enter() {
+			t.Fatal("a closed pool admitted a call")
+		}
+	}
+}
+
+// The members are connections of their own: while the main connection
+// is down and reconnecting, publishing goes on through them.
+func TestPoolPublishesWhileMainConnectionIsDown(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		info := c.AcceptConnect(wire.ConnackOpts{})
+		if info == nil {
+			return
+		}
+		if strings.HasSuffix(info.ClientID, "-pub-1") {
+			c.ServeAuto()
+		}
+		// The main connection closes at once, every time.
+	})
+	cli := tbClient(t, b, WithPublisherPool(1), WithReconnectBackoff(ConstantBackoff(time.Minute)))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for cli.Connected() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if cli.Connected() {
+		t.Fatal("the main connection never dropped")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1}); err != nil {
+		t.Fatalf("Publish with the main connection down = %v", err)
+	}
+}

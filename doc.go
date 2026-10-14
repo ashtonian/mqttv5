@@ -14,9 +14,10 @@
 // Backpressure is per subscription: a consumer that falls behind loses
 // QoS 0 messages, acknowledged so the broker stops retransmitting,
 // while the broker's flow control holds QoS 1 and 2 messages back
-// (see [Client.Subscribe]).
+// unless the subscription opts out with [SubAutoAck] or a [DropOldest]
+// queue (see [Client.Subscribe]).
 //
-// Three multi-broker patterns are kept distinct:
+// Two multi-broker patterns are kept distinct:
 //
 //   - Failover within one logical client (interchangeable brokers,
 //     one session identity): [WithBrokers].
@@ -26,12 +27,17 @@
 //     ([GroupPublishBroadcast], [GroupPublishRoundRobin],
 //     [GroupPublishHashByTopic]). A member with several
 //     [GroupMember.Brokers] fails over among them.
-//   - Publishing over N connections to the client's brokers:
-//     [WithPublisherPool].
 //
-// Typed publish / subscribe goes through the generic [Codec] interface;
-// JSON and msgpack ship in separate submodules so the core stays
-// stdlib-only. The durable outbound [QueuePublisher] lets you enqueue
+// Separately, [WithPublisherPool] adds publish-only connections to the
+// client's own brokers, each with its own window of unacknowledged QoS
+// 1/2 messages and its own read loop, while subscriptions and any
+// persistent session stay on the main connection.
+//
+// Typed publish / subscribe takes one [Encoding] per client
+// ([WithEncoding]) and the payload type per call: [Client.SubscribeAs]
+// delivers decoded values and [Client.PublishValue] encodes any value
+// and declares the Encoding's Content Type. JSON and msgpack Encodings
+// ship in separate submodules so the core stays stdlib-only. The durable outbound [QueuePublisher] lets you enqueue
 // publishes while disconnected, keeps a window of them in flight once
 // connected, and, with the queue/file and store/file submodules,
 // continues the exchanges in flight after a process crash instead of
@@ -153,9 +159,9 @@
 // [net.Conn.Write]. On unix systems the reader writes the
 // acknowledgements it owes itself when the connection is idle, as far
 // as the socket takes them without waiting, and leaves the rest to the
-// writer goroutine. [WithPublisherPool] runs N such connections, each
-// with its own writer goroutine, so publishing is not limited to one
-// connection's writer.
+// writer goroutine. [WithPublisherPool] runs N such connections for
+// publishing, each with its own writer and its own Receive Maximum
+// window.
 //
 // Packets and frame buffers up to 64 KiB come from sync.Pools. An
 // inbound [Message] owns a copy of its topic, payload and properties,
