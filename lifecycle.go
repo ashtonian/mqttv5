@@ -201,8 +201,11 @@ func (c *Client) Disconnect(ctx context.Context) error {
 }
 
 // DisconnectWith sends a DISCONNECT with opts, stops the supervisor,
-// and tears down the current connection. Pool-member disconnect
-// errors are joined into the returned error. Idempotent. Like
+// and tears down the current connection. With [WithPublisherPool] it
+// then refuses new publishes with [ErrClosed] and waits, bounded by ctx,
+// for those in flight on pool members, whose sessions end with their
+// connections, before disconnecting them; pool-member disconnect errors
+// are joined into the returned error. Idempotent. Like
 // [Client.Disconnect], it must not be called from a SubscribeCallback
 // handler or SubOnDrop hook.
 func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) error {
@@ -246,7 +249,8 @@ func (c *Client) teardown(ctx context.Context, life *lifecycle, opts wire.Discon
 }
 
 // finish tears down what a span left once its connection is gone:
-// subscriptions are closed, store writes drained, the publisher pool
+// subscriptions are closed, store writes drained, the publisher pool's
+// publishes in flight waited for, bounded by ctx, and the pool
 // disconnected. It runs once per span, from Disconnect or from a
 // supervisor told to stop reconnecting.
 func (c *Client) finish(ctx context.Context, life *lifecycle) error {
@@ -269,6 +273,9 @@ func (c *Client) finish(ctx context.Context, life *lifecycle) error {
 			c.cfg.Logger.Warn("mqttv5: session store writes still pending at disconnect", slog.Any("error", err))
 		}
 		if c.pool != nil {
+			if err := c.pool.drain(ctx); err != nil {
+				c.cfg.Logger.Warn("mqttv5: publisher pool publishes still in flight at disconnect", slog.Any("error", err))
+			}
 			poolErr = c.pool.disconnect(ctx)
 		}
 		c.cfg.Logger.Info("mqttv5: disconnected", slog.String("client_id", c.ClientID()))

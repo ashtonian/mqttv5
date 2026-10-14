@@ -236,8 +236,12 @@ When `Publish` returns depends on the QoS:
 | 2 | when the broker's PUBCOMP arrives |
 
 `ctx` bounds the call. While the client is disconnected `Publish`
-returns `ErrNotConnected`; a [`QueuePublisher`](#durable-publishing-with-queuepublisher)
-queues through outages instead. A QoS 1/2 message accepted before a
+returns `ErrNotConnected`; with a
+[publish pool](#publish-pool-withpublisherpool) that means no member is
+connected either, since publishing goes on through the members while
+the main connection reconnects. A
+[`QueuePublisher`](#durable-publishing-with-queuepublisher) queues
+through outages instead. A QoS 1/2 message accepted before a
 drop belongs to the session: it is resent when the session resumes, and
 the caller stays blocked until the broker acknowledges it. A refusal
 (reason code 0x80 or above) is returned as a `*ReasonCodeError`.
@@ -344,6 +348,14 @@ cli, _ := mqttv5.New(
   replaces it for them too — and each starts at a random entry, so over
   a cluster the pool spreads across its nodes. Each member follows the
   server redirects its own broker sends.
+- **Lifetime.** Members connect with the client and disconnect with
+  it, never on their own: an idle member stays connected and sends
+  keepalive pings. When the main connection drops, the members stay
+  connected and publishing goes on. `Disconnect` refuses new publishes
+  with `ErrClosed`, waits, bounded by its ctx, for those in flight on
+  members (a member's session ends with its connection, so nothing could
+  finish them later), then disconnects the members; a publish its ctx
+  cuts short returns `ErrClosed`, and the broker may or may not have it.
 - **Client-wide calls.** `Reauthenticate` re-authenticates every
   connected member along with the main connection, so the
   `Authenticator` must be safe for concurrent use. `Stats()` counts the
@@ -1388,9 +1400,14 @@ instance's session expires first. Make each instance a
 2. it waits for the connection's goroutines (the read loop runs
    `SubscribeCallback` handlers) and closes every subscription's channel
    or queue;
-3. it waits, bounded by ctx, for session store writes.
+3. it waits, bounded by ctx, for session store writes;
+4. with a [publish pool](#publish-pool-withpublisherpool), it refuses
+   new publishes with `ErrClosed`, waits, bounded by ctx, for those in
+   flight on pool members, and disconnects the members.
 
-Unfinished QoS 1/2 exchanges stay in the session for the next `Connect`.
+Unfinished QoS 1/2 exchanges of the main connection stay in the session
+for the next `Connect`; a pool member's session ends with its
+connection, which is why step 4 waits for them.
 `Disconnect` is idempotent and does not fire `OnConnectionDown`: the
 call itself is the "going down" signal. A lifecycle callback may call
 it; a `SubscribeCallback` handler must not (see

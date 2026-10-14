@@ -387,7 +387,16 @@ type publisherPool struct {
 	cursor  atomic.Uint64
 	routing PoolRoutingPolicy
 	logger  *slog.Logger
+
+	// calls counts the Publish calls running through the pool, with
+	// poolClosing set while the client disconnects; the call that ends
+	// the last of them then closes drained.
+	calls   atomic.Int64
+	drained atomic.Pointer[chan struct{}]
 }
+
+// poolClosing marks publisherPool.calls while the pool admits no calls.
+const poolClosing = 1 << 62
 
 // newPublisherPool constructs the pool but does not connect it. Pool
 // members inherit the parent's broker URL + credentials + TLS config
@@ -494,7 +503,49 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 // supervisor, so an error means ctx ended or the client stopped first;
 // the pool stays usable either way.
 func (p *publisherPool) connect(ctx context.Context) error {
+	p.calls.And(^poolClosing)
+	p.drained.Store(nil)
 	return p.each(func(m *Client) error { return m.Connect(ctx) })
+}
+
+// enter admits a Publish call unless the pool is closing. It counts the
+// call first and backs out when closing is set, so admission costs one
+// atomic add however many goroutines publish.
+func (p *publisherPool) enter() bool {
+	if p.calls.Add(1)&poolClosing != 0 {
+		p.exit()
+		return false
+	}
+	return true
+}
+
+// exit ends a call enter counted. Calls backing out of a closing pool
+// can reach zero more than once, so the channel is taken before it is
+// closed.
+func (p *publisherPool) exit() {
+	if p.calls.Add(-1) == poolClosing {
+		if d := p.drained.Swap(nil); d != nil {
+			close(*d)
+		}
+	}
+}
+
+// drain stops admitting Publish calls and waits, bounded by ctx, for
+// those running to return. A member's session ends with its connection,
+// so a publish it still awaits an acknowledgement for has nothing to
+// finish it once the member disconnects.
+func (p *publisherPool) drain(ctx context.Context) error {
+	done := make(chan struct{})
+	p.drained.Store(&done)
+	if p.calls.Or(poolClosing)&^poolClosing == 0 {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // publish picks a starting member per the routing policy and tries
@@ -504,6 +555,10 @@ func (p *publisherPool) connect(ctx context.Context) error {
 // one Publish never puts the message on two connections. Returns
 // errNoHealthyPublishers when no member could send it.
 func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error {
+	if !p.enter() {
+		return ErrClosed
+	}
+	defer p.exit()
 	n := len(p.members)
 	start := p.startIndex(opts)
 	var lastErr error
