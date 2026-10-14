@@ -895,10 +895,9 @@ func TestTypedSubscriptionLeavesNothingBehind(t *testing.T) {
 		}
 		c.ServeAuto()
 	})
-	cli := tbClient(t, b, WithStats())
-	typed := NewTyped(cli, testJSONCodec[string]{})
+	cli := tbClient(t, b, WithStats(), WithEncoding(testJSON{}))
 	before := runtime.NumGoroutine()
-	ch, tok, err := typed.Subscribe(context.Background(), []TopicFilter{{Topic: "t"}}, SubBuffer(2))
+	ch, tok, err := cli.SubscribeAs[string](context.Background(), []TopicFilter{{Topic: "t"}}, SubBuffer(2))
 	if err != nil {
 		t.Fatal(err)
 	}

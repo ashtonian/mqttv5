@@ -1,21 +1,27 @@
 // Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
 
-// Package json is the JSON Codec[T] implementation. It sits in its
-// own package so the core mqttv5 module can stay encoding/json-free
-// for callers that want a different codec (protobuf, msgpack, etc.).
+// Package json is a JSON Encoding for mqttv5's typed calls
+// (Client.PublishValue, Client.SubscribeAs and their variants), built
+// on the standard library's encoding/json. It sits in its own module so
+// the core needs no codec; Encoding satisfies mqttv5.Encoding
+// structurally, so this module does not import mqttv5.
 package json
 
 import "encoding/json"
 
-// Codec is a JSON encoder/decoder for T. The zero value is usable.
-type Codec[T any] struct{}
+// MediaType is the MQTT 5 Content Type a publish encoded by Encoding
+// declares.
+const MediaType = "application/json"
 
-// Encode marshals v.
-func (Codec[T]) Encode(v T) ([]byte, error) { return json.Marshal(v) }
+// Encoding encodes payloads as JSON with encoding/json. The zero value
+// is ready to use and safe for concurrent use.
+type Encoding struct{}
 
-// Decode unmarshals b into a fresh T.
-func (Codec[T]) Decode(b []byte) (T, error) {
-	var v T
-	err := json.Unmarshal(b, &v)
-	return v, err
-}
+// ContentType returns [MediaType].
+func (Encoding) ContentType() string { return MediaType }
+
+// Marshal is json.Marshal.
+func (Encoding) Marshal(v any) ([]byte, error) { return json.Marshal(v) }
+
+// Unmarshal is json.Unmarshal; the decoded value keeps nothing of data.
+func (Encoding) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }

@@ -2092,8 +2092,7 @@ func TestLifecycleLeavesNoGoroutines(t *testing.T) {
 		if _, err := cli.SubscribeCallback(ctx, []TopicFilter{{Topic: "leak/cb"}}, func(*Message) {}); err != nil {
 			t.Fatal(err)
 		}
-		typed := NewTyped(cli, testJSONCodec[string]{})
-		if _, _, err := typed.Subscribe(ctx, []TopicFilter{{Topic: "leak/typed"}}); err != nil {
+		if _, _, err := cli.SubscribeAs[string](ctx, []TopicFilter{{Topic: "leak/typed"}}, SubEncoding(testJSON{})); err != nil {
 			t.Fatal(err)
 		}
 		for qos := byte(0); qos <= 2; qos++ {

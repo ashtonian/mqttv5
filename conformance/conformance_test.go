@@ -583,16 +583,14 @@ type reading struct {
 	Site     string  `json:"site"`
 }
 
-// Typed[T] with the JSON codec round-trips a struct.
+// SubscribeAs and PublishValue with the JSON Encoding round-trip a
+// struct, and the broker forwards the declared Content Type.
 func TestTypedJSON_FullStructEquality(t *testing.T) {
-	sub := connect(t)
-	pub := connect(t)
-
-	typedSub := mqttv5.NewTyped[reading](sub, jsoncodec.Codec[reading]{})
-	typedPub := mqttv5.NewTyped[reading](pub, jsoncodec.Codec[reading]{})
+	sub := connect(t, mqttv5.WithEncoding(jsoncodec.Encoding{}))
+	pub := connect(t, mqttv5.WithEncoding(jsoncodec.Encoding{}))
 
 	topic := "conformance/typed/" + randSuffix()
-	ch, _, err := typedSub.Subscribe(context.Background(),
+	ch, _, err := sub.SubscribeAs[reading](context.Background(),
 		[]mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(4))
 	if err != nil {
 		t.Fatal(err)
@@ -600,7 +598,7 @@ func TestTypedJSON_FullStructEquality(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	want := reading{DeviceID: "sensor-77", Temp: 21.5, Site: "us-west-2"}
-	if err := typedPub.Publish(context.Background(), mqttv5.PublishOptions{
+	if err := pub.PublishValue(context.Background(), mqttv5.PublishOptions{
 		Topic: topic, QoS: 1,
 	}, want); err != nil {
 		t.Fatal(err)
@@ -610,6 +608,9 @@ func TestTypedJSON_FullStructEquality(t *testing.T) {
 	case m := <-ch:
 		if m.Value != want {
 			t.Errorf("Value = %+v, want %+v", m.Value, want)
+		}
+		if ct := m.Properties.ContentType(); ct != jsoncodec.MediaType {
+			t.Errorf("Content Type = %q, want %q", ct, jsoncodec.MediaType)
 		}
 		_ = m.Ack()
 	case <-time.After(3 * time.Second):

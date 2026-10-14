@@ -1,38 +1,43 @@
 # codec/msgpack
 
-A MessagePack `Codec[T]` for
-[`mqttv5.Typed[T]`](../../README.md#typed-publish--subscribe), built on
-[`github.com/vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack).
+A MessagePack `Encoding` for mqttv5's
+[typed calls](../../README.md#typed-publish--subscribe)
+(`Client.PublishValue`, `Client.SubscribeAs` and their variants), built
+on [`github.com/vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack).
 
 ```go
 import msgpackcodec "github.com/ashtonian/mqttv5/codec/msgpack"
 
-readings := mqttv5.NewTyped(cli, msgpackcodec.Codec[Reading]{})
+cli, _ := mqttv5.New(mqttv5.WithBroker(url), mqttv5.WithEncoding(msgpackcodec.Encoding{}))
+readings, _, _ := cli.SubscribeAs[Reading](ctx, []mqttv5.TopicFilter{{Topic: "t/+", QoS: 1}})
 ```
 
 | | |
 |---|---|
 | Module | `github.com/ashtonian/mqttv5/codec/msgpack` |
-| Depends on | `github.com/vmihailenco/msgpack/v5` v5.4.1 (not on `mqttv5`: `Codec[T]` satisfies `mqttv5.Codec[T]` structurally) |
+| Depends on | `github.com/vmihailenco/msgpack/v5` v5.4.1 (not on `mqttv5`: `Encoding` satisfies `mqttv5.Encoding` structurally) |
 
 ## Overview
 
-`Codec[T]` encodes a value with `msgpack.Marshal` and decodes a payload
-into a new `T` with `msgpack.Unmarshal` — a smaller payload than JSON
-for the same value. `Typed[T].Publish` sends the encoded bytes;
-`Typed[T].Subscribe` and `SubscribeQueue` decode each message before
-delivering it. A payload that does not decode is logged at Warn
-(`mqttv5/typed: decode failed`, with the topic), acknowledged so the
-broker does not resend it, and not delivered.
+`Encoding` marshals any value with `msgpack.Marshal` and unmarshals a
+payload with `msgpack.Unmarshal` — a smaller payload than JSON for the
+same value. One `Encoding` serves every payload type; the type is named
+per call. A publish made with it declares the MQTT 5 Content Type
+`application/vnd.msgpack`, MessagePack's IANA registration, unless
+`PublishOptions.ContentType` says otherwise.
 
-The codec sets no MQTT properties: set `ContentType` in
-`PublishOptions` (for example `application/msgpack`) if receivers need
-it.
+A payload that does not decode is not delivered: the client acks it so
+the broker does not resend it, logs it at Warn (`mqttv5: payload decode
+failed`, with the topic), counts it in `Stats().DecodeFailures` and
+hands it to the subscription's `SubOnDecodeError`, if any.
+
+To receive msgpack on one subscription of a client whose `Encoding` is
+JSON, pass `mqttv5.SubEncoding(msgpackcodec.Encoding{})` to it.
 
 ## Configuration
 
-None: the zero value `Codec[T]{}` is the codec. Field names follow the
-`msgpack` struct tags on `T`.
+None: the zero value `Encoding{}` is the encoding. Field names follow
+the `msgpack` struct tags.
 
 ## External dependencies
 
@@ -44,11 +49,13 @@ None: the zero value `Codec[T]{}` is the codec. Field names follow the
 
 | Symbol | Description |
 |---|---|
-| `Codec[T any]` | MessagePack codec for `T`; zero value usable. |
-| `(Codec[T]) Encode(v T) ([]byte, error)` | `msgpack.Marshal(v)`. |
-| `(Codec[T]) Decode(b []byte) (T, error)` | `msgpack.Unmarshal` into a fresh `T`. |
+| `Encoding` | MessagePack encoding; zero value usable, safe for concurrent use. |
+| `(Encoding) ContentType() string` | `MediaType`. |
+| `(Encoding) Marshal(v any) ([]byte, error)` | `msgpack.Marshal(v)`. |
+| `(Encoding) Unmarshal(data []byte, v any) error` | `msgpack.Unmarshal(data, v)`; keeps nothing of `data`. |
+| `MediaType` | `"application/vnd.msgpack"`. |
 
-Other encodings (Protobuf, CBOR, …) need only a type with these two
+Other formats (Protobuf, CBOR, …) need only a type with these three
 methods; nothing in `mqttv5` depends on this package.
 
 ## Build, run, test
@@ -61,7 +68,7 @@ go -C codec/msgpack test -race ./...
 
 | Symptom | Check | Then |
 |---|---|---|
-| `mqttv5/typed: decode failed` in the logs | the topic in the log entry; what publishes there | The publisher sends another encoding or shape; such messages are acknowledged and dropped. |
+| `mqttv5: payload decode failed` in the logs; `Stats().DecodeFailures` rising | the topic in the log entry; what publishes there | The publisher sends another encoding or shape; such messages are acknowledged and not delivered. |
 
 ## Security
 
@@ -72,5 +79,5 @@ it with `mqttv5.WithMaximumPacketSize`.
 
 | File | What |
 |---|---|
-| `msgpack.go` | `Codec[T]` |
-| `msgpack_test.go` | round trips and decode errors |
+| `msgpack.go` | `Encoding`, `MediaType` |
+| `msgpack_test.go` | round trips, decode errors, and that a decoded value keeps nothing of its input |

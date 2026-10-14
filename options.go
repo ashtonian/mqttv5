@@ -226,6 +226,10 @@ type Config struct {
 	// always wait for the broker's ack.
 	PublishMode PublishMode
 
+	// Encoding encodes and decodes the payloads of the typed calls
+	// (PublishValue, SubscribeAs and their variants). See [WithEncoding].
+	Encoding Encoding
+
 	// OnConnectionUp fires on each successful CONNECT/CONNACK with
 	// what the broker granted, possibly after Connect has returned.
 	// Runs with the other lifecycle callbacks (see the package documentation).

@@ -218,49 +218,61 @@ func ExampleNewClientGroup() {
 	}
 }
 
-// readingCodec is a tiny inline [mqttv5.Codec] used by
-// [ExampleNewTyped]. In real code prefer the codec/json submodule or
-// any other implementation of mqttv5.Codec[T].
-type readingCodec struct{}
+// jsonEncoding is a tiny inline [mqttv5.Encoding] used by
+// [ExampleClient_SubscribeAs]. In real code use the codec/json
+// submodule's Encoding.
+type jsonEncoding struct{}
+
+func (jsonEncoding) ContentType() string             { return "application/json" }
+func (jsonEncoding) Marshal(v any) ([]byte, error)   { return json.Marshal(v) }
+func (jsonEncoding) Unmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
 
 type reading struct {
 	Device string  `json:"device"`
 	Temp   float64 `json:"temp"`
 }
 
-func (readingCodec) Encode(v reading) ([]byte, error) { return json.Marshal(v) }
-
-func (readingCodec) Decode(b []byte) (reading, error) {
-	var v reading
-	err := json.Unmarshal(b, &v)
-	return v, err
+type command struct {
+	Op string `json:"op"`
 }
 
-// ExampleNewTyped wraps a [mqttv5.Client] with a [mqttv5.Codec] so
-// Publish and Subscribe carry decoded values. Decode failures on the
-// receive path are logged + acked + dropped — wrap the codec for
-// stricter behaviour.
-func ExampleNewTyped() {
-	cli, _ := mqttv5.New(mqttv5.WithBroker("mqtt://localhost:1883"))
+// ExampleClient_SubscribeAs sets one [mqttv5.Encoding] on the client and
+// names the payload type per subscription. PublishValue encodes any
+// value and declares the Encoding's Content Type.
+func ExampleClient_SubscribeAs() {
+	cli, _ := mqttv5.New(
+		mqttv5.WithBroker("mqtt://localhost:1883"),
+		mqttv5.WithEncoding(jsonEncoding{}),
+	)
 	ctx := context.Background()
 	_ = cli.Connect(ctx)
 	defer cli.Disconnect(ctx)
 
-	typed := mqttv5.NewTyped[reading](cli, readingCodec{})
-
-	_ = typed.Publish(ctx,
-		mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
-		reading{Device: "a1", Temp: 22.5},
-	)
-
-	ch, _, err := typed.Subscribe(ctx,
+	readings, _, err := cli.SubscribeAs[reading](ctx,
 		[]mqttv5.TopicFilter{{Topic: "sensors/+", QoS: 1}})
 	if err != nil {
 		return
 	}
-	for m := range ch {
-		fmt.Println(m.Topic, m.Value.Temp)
-		_ = m.Ack()
+	commands, _, err := cli.SubscribeAs[command](ctx,
+		[]mqttv5.TopicFilter{{Topic: "devices/+/cmd", QoS: 1}})
+	if err != nil {
+		return
+	}
+
+	_ = cli.PublishValue(ctx,
+		mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
+		reading{Device: "a1", Temp: 22.5},
+	)
+
+	for {
+		select {
+		case m := <-readings:
+			fmt.Println(m.Topic, m.Value.Temp)
+			_ = m.Ack()
+		case m := <-commands:
+			fmt.Println(m.Topic, m.Value.Op)
+			_ = m.Ack()
+		}
 	}
 }
 

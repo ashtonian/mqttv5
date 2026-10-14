@@ -447,8 +447,8 @@ func TestTypedSubscribePartialRefusal(t *testing.T) {
 		c.Publish(wire.PublishOpts{Topic: "open/x", Payload: []byte(`"ok"`)})
 		c.ServeAuto()
 	})
-	typed := NewTyped(tbClient(t, b), testJSONCodec[string]{})
-	ch, tok, err := typed.Subscribe(context.Background(), []TopicFilter{{Topic: "open/#"}, {Topic: "secret/#"}})
+	cli := tbClient(t, b, WithEncoding(testJSON{}))
+	ch, tok, err := cli.SubscribeAs[string](context.Background(), []TopicFilter{{Topic: "open/#"}, {Topic: "secret/#"}})
 	var serr *SubscribeError
 	if !errors.As(err, &serr) || ch == nil || tok.Results() == nil {
 		t.Fatalf("Subscribe = %v, %v, %+v", ch, err, tok.Results())

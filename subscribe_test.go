@@ -249,21 +249,6 @@ func TestSubscribeAllowedWhenBrokerSupports(t *testing.T) {
 	}
 }
 
-// testJSONCodec is a tiny inline json Codec[T] for the typed tests.
-// The shipping json codec lives in its own submodule
-// (codec/json/json.go) so importing it would pull the codec submodule
-// into the main module's test dependency graph — the inline version
-// keeps main stdlib-only.
-type testJSONCodec[T any] struct{}
-
-func (testJSONCodec[T]) Encode(v T) ([]byte, error) { return json.Marshal(v) }
-
-func (testJSONCodec[T]) Decode(b []byte) (T, error) {
-	var v T
-	err := json.Unmarshal(b, &v)
-	return v, err
-}
-
 // pushPublishBroker is a raw testbroker handler factory that pushes one
 // PUBLISH on the given topic shortly after CONNACK + SUBSCRIBE.
 func pushPublishBroker(t *testing.T, payload []byte) func(*testbroker.Broker, net.Conn) {
@@ -422,30 +407,24 @@ func TestSubscribeQueue(t *testing.T) {
 	}
 }
 
-type sensorReading struct {
-	DeviceID string  `json:"device_id"`
-	Temp     float64 `json:"temp"`
-}
-
 func TestTypedPublishSubscribe(t *testing.T) {
 	// JSON-encode the expected payload so the broker pushes a payload
 	// the Typed decoder can read.
 	expected := sensorReading{DeviceID: "sensor-001", Temp: 42.7}
-	jsonBytes, _ := testJSONCodec[sensorReading]{}.Encode(expected)
+	jsonBytes, _ := json.Marshal(expected)
 
 	fb := testbroker.NewRaw(t, pushPublishBroker(t, jsonBytes))
 
-	cli, _ := New(WithBroker(fb.URL()))
+	cli, _ := New(WithBroker(fb.URL()), WithEncoding(testJSON{}))
 	if err := cli.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer cli.Disconnect(context.Background())
 
-	typed := NewTyped(cli, testJSONCodec[sensorReading]{})
-	ch, _, err := typed.Subscribe(context.Background(),
+	ch, _, err := cli.SubscribeAs[sensorReading](context.Background(),
 		[]TopicFilter{{Topic: "sensor/+", QoS: 1}}, SubBuffer(4))
 	if err != nil {
-		t.Fatalf("typed.Subscribe: %v", err)
+		t.Fatalf("SubscribeAs: %v", err)
 	}
 
 	select {

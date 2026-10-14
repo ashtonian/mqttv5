@@ -140,8 +140,11 @@ supervisor:
 - **Durable publishing.** `QueuePublisher` with `queue/file` and
   `store/file` keeps publishing through outages and survives a process
   crash without publishing an in-flight message twice.
-- **Typed payloads.** `Typed[T]` over a `Codec[T]`; JSON and msgpack
-  codecs ship as submodules, so the core stays standard library only.
+- **Typed payloads.** One `Encoding` on the client, the payload type per
+  call: `cli.SubscribeAs[Reading](…)` delivers decoded values and
+  `cli.PublishValue(…)` encodes any value and declares the MQTT 5
+  Content Type. JSON and msgpack Encodings ship as submodules, so the
+  core stays standard library only.
 - **The MQTT v5 feature set, tested against real brokers.** Shared
   subscriptions, Subscription Identifiers, topic aliases in both
   directions, session expiry and resumption, retained messages, the Will
@@ -166,7 +169,7 @@ multi-broker ones from the variables in
 |---|---|
 | [`examples/readme/quickstart`](examples/readme/quickstart) | The quick start above: connect, channel subscribe, publish |
 | [`examples/subscribe`](examples/subscribe) | Channel, queue and callback subscriptions, and what each does with a consumer that falls behind |
-| [`examples/typed`](examples/typed) | `Typed[T]` + JSON codec |
+| [`examples/typed`](examples/typed) | `SubscribeAs[T]` and `PublishValue` with the JSON Encoding: two payload types on one client, and a payload that does not decode |
 | [`examples/request`](examples/request) | MQTT 5 request/response: Response Topic, Correlation Data, a shared responder |
 | [`examples/durable`](examples/durable) | `QueuePublisher` on `queue/file` with `store/file`: publishing through outages and restarts |
 | [`examples/reconnect`](examples/reconnect) | Full lifecycle callback set (Up / Down / ConnectError / ReconnectAttempt) surviving a broker restart |
@@ -195,8 +198,8 @@ its own `go.mod`, so the core never pulls in its dependencies.
 | Submodule | Import | Purpose |
 |---|---|---|
 | core | `github.com/ashtonian/mqttv5` | Client, supervisor, options, in-memory queue |
-| JSON codec | `github.com/ashtonian/mqttv5/codec/json` | `Codec[T]` for `Typed[T]` (stdlib only) |
-| msgpack codec | `github.com/ashtonian/mqttv5/codec/msgpack` | `Codec[T]` via `vmihailenco/msgpack/v5` |
+| JSON codec | `github.com/ashtonian/mqttv5/codec/json` | `Encoding` for the typed calls (stdlib only) |
+| msgpack codec | `github.com/ashtonian/mqttv5/codec/msgpack` | `Encoding` via `vmihailenco/msgpack/v5` |
 | File session store | `github.com/ashtonian/mqttv5/store/file` | Crash-safe in-flight QoS 1/2 state |
 | File publish queue | `github.com/ashtonian/mqttv5/queue/file` | Crash-safe outbound publish queue for `QueuePublisher` |
 | WebSocket transport | `github.com/ashtonian/mqttv5/transport/ws` | ws:// and wss:// — `WithDialFunc(ws.DialFunc(ws.DialOpts{...}))` |
@@ -473,6 +476,9 @@ for m := range msgs { // first what arrived while the worker was down
 
 ## Typed publish / subscribe
 
+The client gets one `Encoding`; each call names its payload type, so
+one client handles any number of them.
+
 ```go
 import jsoncodec "github.com/ashtonian/mqttv5/codec/json"
 
@@ -481,27 +487,68 @@ type Reading struct {
     Temp   float64
 }
 
-typed := mqttv5.NewTyped[Reading](cli, jsoncodec.Codec[Reading]{})
+type Command struct {
+    Op string
+}
 
-_ = typed.Publish(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
+cli, _ := mqttv5.New(
+    mqttv5.WithBroker(url),
+    mqttv5.WithEncoding(jsoncodec.Encoding{}), // one Encoding, any payload type
+)
+
+readings, _, _ := cli.SubscribeAs[Reading](ctx,
+    []mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
+commands, _, _ := cli.SubscribeAs[Command](ctx,
+    []mqttv5.TopicFilter{{Topic: "devices/+/cmd", QoS: 1}})
+
+// Declares Content Type application/json.
+_ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
     Reading{Device: "a1", Temp: 22.5})
 
-ch, _, _ := typed.Subscribe(ctx,
-    []mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
-for m := range ch {
-    fmt.Println(m.Topic, m.Value.Temp)
-    _ = m.Ack()
+for {
+    select {
+    case m := <-readings:
+        fmt.Println(m.Topic, m.Value.Temp)
+        _ = m.Ack()
+    case m := <-commands:
+        fmt.Println(m.Topic, m.Value.Op)
+        _ = m.Ack()
+    }
 }
 ```
 
-Implement `mqttv5.Codec[T]` for protobuf, Cap'n Proto, FlatBuffers, or
-custom binary — the core has no codec dependency.
+- **Subscribing.** `SubscribeAs[T]`, `SubscribeQueueAs[T]` and
+  `SubscribeCallbackAs` are `Subscribe`, `SubscribeQueue` and
+  `SubscribeCallback` with each payload decoded into a `T`, with the
+  same buffering, bounds, drop policy, refusals and closing. A
+  `*TypedMessage[T]` carries the decoded `Value` beside the `*Message`,
+  which is acked as usual. Payloads are decoded on the connection's read
+  goroutine as they arrive, straight into the delivered message.
+- **Publishing.** `PublishValue` encodes any value and publishes it as
+  `Publish` does, declaring the Encoding's Content Type unless
+  `PublishOptions.ContentType` is set; `PublishOptions.Payload` must be
+  empty.
+- **A payload that does not decode** is not delivered: it is acked, so
+  the broker does not send it again, logged at Warn, counted in
+  `Stats().DecodeFailures`, and handed with the error to
+  `SubOnDecodeError` if the subscription set one.
+- **Several encodings.** `SubEncoding` decodes one subscription with
+  another `Encoding` than the client's. A `ClientGroup` member uses its
+  own, so a group can join brokers whose payloads differ.
+- **Groups and queues.** `ClientGroup.SubscribeAs`,
+  `ClientGroup.SubscribeQueueAs` and `ClientGroup.PublishValue` decode
+  and encode with each member's `Encoding`; `QueuePublisher.PublishValue`
+  encodes before the message is queued.
+- **Without an Encoding** every typed call returns `ErrNoEncoding`
+  before anything is sent.
 
-Payloads are decoded on the connection's read goroutine as they arrive
-and delivered with the buffer, bound and drop policy of
-`Client.Subscribe` / `SubscribeQueue`; a payload the codec rejects is
-logged, acked and dropped. The channel or queue closes when the
-subscription ends, whether or not anyone is still reading it.
+`codec/json` and `codec/msgpack` provide an `Encoding` each. For
+protobuf, Cap'n Proto, FlatBuffers or a format of your own, implement
+the three methods (`ContentType`, `Marshal`, `Unmarshal`); `Unmarshal`
+must not keep its input, which on a `SubZeroCopy` subscription is the
+network frame. The typed calls are generic methods (Go 1.27), and an
+interface cannot list a generic method: code that hides `*Client` behind
+an interface lists `Subscribe` and decodes itself.
 
 ---
 
@@ -1446,6 +1493,7 @@ See [`examples/disconnect`](examples/disconnect).
 | `WithPublisherPool(N)` | 0 (off) | N publish-only connections to the client's brokers, beside the main one, that `Publish` spreads over ([Publish pool](#publish-pool-withpublisherpool)). |
 | `WithPublisherPoolRouting(p)` | `PoolRoutingRoundRobin` | `PoolRoutingHashByTopic` preserves per-topic ordering. |
 | `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"`; empty (broker-assigned) when the parent ClientID is | Each member's ClientID from the parent's and a 1-based index, e.g. to fit a broker ACL pattern. IDs must be unique across every client of the broker. |
+| `WithEncoding(e)` | none | The `Encoding` of the typed calls (`PublishValue`, `SubscribeAs` and their variants), e.g. `jsoncodec.Encoding{}`; without one they return `ErrNoEncoding` ([Typed publish / subscribe](#typed-publish--subscribe)). |
 | `WithQoSDowngrade()` | off | Send a publish whose QoS exceeds the broker's Maximum QoS at that maximum instead of failing it with `ErrQoSNotSupported`. Weakens the guarantee (QoS 2 becomes at-least-once). |
 
 > **Broker limits.** Checked before a packet is written; see
@@ -1508,7 +1556,7 @@ after five seconds.
 ### Per-subscribe
 
 `SubscribeOption` applies to `Subscribe`, `SubscribeQueue`,
-`SubscribeCallback`, plus the `Typed[T]` and `ClientGroup` variants.
+`SubscribeCallback`, plus their typed (`SubscribeAs[T]`, …) and `ClientGroup` variants.
 
 | Option | Effect |
 |---|---|
@@ -1517,6 +1565,8 @@ after five seconds.
 | `SubDropPolicy(p)` | `DropNewest` / `DropOldest`. SubscribeQueue honours both, and `DropOldest` evicts whatever the QoS; chan-based `Subscribe` returns `ErrChanDropOldestUnsupported` when DropOldest is set explicitly. |
 | `SubOnDrop(fn)` | Hook run on the read goroutine before a dropped message is acked; every field is readable. Must not block or call `Disconnect`. |
 | `SubAutoAck()` | Opt-in: the dispatcher acks each delivery before handing it to the consumer, so a full buffer or queue drops QoS 1/2 messages too. See note below. Ignored by `SubscribeCallback`. |
+| `SubEncoding(e)` | Decode this typed subscription with `e` instead of the client's `Encoding`. Ignored by untyped subscriptions. |
+| `SubOnDecodeError(fn)` | `func(*Message, error)`, run on the read goroutine for each payload a typed subscription's `Encoding` rejects, before the message is acked. Must not block or call `Disconnect`. |
 | `SubZeroCopy()` | Deliver messages whose Topic / Payload / Properties alias the network frame (valid until every receiving subscription has acked; for callbacks, until return). Saves the copy: one allocation per message at QoS 0. Also accepted by `SubscribeCallback`. |
 
 > **`SubAutoAck` trade-offs.**
@@ -1610,6 +1660,7 @@ them with `errors.As`.
 | `ErrTopicAliasInvalid` | `Publish` | Topic Alias above the broker's maximum, or a QoS 1/2 publish with an alias but no topic. |
 | `ErrRetainNotSupported` | `Publish` | Retained message on a broker with Retain Available = 0. |
 | `ErrPacketTooLarge` | `Publish`, `Subscribe*`, `Unsubscribe` | Packet above the broker's Maximum Packet Size; nothing was sent. |
+| `ErrNoEncoding` | `PublishValue`, `SubscribeAs` and their variants | No `Encoding`: set `WithEncoding`, or `SubEncoding` for one subscription. Nothing was sent. |
 | `ErrSessionLost` | `Publish` (QoS 1/2) | Session lost with `WithSessionLossPolicy(SessionLossFail)`. |
 | `ErrMessageExpired` | `Publish` (QoS 1/2) | Message Expiry ran out before a republish after session loss. |
 | `ErrPacketIDsExhausted` | `Publish`, `Subscribe*` | All 65,535 packet identifiers in use until ctx ended. |
@@ -2043,6 +2094,7 @@ fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
 | `SendQuota` | gauge | QoS 1/2 publishes the broker's Receive Maximum still allows in flight |
 | `InboundPublishes` | counter | PUBLISH packets received |
 | `InboundDropped` | counter | Received messages dropped because a subscription's buffer or queue was full |
+| `DecodeFailures` | counter | Payloads a typed subscription's `Encoding` rejected: acked and not delivered |
 | `SubscribesSent`, `UnsubscribesSent` | counter | SUBSCRIBE and UNSUBSCRIBE packets sent |
 | `SubscriptionsActive` | gauge | Subscriptions registered on the client |
 | `PoolFallbacks` | counter | Publishes the main connection sent because no pool member could |
@@ -2068,6 +2120,8 @@ Worth alerting on:
 - `ConnectFailures` or `Disconnects` rising: the connection is
   flapping ([Troubleshooting](#troubleshooting)).
 - `InboundDropped` rising: a consumer is behind the stream.
+- `DecodeFailures` rising: a publisher sends payloads the subscription's
+  `Encoding` cannot decode.
 - `PoolConnected` below the pool size, or `PoolFallbacks` rising: pool
   members cannot connect.
 - `StoreErrors` or `ProtocolErrors` above zero.
@@ -2094,6 +2148,7 @@ Normal message traffic logs nothing.
 | `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
 | QoS 1/2 `Publish` slow while subscriptions are busy | how long `SubscribeCallback` handlers and `SubOnDrop` hooks take | They run on the read loop that also reads this client's publish acknowledgements: move slow work to a channel or queue subscription, or publish through a [publish pool](#publish-pool-withpublisherpool) |
 | `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
+| Typed messages missing; Warn log `payload decode failed` | `Stats().DecodeFailures`; the topic in the log; `SubOnDecodeError` | The publisher sends another format or shape than the subscription's `Encoding` and type expect: fix the publisher, or use `SubEncoding` / another type for that topic |
 | Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream. Only QoS 0 messages are dropped, unless `SubAutoAck` or `DropOldest` is set: raise `SubBuffer` / `SubMaxQueueSize`, subscribe at QoS 1, consume faster, or use a callback (backpressure) |
 | Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
 | `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
@@ -2247,7 +2302,8 @@ control queue that survives reconnects.
 | `subscribe.go`, `subscription.go` | subscribe API with its results and tokens, `Message` and its delivery, `Queue[T]`; the subscription registry and control queue |
 | `queue_publisher.go` | `QueuePublisher`, the `PublisherQueue` interface and its in-memory implementation |
 | `client_group.go` | `ClientGroup` |
-| `types.go` | public value types, errors, `Codec[T]` and `Typed[T]` |
+| `types.go` | public value types and errors |
+| `encoding.go` | `Encoding` and the typed calls: `PublishValue`, `SubscribeAs` and their variants, `TypedMessage` |
 | `doc.go` | package documentation |
 | `*_test.go` | a test file per source file, plus `helpers_test.go`, `session_test.go` (sessions and stores across connections), `bench_test.go`, `example_test.go` and `readme_test.go` |
 | `internal/inflight` | session engine: packet identifiers, QoS 1/2 state, quota, replay, store writes |
@@ -2259,7 +2315,7 @@ control queue that survives reconnects.
 | `wire` | MQTT v5 codec (unstable API) |
 | `transport`, `transport/ws` | TCP/TLS dialing; WebSocket |
 | `store/file`, `queue/file` | durable session store and publish queue |
-| `codec/json`, `codec/msgpack` | `Codec[T]` implementations |
+| `codec/json`, `codec/msgpack` | `Encoding` implementations |
 | `conformance` | tests against real brokers (`-tags conformance`) |
 | `benchmarks` | head-to-head benchmarks, raw results, `benchtab` |
 | `examples`, `examples/readme` | runnable examples; the README's snippets as compiled code |
@@ -2312,7 +2368,7 @@ mqttv5 is pre-1.0: any minor release may change the API.
 
 - The client API is the `mqttv5` package: `Client`, `Config`, the
   options, `Stats`, and its value types (`PublishOptions`,
-  `TopicFilter`, `Message`, `Properties`, `ConnackInfo`,
+  `TopicFilter`, `Message`, `TypedMessage`, `Properties`, `ConnackInfo`,
   `DisconnectInfo`, `WillOptions`, `ConnectOptions`,
   `DisconnectOptions`, `ServerRedirect`, results and errors).
 - `ReasonCode`, `PacketType` and `UserProperty` are the protocol's own

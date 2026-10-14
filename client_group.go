@@ -390,30 +390,42 @@ func (g *ClientGroup) lifecycleOp(ctx context.Context, label string, op func(idx
 // could not send it at all (not connected), so a broker refusal or ctx
 // ending is returned as is and never duplicates the message.
 func (g *ClientGroup) Publish(ctx context.Context, opts PublishOptions) ([]GroupResult, error) {
+	return g.publish(ctx, opts.Topic, func(*Client) (PublishOptions, error) { return opts, nil })
+}
+
+// publish sends what optsFor makes for each member it publishes on,
+// under the group's publish policy. topic is the message's, for
+// GroupPublishHashByTopic.
+func (g *ClientGroup) publish(ctx context.Context, topic string, optsFor func(*Client) (PublishOptions, error)) ([]GroupResult, error) {
 	if g.closed.Load() {
 		return nil, ErrClosed
 	}
 	switch g.cfg.publishPolicy {
 	case GroupPublishRoundRobin:
-		return g.publishStartingAt(ctx, opts, g.rrCursor.Add(1))
+		return g.publishStartingAt(ctx, optsFor, g.rrCursor.Add(1))
 	case GroupPublishHashByTopic:
 		var start uint64
-		if opts.Topic != "" {
+		if topic != "" {
 			h := fnv.New32a()
-			_, _ = h.Write([]byte(opts.Topic))
+			_, _ = h.Write([]byte(topic))
 			start = uint64(h.Sum32())
 		}
-		return g.publishStartingAt(ctx, opts, start)
+		return g.publishStartingAt(ctx, optsFor, start)
 	default:
-		return g.publishBroadcast(ctx, opts)
+		return g.publishBroadcast(ctx, optsFor)
 	}
 }
 
-func (g *ClientGroup) publishBroadcast(ctx context.Context, opts PublishOptions) ([]GroupResult, error) {
+func (g *ClientGroup) publishBroadcast(ctx context.Context, optsFor func(*Client) (PublishOptions, error)) ([]GroupResult, error) {
 	results := make([]GroupResult, len(g.members))
 	var wg sync.WaitGroup
 	for i, m := range g.members {
 		results[i].Member = g.names[i]
+		opts, err := optsFor(m)
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
 		wg.Go(func() { results[i].Err = m.Publish(ctx, opts) })
 	}
 	wg.Wait()
@@ -429,13 +441,18 @@ func (g *ClientGroup) publishBroadcast(ctx context.Context, opts PublishOptions)
 	return results, nil
 }
 
-// publishStartingAt tries members from start until one sends opts.
-func (g *ClientGroup) publishStartingAt(ctx context.Context, opts PublishOptions, start uint64) ([]GroupResult, error) {
+// publishStartingAt tries members from start until one sends what
+// optsFor makes for it.
+func (g *ClientGroup) publishStartingAt(ctx context.Context, optsFor func(*Client) (PublishOptions, error), start uint64) ([]GroupResult, error) {
 	n := uint64(len(g.members))
 	var results []GroupResult
 	for i := range n {
 		idx := (start + i) % n
-		err := g.members[idx].Publish(ctx, opts)
+		m := g.members[idx]
+		opts, err := optsFor(m)
+		if err == nil {
+			err = m.Publish(ctx, opts)
+		}
 		results = append(results, GroupResult{Member: g.names[idx], Err: err})
 		if !notSent(err) {
 			return results, err
@@ -460,10 +477,20 @@ func (g *ClientGroup) publishStartingAt(ctx context.Context, opts PublishOptions
 // returns at once, as [Client.Subscribe] does, and each member's
 // SUBSCRIBE goes out first on its connection.
 func (g *ClientGroup) Subscribe(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (<-chan *Message, map[string]SubscriptionToken, error) {
+	return g.subscribeChan(ctx, filters, opts, ownMessages)
+}
+
+// subscribeChan subscribes every member with one merged channel of the
+// elements wrap makes; see [ClientGroup.Subscribe].
+func (g *ClientGroup) subscribeChan[T any](ctx context.Context, filters []TopicFilter, opts []SubscribeOption, wrap wrapper[T]) (<-chan T, map[string]SubscriptionToken, error) {
 	if g.closed.Load() {
 		return nil, nil, ErrClosed
 	}
 	cfg, err := g.members[0].chanSubscribeConfig(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	convs, err := memberWraps(g.members, cfg, wrap)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -473,9 +500,9 @@ func (g *ClientGroup) Subscribe(ctx context.Context, filters []TopicFilter, opts
 		// the buffer by one for each other member.
 		cfg.room += len(g.members) - 1
 	}
-	merged := make(chan *Message, cfg.bufferSize+cfg.room)
-	tokens, err := g.subscribeAll(ctx, filters, func() { close(merged) }, func(m *Client) *route {
-		return &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(m, cfg, merged, ownMessage)}
+	merged := make(chan T, cfg.bufferSize+cfg.room)
+	tokens, err := g.subscribeAll(ctx, filters, func() { close(merged) }, func(i int, m *Client) *route {
+		return &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: chanDeliver(m, cfg, merged, convs[i])}
 	})
 	if err != nil {
 		return nil, nil, err
@@ -483,18 +510,42 @@ func (g *ClientGroup) Subscribe(ctx context.Context, filters []TopicFilter, opts
 	return merged, tokens, nil
 }
 
+// memberWraps builds each member's wrap function before anything is
+// subscribed, so a member that cannot decode fails the call up front.
+func memberWraps[T any](members []*Client, cfg subscribeConfig, wrap wrapper[T]) ([]func(*Message) (T, bool), error) {
+	convs := make([]func(*Message) (T, bool), len(members))
+	for i, m := range members {
+		conv, err := wrap(m, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("mqttv5: ClientGroup member %d: %w", i+1, err)
+		}
+		convs[i] = conv
+	}
+	return convs, nil
+}
+
 // SubscribeQueue is the queue-merged variant of Subscribe, with the
 // bound and drop policy of [Client.SubscribeQueue] applied to the merged
 // queue as a whole.
 func (g *ClientGroup) SubscribeQueue(ctx context.Context, filters []TopicFilter, opts ...SubscribeOption) (*Queue[*Message], map[string]SubscriptionToken, error) {
+	return g.subscribeQueue(ctx, filters, opts, ownMessages, sameMessage)
+}
+
+// subscribeQueue subscribes every member with one merged queue of the
+// elements wrap makes; see [ClientGroup.SubscribeQueue].
+func (g *ClientGroup) subscribeQueue[T any](ctx context.Context, filters []TopicFilter, opts []SubscribeOption, wrap wrapper[T], message func(T) *Message) (*Queue[T], map[string]SubscriptionToken, error) {
 	if g.closed.Load() {
 		return nil, nil, ErrClosed
 	}
 	cfg := g.members[0].subscribeConfigFrom(opts)
+	convs, err := memberWraps(g.members, cfg, wrap)
+	if err != nil {
+		return nil, nil, err
+	}
 	cfg.room = g.qosRoom(cfg, filters)
-	merged := NewQueue[*Message]()
-	tokens, err := g.subscribeAll(ctx, filters, merged.Close, func(m *Client) *route {
-		return &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(m, cfg, merged, ownMessage, func(m *Message) *Message { return m })}
+	merged := NewQueue[T]()
+	tokens, err := g.subscribeAll(ctx, filters, merged.Close, func(i int, m *Client) *route {
+		return &route{zeroCopy: cfg.zeroCopyDelivery(), deliver: queueDeliver(m, cfg, merged, convs[i], message)}
 	})
 	if err != nil {
 		return nil, nil, err
@@ -515,7 +566,7 @@ func (g *ClientGroup) qosRoom(cfg subscribeConfig, filters []TopicFilter) int {
 // subscribeAll subscribes every member with the route newRoute builds
 // for it. closeOutput runs once every member's subscription has ended,
 // including those that never started.
-func (g *ClientGroup) subscribeAll(ctx context.Context, filters []TopicFilter, closeOutput func(), newRoute func(*Client) *route) (map[string]SubscriptionToken, error) {
+func (g *ClientGroup) subscribeAll(ctx context.Context, filters []TopicFilter, closeOutput func(), newRoute func(int, *Client) *route) (map[string]SubscriptionToken, error) {
 	n := len(g.members)
 	var remaining atomic.Int32
 	remaining.Store(int32(n))
@@ -532,7 +583,7 @@ func (g *ClientGroup) subscribeAll(ctx context.Context, filters []TopicFilter, c
 	tokens := make([]SubscriptionToken, n)
 	run := func(i int) {
 		m := g.members[i]
-		tokens[i], results[i].Err = m.subscribe(ctx, filters, newRoute(m), ended[i])
+		tokens[i], results[i].Err = m.subscribe(ctx, filters, newRoute(i, m), ended[i])
 		results[i].Member = g.names[i]
 	}
 	if g.cfg.parallel {

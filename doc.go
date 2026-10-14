@@ -33,9 +33,11 @@
 // 1/2 messages and its own read loop, while subscriptions and any
 // persistent session stay on the main connection.
 //
-// Typed publish / subscribe goes through the generic [Codec] interface;
-// JSON and msgpack ship in separate submodules so the core stays
-// stdlib-only. The durable outbound [QueuePublisher] lets you enqueue
+// Typed publish / subscribe takes one [Encoding] per client
+// ([WithEncoding]) and the payload type per call: [Client.SubscribeAs]
+// delivers decoded values and [Client.PublishValue] encodes any value
+// and declares the Encoding's Content Type. JSON and msgpack Encodings
+// ship in separate submodules so the core stays stdlib-only. The durable outbound [QueuePublisher] lets you enqueue
 // publishes while disconnected, keeps a window of them in flight once
 // connected, and, with the queue/file and store/file submodules,
 // continues the exchanges in flight after a process crash instead of
