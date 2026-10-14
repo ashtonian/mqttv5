@@ -1382,7 +1382,10 @@ func TestDisconnectDrainIsBoundedByCtx(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- cli.Disconnect(ctx) }()
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Disconnect = %v, want the deadline that cut the drain short", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Disconnect outlived its ctx")
 	}
@@ -1469,4 +1472,31 @@ func TestPoolPublishesWhileMainConnectionIsDown(t *testing.T) {
 	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1}); err != nil {
 		t.Fatalf("Publish with the main connection down = %v", err)
 	}
+}
+
+// A member whose first CONNECT is still pending when the caller's ctx
+// ends keeps trying in the background, as one refused does: Connect's
+// deadline bounds the call, not the pool.
+func TestPoolMemberSurvivesConnectDeadline(t *testing.T) {
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		c.ServeAuto()
+	}, func(c *testbroker.Conn) {
+		if _, ok := c.Await(wire.CONNECT, 0); !ok {
+			return
+		}
+		c.Hold(0) // no CONNACK; the member's next attempt reaches the fallback
+	})
+	cli, err := New(WithBroker(b.URL()), WithClientID("deadline"), WithPublisherPool(1), WithLogger(quietLogger()),
+		WithConnectTimeout(300*time.Millisecond), WithReconnectBackoff(ConstantBackoff(10*time.Millisecond)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatalf("Connect = %v", err)
+	}
+	waitForPoolReady(t, cli, 1, 3*time.Second)
 }

@@ -745,11 +745,64 @@ func TestKeepAliveDetectsHalfOpen(t *testing.T) {
 	}
 }
 
-// busy marks the read loop as inside application code (a SubscribeCallback
-// handler, say) or, with false, as back from it.
-func (h *pingHarness) busy(on bool) {
-	if odd := h.c.appCalls.Load()%2 == 1; odd != on {
-		h.c.appCalls.Add(1)
+// hold runs a SubscribeCallback handler through the real route, as the
+// read loop would, until the returned function releases it.
+func (h *pingHarness) hold() (release func()) {
+	gate, entered, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	r := &route{sync: true, deliver: func(*Message) { close(entered); <-gate }}
+	d := &delivery{client: h.c}
+	d.refs.Store(1)
+	d.first.d = d
+	go func() {
+		defer close(done)
+		r.dispatch(&d.first)
+	}()
+	<-entered
+	return func() { close(gate); <-done }
+}
+
+// blockingAuth is an Authenticator whose Continue, and VerifyServerFinal,
+// wait for release once entered is closed.
+type blockingAuth struct {
+	entered, release chan struct{}
+}
+
+func (*blockingAuth) Method() string                        { return "ECHO" }
+func (*blockingAuth) Begin(context.Context) ([]byte, error) { return nil, nil }
+func (a *blockingAuth) Continue([]byte) ([]byte, bool, error) {
+	close(a.entered)
+	<-a.release
+	return nil, false, nil
+}
+func (a *blockingAuth) VerifyServerFinal([]byte) error {
+	close(a.entered)
+	<-a.release
+	return nil
+}
+
+// An Authenticator answering a re-authentication runs on the read loop
+// too; the keep-alive waits it out as it waits out a handler.
+func TestKeepAliveWaitsOutAnAuthenticator(t *testing.T) {
+	for _, reason := range []wire.ReasonCode{wire.ReasonContinueAuthentication, wire.ReasonSuccess} {
+		t.Run(fmt.Sprintf("reason=0x%02X", byte(reason)), func(t *testing.T) {
+			h := newPingHarness(t, 2*time.Second, time.Second)
+			h.answer = false // nothing is read while the Authenticator holds the loop
+			auth := &blockingAuth{entered: make(chan struct{}), release: make(chan struct{})}
+			h.c.cfg.Authenticator = auth
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				h.c.handleReauthInbound(h.cs, &reauthCall{result: make(chan error, 1)}, reason, nil)
+			}()
+			<-auth.entered
+			h.read(h.clk.Now()) // the AUTH that started it was read
+			h.run(10*time.Second, 100*time.Millisecond)
+			close(auth.release)
+			<-done
+			if !h.died.IsZero() {
+				t.Fatalf("declared dead at %v while the Authenticator held the read loop", h.died)
+			}
+		})
 	}
 }
 
@@ -760,7 +813,7 @@ func TestKeepAliveWaitsOutApplicationCode(t *testing.T) {
 	keep, timeout := 2*time.Second, time.Second
 	h := newPingHarness(t, keep, timeout)
 	h.answer = false // what the broker answers is not read while the loop is busy
-	h.busy(true)
+	release := h.hold()
 	h.run(20*time.Second, 100*time.Millisecond)
 	if !h.died.IsZero() {
 		t.Fatalf("declared dead at %v while a handler held the read loop", h.died)
@@ -777,7 +830,7 @@ func TestKeepAliveWaitsOutApplicationCode(t *testing.T) {
 	if h.clk.Now().Sub(prev) > keep {
 		t.Fatalf("no PINGREQ since %v", prev)
 	}
-	h.busy(false)
+	release()
 	h.read(h.clk.Now()) // the PINGRESP waiting in the socket
 	h.answer = true
 	h.run(20*time.Second, 100*time.Millisecond)
@@ -792,13 +845,13 @@ func TestKeepAliveDetectsSilenceAfterApplicationCode(t *testing.T) {
 	keep, timeout := 2*time.Second, time.Second
 	h := newPingHarness(t, keep, timeout)
 	h.answer = false
-	h.busy(true)
+	release := h.hold()
 	h.run(10*time.Second, 100*time.Millisecond)
 	if !h.died.IsZero() {
 		t.Fatalf("declared dead at %v while a handler held the read loop", h.died)
 	}
 	freed := h.clk.Now()
-	h.busy(false)
+	release()
 	h.run(time.Minute, 100*time.Millisecond)
 	if h.died.IsZero() {
 		t.Fatal("silent broker not detected after the handler returned")

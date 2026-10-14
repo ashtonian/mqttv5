@@ -87,8 +87,14 @@ func (c *Client) PublishValue(ctx context.Context, opts PublishOptions, v any) e
 
 // PublishValue encodes v with each member's [Encoding] and publishes it
 // as [ClientGroup.Publish] does; members with different Encodings send
-// differently encoded copies.
+// differently encoded copies. If any member has no Encoding it returns
+// [ErrNoEncoding] and publishes nothing.
 func (g *ClientGroup) PublishValue(ctx context.Context, opts PublishOptions, v any) ([]GroupResult, error) {
+	for i, m := range g.members {
+		if m.cfg.Encoding == nil {
+			return nil, fmt.Errorf("mqttv5: ClientGroup member %q: %w", g.names[i], ErrNoEncoding)
+		}
+	}
 	return g.publish(ctx, opts.Topic, func(m *Client) (PublishOptions, error) {
 		return encodePayload(m.cfg.Encoding, opts, v)
 	})

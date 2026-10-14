@@ -348,3 +348,32 @@ func TestQueuePublisherPublishValue(t *testing.T) {
 		t.Errorf("queued PUBLISH %s as %q", pubs[0].Payload, ct)
 	}
 }
+
+// A group publishes a value only when every member can encode it, so
+// ErrNoEncoding means nothing was sent.
+func TestGroupPublishValueWithoutAnEncodingSendsNothing(t *testing.T) {
+	b := testbroker.New(t)
+	g, err := NewClientGroup([]GroupMember{
+		{Name: "encoded", Brokers: []string{b.URL()}, Opts: []Option{WithEncoding(testJSON{})}},
+		{Name: "missing", Brokers: []string{b.URL()}},
+	}, WithGroupSharedOpts(WithLogger(quietLogger())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := g.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer g.Disconnect(context.Background())
+	if _, err := g.PublishValue(ctx, PublishOptions{Topic: "t", QoS: 1}, 42); !errors.Is(err, ErrNoEncoding) {
+		t.Fatalf("PublishValue = %v, want ErrNoEncoding", err)
+	}
+	for i := range b.Accepted() {
+		for _, p := range b.Conn(i, time.Second).Log() {
+			if p.Type == wire.PUBLISH {
+				t.Fatalf("ErrNoEncoding returned, yet %q was published", p.Payload)
+			}
+		}
+	}
+}

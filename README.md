@@ -20,7 +20,8 @@ store, process restarts.
   ([Multiple brokers](#multiple-brokers)).
 - Publishing can move to a pool of publish-only connections to the same
   broker: more QoS 1/2 publishes in flight than one connection allows,
-  and none waiting behind a slow subscription handler
+  and none of those the members carry waiting behind a slow
+  `SubscribeCallback` handler
   ([Publish pool](#publish-pool-withpublisherpool)).
 - Decoding a PUBLISH of up to 64 KiB allocates nothing once pools are
   warm.
@@ -135,7 +136,7 @@ supervisor:
 - **Publishing apart from receiving.** `WithPublisherPool` adds
   publish-only connections to the same broker, each with a QoS 1/2
   window of its own; subscriptions stay on the main connection, so a
-  slow `SubscribeCallback` handler never holds up a publish
+  slow `SubscribeCallback` handler holds up no publish a member carries
   ([Publish pool](#publish-pool-withpublisherpool)).
 - **Durable publishing.** `QueuePublisher` with `queue/file` and
   `store/file` keeps publishing through outages and survives a process
@@ -328,7 +329,8 @@ cli, _ := mqttv5.New(
   fails keeps retrying in the background; `Stats().PoolConnected` counts
   the members connected.
 - **Guarantees.** Members have no session that outlives their
-  connection: each connects with Clean Start = 1 and Session Expiry 0.
+  connection: each connects with Session Expiry 0 (and Clean Start = 1
+  the first time).
   A QoS 1/2 publish interrupted by a member's reconnect follows the
   session-loss policy — sent again, possibly duplicated, so QoS 2 is not
   exactly-once across it. Publish what must resume exactly on a
@@ -354,8 +356,9 @@ cli, _ := mqttv5.New(
   connected and publishing goes on. `Disconnect` refuses new publishes
   with `ErrClosed`, waits, bounded by its ctx, for those in flight on
   members (a member's session ends with its connection, so nothing could
-  finish them later), then disconnects the members; a publish its ctx
-  cuts short returns `ErrClosed`, and the broker may or may not have it.
+  finish them later), then disconnects the members. A publish its ctx
+  cuts short returns `ErrClosed`, and the broker may or may not have it;
+  `Disconnect` then returns ctx's error.
 - **Client-wide calls.** `Reauthenticate` re-authenticates every
   connected member along with the main connection, so the
   `Authenticator` must be safe for concurrent use. `Stats()` counts the
@@ -368,8 +371,10 @@ cli, _ := mqttv5.New(
   so on the main connection a slow handler holds up publishes too: with
   100 messages queued for a 10 ms handler, a QoS 1 publish waits about
   a second. A member reads its own acknowledgements and never waits on
-  them. Channel and queue subscriptions hand messages off without
-  blocking the loop, so they hold up nothing either way.
+  them, so its publishes don't wait — though a publish that falls back
+  to the main connection does. Channel and queue subscriptions hand
+  messages to their consumer without waiting for it; only their typed
+  decoding and `SubOnDrop` / `SubOnDecodeError` hooks run on the loop.
 - **A pool of one** adds no window, but is enough to keep publishes
   from waiting behind the subscriptions' handlers.
 
@@ -518,10 +523,15 @@ cli, _ := mqttv5.New(
     mqttv5.WithEncoding(jsoncodec.Encoding{}), // one Encoding, any payload type
 )
 
+// Subscribed before Connect, so nothing the broker sends is missed.
 readings, _, _ := cli.SubscribeAs[Reading](ctx,
     []mqttv5.TopicFilter{{Topic: "sensors/#", QoS: 1}})
 commands, _, _ := cli.SubscribeAs[Command](ctx,
     []mqttv5.TopicFilter{{Topic: "devices/+/cmd", QoS: 1}})
+if err := cli.Connect(ctx); err != nil {
+    log.Fatal(err)
+}
+defer cli.Disconnect(ctx)
 
 // Declares Content Type application/json.
 _ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
@@ -529,10 +539,16 @@ _ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "sensors/a1", QoS: 1},
 
 for {
     select {
-    case m := <-readings:
+    case m, ok := <-readings:
+        if !ok {
+            return
+        }
         fmt.Println(m.Topic, m.Value.Temp)
         _ = m.Ack()
-    case m := <-commands:
+    case m, ok := <-commands:
+        if !ok {
+            return
+        }
         fmt.Println(m.Topic, m.Value.Op)
         _ = m.Ack()
     }
@@ -559,8 +575,9 @@ for {
   own, so a group can join brokers whose payloads differ.
 - **Groups and queues.** `ClientGroup.SubscribeAs`,
   `ClientGroup.SubscribeQueueAs` and `ClientGroup.PublishValue` decode
-  and encode with each member's `Encoding`; `QueuePublisher.PublishValue`
-  encodes before the message is queued.
+  and encode with each member's `Encoding`, and need one on every
+  member; `QueuePublisher.PublishValue` encodes before the message is
+  queued.
 - **Without an Encoding** every typed call returns `ErrNoEncoding`
   before anything is sent.
 
@@ -971,8 +988,9 @@ flowchart LR
 Members never stand in for each other: if your brokers are
 interchangeable for the same data, use `WithBrokers` on a single
 `Client`. Pointed at one cluster, a group's members would each
-subscribe to the same messages, so a merged subscription would deliver
-every message once per member; for publish throughput into one broker
+subscribe to the same messages, so a merged subscription to a filter
+that is not a shared subscription would deliver every message once per
+member; for publish throughput into one broker
 or cluster, use a [publish pool](#publish-pool-withpublisherpool). A member can have several `Brokers` of its own to fail over
 between ([regional HA](#regional-ha)).
 
@@ -1411,8 +1429,10 @@ instance's session expires first. Make each instance a
    new publishes with `ErrClosed`, waits, bounded by ctx, for those in
    flight on pool members, and disconnects the members.
 
-Unfinished QoS 1/2 exchanges of the main connection stay in the session
-for the next `Connect`; a pool member's session ends with its
+`Disconnect` returns ctx's error, joined with the pool members'
+disconnect errors, if ctx ended before steps 3 or 4 completed. Unfinished
+QoS 1/2 exchanges of the main connection stay in the session for the
+next `Connect`; a pool member's session ends with its
 connection, which is why step 4 waits for them.
 `Disconnect` is idempotent and does not fire `OnConnectionDown`: the
 call itself is the "going down" signal. A lifecycle callback may call
@@ -1503,8 +1523,10 @@ See [`examples/disconnect`](examples/disconnect).
 > Time the read loop spends in application code — a `SubscribeCallback`
 > handler, a `SubOnDrop` or `SubOnDecodeError` hook, an `Encoding` — is
 > not taken for the broker's silence, since the answer may be waiting
-> unread: PINGREQs keep going out, and a broker that really is silent is
-> detected within two `PingTimeout`s of the loop being free.
+> unread: PINGREQs keep going out and the verdict waits. A broker that
+> really is silent is then detected within two `PingTimeout`s of the
+> loop being free, or, if no PINGREQ was outstanding, after the usual
+> `KeepAlive + PingTimeout`.
 
 #### Reconnect
 
@@ -2123,11 +2145,11 @@ fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
 |---|---|---|
 | `Connects` | counter | Successful CONNECT/CONNACK handshakes |
 | `ConnectFailures` | counter | Connection attempts that failed, for any reason (dial, TLS, CONNACK refusal, authentication) |
-| `Disconnects` | counter | Connections that ended, for any reason |
+| `Disconnects` | counter | Connections lost, for any reason but `Disconnect` |
 | `ServerDisconnects` | counter | DISCONNECT packets the broker sent |
 | `PingTimeouts` | counter | Connections declared dead after a PINGREQ went unanswered |
-| `PublishesSent` | counter | Publishes that succeeded: QoS 0 once queued (or written, with `PublishWaitForFlush`), QoS 1/2 once the broker accepted them; `QueuePublisher` messages included |
-| `PublishesAcked` | counter | PUBACK and PUBCOMP packets received, refusals included |
+| `PublishesSent` | counter | `Publish` calls that returned nil — QoS 0 once queued (or written, with `PublishWaitForFlush`), QoS 1/2 once acknowledged — and `QueuePublisher` messages the broker accepted |
+| `PublishesAcked` | counter | PUBACK and PUBCOMP packets received, refusals included, and those for publishes whose caller stopped waiting |
 | `PublishesReplayed` | counter | QoS 1/2 publishes resent after a reconnect |
 | `PublishesInflight` | gauge | QoS 1/2 publishes waiting for their acknowledgement |
 | `SendQuota` | gauge | QoS 1/2 publishes the broker's Receive Maximum still allows in flight |
@@ -2137,7 +2159,7 @@ fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
 | `DecodeFailures` | counter | Payloads a typed subscription's `Encoding` rejected: acked and not delivered |
 | `SubscribesSent`, `UnsubscribesSent` | counter | SUBSCRIBE and UNSUBSCRIBE packets sent |
 | `SubscriptionsActive` | gauge | Subscriptions registered on the client |
-| `PoolFallbacks` | counter | Publishes the main connection sent because no pool member could |
+| `PoolFallbacks` | counter | Publishes no pool member could send, handed to the main connection, whether or not it could send them |
 | `PoolConnected` | gauge | Publish pool members with a live connection |
 | `AcksIgnored` | counter | Acknowledgements for an unknown or mismatched packet identifier |
 | `StoreErrors` | counter | Failed `session.Store` operations |

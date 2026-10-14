@@ -201,8 +201,9 @@ type reauthCall struct {
 // With a publisher pool the outcomes above describe the main connection,
 // joined with any pool member's failure (prefixed with the member), so
 // errors.Is sees every one: a rejected member reconnects as the main
-// connection would. A member that is not connected is skipped; its next
-// CONNECT presents a fresh credential.
+// connection would, and one lost during its exchange reports
+// ErrNotConnected. A member not connected when the call starts is
+// skipped; its next CONNECT presents a fresh credential.
 func (c *Client) Reauthenticate(ctx context.Context) error {
 	if c.cfg.Authenticator == nil {
 		return ErrNoAuthenticator
@@ -213,10 +214,12 @@ func (c *Client) Reauthenticate(ctx context.Context) error {
 	poolDone := make(chan error, 1)
 	go func() {
 		poolDone <- c.pool.each(func(m *Client) error {
-			if err := m.reauthenticate(ctx); !errors.Is(err, ErrNotConnected) {
-				return err
+			// A member not connected now presents a fresh credential
+			// when it connects; one lost during its exchange failed.
+			if !m.Connected() {
+				return nil
 			}
-			return nil
+			return m.reauthenticate(ctx)
 		})
 	}()
 	err := c.reauthenticate(ctx)
@@ -322,7 +325,10 @@ func (c *Client) handleReauthInbound(cs *connState, call *reauthCall, pktReason 
 		// server's final data, a failure means the broker is not trusted
 		// — report it to the caller and tear the connection down.
 		if v, ok := c.cfg.Authenticator.(ServerFinalVerifier); ok {
-			if err := v.VerifyServerFinal(brokerData); err != nil {
+			c.appCalls.Add(1) // application code on the read loop (see Client.appCalls)
+			err := v.VerifyServerFinal(brokerData)
+			c.appCalls.Add(1)
+			if err != nil {
 				call.result <- fmt.Errorf("mqttv5: server re-authentication verification failed: %w", err)
 				c.writeDisconnectAndClose(cs, wire.DisconnectOpts{ReasonCode: wire.ReasonNotAuthorized})
 				return
@@ -335,7 +341,9 @@ func (c *Client) handleReauthInbound(cs *connState, call *reauthCall, pktReason 
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
 	defer cancel()
+	c.appCalls.Add(1) // application code on the read loop (see Client.appCalls)
 	response, err := c.authContinue(ctx, brokerData)
+	c.appCalls.Add(1)
 	if err != nil {
 		c.cfg.Logger.Warn("mqttv5: Authenticator.Continue failed during re-authentication",
 			slog.Any("error", err),

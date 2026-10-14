@@ -836,8 +836,9 @@ func WithDropPolicy(p DropPolicy) Option {
 // WithPublisherPool opens size publish-only connections, beside the
 // main one, to the client's own brokers; [Client.Publish] spreads over
 // them, and falls back to the main connection when none can send. 0
-// (the default) disables the pool. Each member connects with Clean
-// Start and Session Expiry 0, so its session ends with its connection:
+// (the default) disables the pool. Each member connects with Session
+// Expiry 0 (and Clean Start the first time), so its session ends with
+// its connection:
 // a QoS 1/2 publish interrupted by a member's reconnect follows the
 // session-loss policy (sent again, possibly duplicated). Subscriptions,
 // the Will, the session store and [QueuePublisher] stay on the main

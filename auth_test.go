@@ -1137,3 +1137,33 @@ func TestReauthenticateCoversThePool(t *testing.T) {
 		}
 	}
 }
+
+// A member connected when Reauthenticate starts but lost during its
+// exchange did not re-authenticate: that is reported, as it is for the
+// main connection.
+func TestReauthenticateReportsAMemberLostMidExchange(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		info := c.AcceptConnect(wire.ConnackOpts{})
+		if info == nil {
+			return
+		}
+		if _, ok := c.Await(wire.AUTH, 0); !ok {
+			return
+		}
+		if strings.HasSuffix(info.ClientID, "-pub-1") {
+			return // the member's connection closes mid-exchange
+		}
+		_ = c.Write(func(w io.Writer) (int64, error) {
+			return wire.WriteAuth(w, wire.AuthOpts{ReasonCode: wire.ReasonSuccess, AuthenticationMethod: "ECHO"})
+		})
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b, WithPublisherPool(1), WithAuthenticator(&countingAuth{}), WithReconnectBackoff(ConstantBackoff(time.Minute)))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cli.Reauthenticate(ctx); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("Reauthenticate = %v, want the member's ErrNotConnected", err)
+	}
+}

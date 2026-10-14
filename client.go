@@ -17,9 +17,11 @@ import (
 )
 
 // HandlerFunc runs synchronously on the read goroutine for each
-// matching inbound PUBLISH. Handlers MUST be non-blocking — a slow
-// handler stalls the read loop, blocks PINGRESP processing, and
-// drops the connection. Use Subscribe / SubscribeQueue for async.
+// matching inbound PUBLISH. Keep it short: while it runs the connection
+// reads nothing, so other subscriptions' messages and the
+// acknowledgements of the client's own publishes wait behind it. The
+// keep-alive does not take that wait for a dead broker. Use Subscribe /
+// SubscribeQueue for work that may take long.
 type HandlerFunc func(*Message)
 
 // Client is an MQTT v5 client. After New(opts...), call Connect to
@@ -101,6 +103,10 @@ type Client struct {
 	// becomes a single predicted nil-check when stats are disabled.
 	stats *clientStats
 
+	// setBrokersMu serializes SetBrokers across the main connection and
+	// the publisher pool.
+	setBrokersMu sync.Mutex
+
 	// appCalls is incremented when the read loop enters application
 	// code — a subscription's delivery: a SubscribeCallback handler, a
 	// SubOnDrop or SubOnDecodeError hook, an Encoding — and again when it
@@ -178,6 +184,8 @@ type lifecycle struct {
 	endOnce     sync.Once
 	disconnOnce sync.Once
 	finishOnce  sync.Once
+	// finishErr is the teardown's result, set within finishOnce.
+	finishErr error
 	// err is why the span ended when it was not Disconnect, written
 	// before shutdown is closed.
 	err error
@@ -299,6 +307,10 @@ func (c *Client) SetBrokers(urls ...string) error {
 	if err := validateBrokerURLs(urls, c.cfg.DialFunc != nil); err != nil {
 		return err
 	}
+	// Concurrent calls must not interleave, or the main connection and
+	// the members could keep different lists.
+	c.setBrokersMu.Lock()
+	defer c.setBrokersMu.Unlock()
 	c.setBrokers(urls)
 	if c.pool != nil {
 		for _, m := range c.pool.members {
@@ -641,11 +653,11 @@ func (s *clientStats) addProtocolError() {
 type Stats struct {
 	Connects          uint64 // successful CONNECT/CONNACK handshakes
 	ConnectFailures   uint64 // CONNECT attempts that failed (any cause)
-	Disconnects       uint64 // connection drops (any cause)
+	Disconnects       uint64 // connections lost, for any reason but Disconnect
 	ServerDisconnects uint64 // broker-sent DISCONNECT packets
 	PingTimeouts      uint64 // PINGRESP timeouts that forced a reconnect
 
-	PublishesSent     uint64 // publishes that succeeded: QoS 0 queued or written, QoS 1/2 accepted by the broker
+	PublishesSent     uint64 // Publish calls that returned nil (QoS 1/2 once acknowledged), and QueuePublisher messages the broker accepted
 	PublishesAcked    uint64 // PUBACK and PUBCOMP packets received, refusals included
 	PublishesInflight uint64 // QoS 1/2 outbound entries awaiting ack
 	SendQuota         uint64 // QoS 1/2 PUBLISHes the broker's Receive Maximum still allows in flight
@@ -660,7 +672,7 @@ type Stats struct {
 	UnsubscribesSent    uint64 // UNSUBSCRIBE packets emitted
 	SubscriptionsActive uint64 // count of currently registered subscriptions
 
-	PoolFallbacks uint64 // publishes that fell back from pool to main connection
+	PoolFallbacks uint64 // publishes no pool member could send, handed to the main connection
 	PoolConnected uint64 // publisher pool members with a live connection
 
 	AcksIgnored    uint64 // PUBACK/PUBREC/PUBCOMP for an unknown or mismatched packet identifier

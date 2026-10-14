@@ -204,8 +204,9 @@ func (c *Client) Disconnect(ctx context.Context) error {
 // and tears down the current connection. With [WithPublisherPool] it
 // then refuses new publishes with [ErrClosed] and waits, bounded by ctx,
 // for those in flight on pool members, whose sessions end with their
-// connections, before disconnecting them; pool-member disconnect errors
-// are joined into the returned error. Idempotent. Like
+// connections, before disconnecting them. It returns ctx's error if ctx
+// ended before the session store writes or the pool's publishes were
+// done, joined with the pool members' disconnect errors. Idempotent. Like
 // [Client.Disconnect], it must not be called from a SubscribeCallback
 // handler or SubOnDrop hook.
 func (c *Client) DisconnectWith(ctx context.Context, opts DisconnectOptions) error {
@@ -252,10 +253,12 @@ func (c *Client) teardown(ctx context.Context, life *lifecycle, opts wire.Discon
 // subscriptions are closed, store writes drained, the publisher pool's
 // publishes in flight waited for, bounded by ctx, and the pool
 // disconnected. It runs once per span, from Disconnect or from a
-// supervisor told to stop reconnecting.
+// supervisor told to stop reconnecting, and every caller gets its
+// result: ctx's error for a wait it cut short, joined with the pool
+// members' disconnect errors.
 func (c *Client) finish(ctx context.Context, life *lifecycle) error {
-	var poolErr error
 	life.finishOnce.Do(func() {
+		var errs []error
 		cs := c.cur.Load()
 		if cs != nil {
 			// Its workers have exited, or are exiting: the supervisor
@@ -270,21 +273,22 @@ func (c *Client) finish(ctx context.Context, life *lifecycle) error {
 		}
 		c.setCur(nil)
 		if err := c.engine.Drain(ctx); err != nil {
-			c.cfg.Logger.Warn("mqttv5: session store writes still pending at disconnect", slog.Any("error", err))
+			errs = append(errs, fmt.Errorf("mqttv5: session store writes still pending: %w", err))
 		}
 		if c.pool != nil {
 			if err := c.pool.drain(ctx); err != nil {
-				c.cfg.Logger.Warn("mqttv5: publisher pool publishes still in flight at disconnect", slog.Any("error", err))
+				errs = append(errs, fmt.Errorf("mqttv5: publisher pool publishes still in flight: %w", err))
 			}
-			poolErr = c.pool.disconnect(ctx)
+			errs = append(errs, c.pool.disconnect(ctx))
 		}
+		life.finishErr = errors.Join(errs...)
 		c.cfg.Logger.Info("mqttv5: disconnected", slog.String("client_id", c.ClientID()))
 		c.startMu.Lock()
 		c.started = false
 		c.startMu.Unlock()
 		close(life.finished)
 	})
-	return poolErr
+	return life.finishErr
 }
 
 // connectResult bundles everything the CONNACK reveals to the

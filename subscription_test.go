@@ -1188,3 +1188,36 @@ func TestUnroutedMessagesAreCountedAndLogged(t *testing.T) {
 		t.Errorf("logged %d warnings, want one per connection: %q", warned, log.msgs)
 	}
 }
+
+// The warning is once per connection: a later connection that drops a
+// message again says so again.
+func TestUnroutedWarningIsPerConnection(t *testing.T) {
+	serve := func(c *testbroker.Conn) {
+		c.AcceptResume(wire.ConnackOpts{})
+		for id := uint16(1); id <= 2; id++ {
+			c.Publish(wire.PublishOpts{Topic: "queued", QoS: 1, PacketID: id, Payload: []byte("x")})
+			c.Expect(wire.PUBACK, 0)
+		}
+	}
+	b := testbroker.New(t, serve, func(c *testbroker.Conn) { serve(c); c.ServeAuto() })
+	log := &recordingLog{Handler: slog.Default().Handler()}
+	cli := tbClient(t, b, WithStats(), WithCleanStart(false), WithLogger(slog.New(log)))
+	deadline := time.Now().Add(3 * time.Second)
+	for cli.Stats().InboundUnrouted < 4 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := cli.Stats().InboundUnrouted; n != 4 {
+		t.Fatalf("Stats().InboundUnrouted = %d, want 4 over two connections", n)
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	warned := 0
+	for _, m := range log.msgs {
+		if strings.HasPrefix(m, "mqttv5: a message matched no subscription") {
+			warned++
+		}
+	}
+	if warned != 2 {
+		t.Errorf("logged %d warnings over two connections, want 2", warned)
+	}
+}
