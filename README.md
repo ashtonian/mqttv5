@@ -451,9 +451,13 @@ start it on another goroutine.
 A consumer with a session the broker keeps (a fixed ClientID,
 `WithCleanStart(false)`, and a `WithSessionExpiry` longer than its
 downtime) gets the messages that arrived while it was down. The broker
-sends them right after the CONNACK, so subscribe before `Connect`:
-`Subscribe` then returns at once and its SUBSCRIBE goes out first on
-the connection.
+sends them right after the CONNACK, before `Connect` has returned, so
+subscribe before `Connect`: `Subscribe` then puts the subscription in
+place at once and its SUBSCRIBE goes out first on the connection. A
+message no subscription matches is acknowledged and dropped, so a
+`Subscribe` after `Connect` races the broker and loses whatever arrives
+first; such messages are counted in `Stats().InboundUnrouted`, and the
+first on each connection is logged at Warn.
 
 ```go
 cli, _ := mqttv5.New(
@@ -1792,7 +1796,12 @@ client reconnects waits for the next connection the same way.
 goes out first on the connection `Connect` makes. Its route is in place
 before the CONNACK, so the messages a resumed session holds — which the
 broker sends right after the CONNACK — reach it; `token.Results()`
-reports the SUBACK once it arrives. A filter that connection's CONNACK
+reports the SUBACK once it arrives. A PUBLISH no subscription matches
+is acknowledged and dropped, counted in `Stats().InboundUnrouted`; the
+first on each connection is logged at Warn unless it was for a
+subscription being unsubscribed, since on a resumed session it is most
+likely a queued message that arrived before the application subscribed.
+A filter that connection's CONNACK
 rules out (shared or wildcard subscriptions unavailable) ends the
 subscription with that error instead of being sent. If `Connect`
 fails, its subscriptions end with it. When the broker has no session,
@@ -2094,6 +2103,7 @@ fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
 | `SendQuota` | gauge | QoS 1/2 publishes the broker's Receive Maximum still allows in flight |
 | `InboundPublishes` | counter | PUBLISH packets received |
 | `InboundDropped` | counter | Received messages dropped because a subscription's buffer or queue was full |
+| `InboundUnrouted` | counter | Received messages no subscription matched: acked and dropped |
 | `DecodeFailures` | counter | Payloads a typed subscription's `Encoding` rejected: acked and not delivered |
 | `SubscribesSent`, `UnsubscribesSent` | counter | SUBSCRIBE and UNSUBSCRIBE packets sent |
 | `SubscriptionsActive` | gauge | Subscriptions registered on the client |
@@ -2120,6 +2130,9 @@ Worth alerting on:
 - `ConnectFailures` or `Disconnects` rising: the connection is
   flapping ([Troubleshooting](#troubleshooting)).
 - `InboundDropped` rising: a consumer is behind the stream.
+- `InboundUnrouted` rising outside unsubscribes: messages reach no
+  subscription, typically a resumed session's queued messages arriving
+  before the application subscribed.
 - `DecodeFailures` rising: a publisher sends payloads the subscription's
   `Encoding` cannot decode.
 - `PoolConnected` below the pool size, or `PoolFallbacks` rising: pool
@@ -2149,6 +2162,7 @@ Normal message traffic logs nothing.
 | QoS 1/2 `Publish` slow while subscriptions are busy | how long `SubscribeCallback` handlers and `SubOnDrop` hooks take | They run on the read loop that also reads this client's publish acknowledgements: move slow work to a channel or queue subscription, or publish through a [publish pool](#publish-pool-withpublisherpool) |
 | `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
 | Typed messages missing; Warn log `payload decode failed` | `Stats().DecodeFailures`; the topic in the log; `SubOnDecodeError` | The publisher sends another format or shape than the subscription's `Encoding` and type expect: fix the publisher, or use `SubEncoding` / another type for that topic |
+| A durable consumer misses the messages queued while it was down | Warn log `a message matched no subscription`; `Stats().InboundUnrouted` | It subscribes after `Connect`, and the broker sends the queued messages right after the CONNACK: subscribe before `Connect` ([Durable consumers](#durable-consumers)) |
 | Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream. Only QoS 0 messages are dropped, unless `SubAutoAck` or `DropOldest` is set: raise `SubBuffer` / `SubMaxQueueSize`, subscribe at QoS 1, consume faster, or use a callback (backpressure) |
 | Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
 | `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |

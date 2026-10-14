@@ -139,6 +139,9 @@ type connState struct {
 	// OnConnectionDown, and by Reauthenticate to distinguish a broker
 	// rejection (ErrReauthRejected) from a plain drop (ErrNotConnected).
 	serverDisconnect atomic.Pointer[DisconnectInfo]
+	// warnedUnrouted is set once a message no subscription matched has
+	// been logged on this connection.
+	warnedUnrouted atomic.Bool
 
 	// reauth is non-nil while a client-initiated re-authentication
 	// (Reauthenticate) is in flight on this connection. The read loop
@@ -572,6 +575,20 @@ func decodeViolation(err error) *ProtocolError {
 	return nil
 }
 
+// unrouted accounts for a PUBLISH no subscription matched, which is
+// acked and dropped. The first on a connection is logged unless it is
+// for a subscription being unsubscribed: on a resumed session it is most
+// likely a queued message that arrived, right after the CONNACK, before
+// the application subscribed.
+func (c *Client) unrouted(cs *connState, topic string, ids []uint32) {
+	c.stats.addInboundUnrouted()
+	if c.retired(ids) || !cs.warnedUnrouted.CompareAndSwap(false, true) {
+		return
+	}
+	c.cfg.Logger.Warn("mqttv5: a message matched no subscription; acked and dropped (subscribe before Connect to receive a resumed session's queued messages)",
+		slog.String("topic", strings.Clone(topic)), slog.Bool("session_present", cs.info.SessionPresent))
+}
+
 // handlePublish dispatches an inbound PUBLISH to every matching
 // subscription. Each subscription gets its own *Message handle onto one
 // shared delivery; the broker acknowledgement goes out when the last
@@ -663,6 +680,7 @@ func (c *Client) handlePublish(cs *connState, pub *wire.Publish) {
 	}
 
 	if first == nil {
+		c.unrouted(cs, pub.Topic, ids)
 		if in != nil {
 			c.engine.AckDeferred(in)
 		}

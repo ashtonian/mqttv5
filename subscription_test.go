@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"math/rand/v2"
 	"slices"
@@ -1147,5 +1148,43 @@ func TestSubscribeBeforeConnectCheckedAgainstConnack(t *testing.T) {
 	expectClosed(t, msgs)
 	if !errors.Is(token.Err(), ErrSharedSubsUnsupported) {
 		t.Fatalf("token.Err() = %v, want ErrSharedSubsUnsupported", token.Err())
+	}
+}
+
+// A message no subscription matches is acked and dropped. It is counted,
+// and the first on a connection is logged: a durable consumer that
+// subscribes after Connect loses what its session held, and must see it.
+func TestUnroutedMessagesAreCountedAndLogged(t *testing.T) {
+	acked := make(chan uint16, 2)
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptResume(wire.ConnackOpts{})
+		c.Publish(wire.PublishOpts{Topic: "queued/1", QoS: 1, PacketID: 1, Payload: []byte("a")})
+		acked <- c.Expect(wire.PUBACK, 0).PacketID
+		c.Publish(wire.PublishOpts{Topic: "queued/2", QoS: 1, PacketID: 2, Payload: []byte("b")})
+		acked <- c.Expect(wire.PUBACK, 0).PacketID
+		c.ServeAuto()
+	})
+	log := &recordingLog{Handler: slog.Default().Handler()}
+	cli := tbClient(t, b, WithStats(), WithCleanStart(false), WithLogger(slog.New(log)))
+	for range 2 {
+		select {
+		case <-acked:
+		case <-time.After(2 * time.Second):
+			t.Fatal("a message nothing subscribed to was never acknowledged")
+		}
+	}
+	if n := cli.Stats().InboundUnrouted; n != 2 {
+		t.Errorf("Stats().InboundUnrouted = %d, want 2", n)
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	warned := 0
+	for _, m := range log.msgs {
+		if strings.HasPrefix(m, "mqttv5: a message matched no subscription") {
+			warned++
+		}
+	}
+	if warned != 1 {
+		t.Errorf("logged %d warnings, want one per connection: %q", warned, log.msgs)
 	}
 }

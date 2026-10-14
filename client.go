@@ -480,6 +480,7 @@ type clientStats struct {
 	publishesReplayed atomic.Uint64
 	inboundPublishes  atomic.Uint64
 	inboundDropped    atomic.Uint64
+	inboundUnrouted   atomic.Uint64
 	decodeFailures    atomic.Uint64
 	subscribesSent    atomic.Uint64
 	unsubscribesSent  atomic.Uint64
@@ -555,6 +556,12 @@ func (s *clientStats) addInboundDropped() {
 	}
 }
 
+func (s *clientStats) addInboundUnrouted() {
+	if s != nil {
+		s.inboundUnrouted.Add(1)
+	}
+}
+
 func (s *clientStats) addDecodeFailure() {
 	if s != nil {
 		s.decodeFailures.Add(1)
@@ -604,7 +611,7 @@ func (s *clientStats) addProtocolError() {
 //   - Monotonic counters (Connects, ConnectFailures, Disconnects,
 //     ServerDisconnects, PingTimeouts, PublishesSent, PublishesAcked,
 //     PublishesReplayed, InboundPublishes, InboundDropped,
-//     DecodeFailures, SubscribesSent, UnsubscribesSent, PoolFallbacks, AcksIgnored,
+//     InboundUnrouted, DecodeFailures, SubscribesSent, UnsubscribesSent, PoolFallbacks, AcksIgnored,
 //     StoreErrors, ProtocolErrors). They start at zero in [New] and are
 //     never reset: they span every Connect and Disconnect of the
 //     Client. Sampled atomically — no locking on the read side.
@@ -638,6 +645,7 @@ type Stats struct {
 
 	InboundPublishes uint64 // PUBLISHes received from the broker
 	InboundDropped   uint64 // inbound PUBLISHes dropped due to full subscriber buffer
+	InboundUnrouted  uint64 // inbound PUBLISHes no subscription matched (acked and dropped)
 	DecodeFailures   uint64 // typed-subscription payloads the Encoding rejected (acked, not delivered)
 
 	SubscribesSent      uint64 // SUBSCRIBE packets emitted
@@ -666,6 +674,7 @@ func (s *Stats) add(o Stats) {
 	s.PublishesReplayed += o.PublishesReplayed
 	s.InboundPublishes += o.InboundPublishes
 	s.InboundDropped += o.InboundDropped
+	s.InboundUnrouted += o.InboundUnrouted
 	s.DecodeFailures += o.DecodeFailures
 	s.SubscribesSent += o.SubscribesSent
 	s.UnsubscribesSent += o.UnsubscribesSent
@@ -721,6 +730,7 @@ func (c *Client) connStats() Stats {
 		PublishesReplayed:   c.stats.publishesReplayed.Load(),
 		InboundPublishes:    c.stats.inboundPublishes.Load(),
 		InboundDropped:      c.stats.inboundDropped.Load(),
+		InboundUnrouted:     c.stats.inboundUnrouted.Load(),
 		DecodeFailures:      c.stats.decodeFailures.Load(),
 		SubscribesSent:      c.stats.subscribesSent.Load(),
 		UnsubscribesSent:    c.stats.unsubscribesSent.Load(),
