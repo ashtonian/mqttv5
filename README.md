@@ -1613,7 +1613,6 @@ them with `errors.As`.
 | `ErrSessionLost` | `Publish` (QoS 1/2) | Session lost with `WithSessionLossPolicy(SessionLossFail)`. |
 | `ErrMessageExpired` | `Publish` (QoS 1/2) | Message Expiry ran out before a republish after session loss. |
 | `ErrPacketIDsExhausted` | `Publish`, `Subscribe*` | All 65,535 packet identifiers in use until ctx ended. |
-| `ErrNoHealthyPublishers` | not returned | The pool's internal signal that no member could send a message; `Publish` then sends it on the main connection, counted in `Stats().PoolFallbacks`. A member's broker refusal or ctx error is returned as is, never retried elsewhere. |
 
 ### `QueuePublisher`
 

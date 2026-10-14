@@ -47,7 +47,7 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 	}
 	if c.pool != nil {
 		err := c.pool.publish(ctx, po)
-		if !errors.Is(err, ErrNoHealthyPublishers) {
+		if !errors.Is(err, errNoHealthyPublishers) {
 			return err
 		}
 		// No member could send it: use the main connection.
@@ -316,10 +316,10 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref [
 	return flow, nil
 }
 
-// ErrNoHealthyPublishers is the pool's internal signal that no member
-// could send a message. [Client.Publish] never returns it: the main
-// connection sends the message instead, counted in Stats.PoolFallbacks.
-var ErrNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
+// errNoHealthyPublishers is the pool's signal that no member could send
+// a message; [Client.Publish] then sends it on the main connection,
+// counted in Stats.PoolFallbacks.
+var errNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
 
 // notSent reports whether a Publish error guarantees the message never
 // reached the network, so another connection may send it instead.
@@ -502,7 +502,7 @@ func (p *publisherPool) connect(ctx context.Context) error {
 // when a member could not send it at all (see notSent): any other
 // outcome, a broker refusal or ctx ending included, is the caller's, so
 // one Publish never puts the message on two connections. Returns
-// ErrNoHealthyPublishers when no member could send it.
+// errNoHealthyPublishers when no member could send it.
 func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error {
 	n := len(p.members)
 	start := p.startIndex(opts)
@@ -517,7 +517,7 @@ func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error 
 		p.logger.Debug("mqttv5: pool member could not send; trying the next",
 			slog.String("client_id", m.ClientID()), slog.Any("error", err))
 	}
-	return fmt.Errorf("%w: %w", ErrNoHealthyPublishers, lastErr)
+	return fmt.Errorf("%w: %w", errNoHealthyPublishers, lastErr)
 }
 
 // startIndex returns the member-index to start the probe loop at,
