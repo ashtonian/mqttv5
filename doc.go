@@ -16,7 +16,7 @@
 // while the broker's flow control holds QoS 1 and 2 messages back
 // (see [Client.Subscribe]).
 //
-// Three multi-broker patterns are kept distinct:
+// Two multi-broker patterns are kept distinct:
 //
 //   - Failover within one logical client (interchangeable brokers,
 //     one session identity): [WithBrokers].
@@ -26,8 +26,11 @@
 //     ([GroupPublishBroadcast], [GroupPublishRoundRobin],
 //     [GroupPublishHashByTopic]). A member with several
 //     [GroupMember.Brokers] fails over among them.
-//   - Publishing over N connections to the client's brokers:
-//     [WithPublisherPool].
+//
+// Separately, [WithPublisherPool] adds publish-only connections to the
+// client's own brokers, so publishing is not limited to one
+// connection's window of unacknowledged QoS 1/2 messages; the client
+// keeps one session.
 //
 // Typed publish / subscribe goes through the generic [Codec] interface;
 // JSON and msgpack ship in separate submodules so the core stays
@@ -153,9 +156,9 @@
 // [net.Conn.Write]. On unix systems the reader writes the
 // acknowledgements it owes itself when the connection is idle, as far
 // as the socket takes them without waiting, and leaves the rest to the
-// writer goroutine. [WithPublisherPool] runs N such connections, each
-// with its own writer goroutine, so publishing is not limited to one
-// connection's writer.
+// writer goroutine. [WithPublisherPool] runs N such connections for
+// publishing, each with its own writer and its own Receive Maximum
+// window.
 //
 // Packets and frame buffers up to 64 KiB come from sync.Pools. An
 // inbound [Message] owns a copy of its topic, payload and properties,

@@ -208,9 +208,9 @@ type Config struct {
 	// [Client.SubscribeQueue] honors both.
 	DropPolicy DropPolicy
 
-	// PublisherPoolSize > 1 enables a publish-only connection pool
-	// that falls back to the main connection if every member is
-	// unhealthy.
+	// PublisherPoolSize > 0 enables a pool of that many publish-only
+	// connections, which falls back to the main connection when no
+	// member can send.
 	PublisherPoolSize int
 
 	// PublisherPoolRouting selects the pool member-picking strategy.
@@ -218,7 +218,8 @@ type Config struct {
 
 	// PublisherPoolClientIDFn derives each pool member's ClientID
 	// from the parent ClientID and a 1-based index. Default is
-	// fmt.Sprintf("%s-pub-%d", parent, idx).
+	// fmt.Sprintf("%s-pub-%d", parent, idx), or empty (broker-assigned)
+	// when the parent's is empty.
 	PublisherPoolClientIDFn func(parent string, idx int) string
 
 	// PublishMode selects QoS 0 write-completion semantics. QoS 1/2
@@ -828,12 +829,17 @@ func WithDropPolicy(p DropPolicy) Option {
 	}
 }
 
-// WithPublisherPool enables N publish-only connections to the
-// configured broker. 0/1 disables. Each member is a full [Client]
-// with its own session; QoS 1/2 acks land on the emitting member.
-// Members force CleanStart=true + SessionExpiry=0 — a mid-flight
-// drop becomes at-least-once with possible duplicates. Use the
-// main connection for ledger-style work.
+// WithPublisherPool opens size publish-only connections, beside the
+// main one, to the client's own brokers; [Client.Publish] spreads over
+// them, and falls back to the main connection when none can send. 0
+// (the default) disables the pool. Each member connects with Clean
+// Start and Session Expiry 0, so its session ends with its connection:
+// a QoS 1/2 publish interrupted by a member's reconnect follows the
+// session-loss policy (sent again, possibly duplicated). Subscriptions,
+// the Will, the session store and [QueuePublisher] stay on the main
+// connection. The broker sees each member as a client of its own
+// (see [WithPublisherPoolClientIDFn]), so No Local does not hide a
+// pooled publish from the main connection's subscriptions.
 func WithPublisherPool(size int) Option {
 	return func(c *Config) error {
 		c.PublisherPoolSize = size
@@ -872,7 +878,7 @@ func (p PoolRoutingPolicy) String() string {
 }
 
 // WithPublisherPoolRouting selects the publisher-pool member-picking
-// strategy. See [PoolRoutingPolicy]. No-op when PublisherPoolSize ≤ 1.
+// strategy. See [PoolRoutingPolicy]. No-op without a pool.
 func WithPublisherPoolRouting(p PoolRoutingPolicy) Option {
 	return func(c *Config) error {
 		if !p.valid() {
@@ -889,15 +895,21 @@ func WithPublisherPoolRouting(p PoolRoutingPolicy) Option {
 const DefaultPublisherPoolClientIDFormat = "%s-pub-%d"
 
 // defaultPoolClientIDFn implements the default ClientID derivation
-// for pool members.
+// for pool members. A parent without a ClientID leaves its members'
+// to the broker too: "-pub-N" would be the same in every process.
 func defaultPoolClientIDFn(parent string, idx int) string {
+	if parent == "" {
+		return ""
+	}
 	return fmt.Sprintf(DefaultPublisherPoolClientIDFormat, parent, idx)
 }
 
 // WithPublisherPoolClientIDFn derives each pool member's ClientID
-// from the parent ClientID and a 1-based index. Override when the
-// parent ClientID is empty — the default ("-pub-N") collides across
-// processes.
+// from the parent's configured ClientID and a 1-based index. The
+// default is "<parent>-pub-<n>" ([DefaultPublisherPoolClientIDFormat]),
+// or, for a parent without a ClientID, empty, so the broker assigns
+// each member's. Broker ACLs or policies keyed on the ClientID must
+// admit these IDs, and fn must give IDs no other client uses.
 func WithPublisherPoolClientIDFn(fn func(parent string, idx int) string) Option {
 	return func(c *Config) error {
 		c.PublisherPoolClientIDFn = fn

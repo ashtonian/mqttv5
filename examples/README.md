@@ -105,7 +105,7 @@ A custom codec is any type with `Encode(T) ([]byte, error)` and
 | `TestREADMESnippets` fails | the README snippet it names | Change the README and the matching file in `readme/` together. |
 | `failover` never moves | which broker `UP` names; whether you stopped that one | Stop the broker it reports; with one broker up it stays there. |
 | `durable` or `bridge` repeats old messages at start | `MQTT_DATA_DIR`, and the brokers' sessions for the example's ClientID | They resume earlier runs on purpose; delete `MQTT_DATA_DIR` or let the sessions expire to start over. |
-| `pool` shows no gain | the broker's Receive Maximum (`ServerInfo().ReceiveMaximum`) and its threading | A broker with a large window and one core gains little; the example measures it. |
+| `pool` shows no gain | the round trip to the broker; its Receive Maximum (`ServerInfo().ReceiveMaximum`) and threading | A pool widens the window of unacknowledged QoS 1 publishes, which limits publishing only when the round trip is long or the window small. Against a broker on the same host or LAN the broker's own processing is the limit, and a single-threaded broker (mosquitto) gains little. |
 
 ## Security
 

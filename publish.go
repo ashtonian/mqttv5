@@ -316,9 +316,9 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref [
 	return flow, nil
 }
 
-// ErrNoHealthyPublishers is returned by publisherPool.publish when no
-// pool member could send the message. The Client falls back to the main
-// connection in this case (and increments PoolFallbacks).
+// ErrNoHealthyPublishers is the pool's internal signal that no member
+// could send a message. [Client.Publish] never returns it: the main
+// connection sends the message instead, counted in Stats.PoolFallbacks.
 var ErrNoHealthyPublishers = errors.New("mqttv5: no healthy publishers in pool")
 
 // notSent reports whether a Publish error guarantees the message never
@@ -328,8 +328,9 @@ func notSent(err error) bool {
 }
 
 // publisherPool is a set of N publish-only Clients. Each member has
-// its own session and supervisor, so QoS 1/2 acks land on the member
-// that emitted the publish.
+// its own connection, transient session and supervisor, so QoS 1/2 acks
+// land on the member that emitted the publish. The parent's SetBrokers,
+// Reauthenticate and Stats cover every member.
 //
 // Spec-compliant but easy to miss:
 //
@@ -345,7 +346,8 @@ func notSent(err error) bool {
 //
 // What is propagated to pool members from the parent Config:
 //
-//   - Wire layer: BrokerURLs, Username/Password, TLSConfig, Dialer,
+//   - Wire layer: BrokerURLs (and later SetBrokers calls),
+//     Username/Password, TLSConfig, Dialer,
 //     DialFunc (required for WebSocket / proxy transports),
 //     Authenticator.
 //   - CONNECT v5 properties: ReceiveMaximum, MaximumPacketSize,

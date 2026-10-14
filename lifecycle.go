@@ -1041,7 +1041,9 @@ func (c *Client) redirect(r ServerRedirect) {
 	}
 	c.cfg.Logger.Info("mqttv5: following a server redirect", slog.String("to", target), slog.Bool("permanent", r.Permanent()))
 	if r.Permanent() {
-		_ = c.SetBrokers(target)
+		// A redirect concerns the connection that received it; pool
+		// members follow the ones their own brokers send.
+		c.setBrokers([]string{target})
 		return
 	}
 	c.redirectOnce.Store(&target)

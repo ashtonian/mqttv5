@@ -15,9 +15,12 @@ store, process restarts.
 - Messages arrive on a channel, a bounded queue or a callback, and are
   acknowledged when you say so.
 - Several brokers from one service: fail over between a cluster's
-  nodes, reach devices spread over independent clusters with one publish
-  and one merged subscription, or spread publishing over a pool of
-  connections ([Multiple brokers](#multiple-brokers)).
+  nodes, or reach devices spread over independent clusters with one
+  publish and one merged subscription
+  ([Multiple brokers](#multiple-brokers)).
+- Publishing that outgrows one connection spreads over a pool of
+  publish-only connections to the same broker, while the client keeps
+  one session ([Publish pool](#publish-pool-withpublisherpool)).
 - Decoding a PUBLISH of up to 64 KiB allocates nothing once pools are
   warm.
 
@@ -124,10 +127,13 @@ supervisor:
   QoS 0 messages, never QoS 1 or 2: the broker's flow control holds
   those back. A dropped message is acknowledged so the broker stops
   resending it.
-- **Several brokers, three distinct patterns.** Failover
-  (`WithBrokers`), parallel sessions (`ClientGroup`) and a publish pool
-  (`WithPublisherPool`), each its own API, and they compose
-  ([Multiple brokers](#multiple-brokers)).
+- **Several brokers, two distinct patterns.** Failover (`WithBrokers`)
+  and parallel sessions (`ClientGroup`), each its own API, and they
+  compose ([Multiple brokers](#multiple-brokers)).
+- **Publish throughput past one connection.** `WithPublisherPool` adds
+  publish-only connections to the same broker, each with a QoS 1/2
+  window of its own; subscriptions and the session stay on one
+  ([Publish pool](#publish-pool-withpublisherpool)).
 - **Durable publishing.** `QueuePublisher` with `queue/file` and
   `store/file` keeps publishing through outages and survives a process
   crash without publishing an in-flight message twice.
@@ -242,7 +248,6 @@ the caller stays blocked until the broker acknowledges it. A refusal
   through the writer.
 - If ctx ends during a write, the writer goroutine finishes the packet,
   so it may still reach the broker after `Publish` returned ctx's error.
-- `WithPublisherPool(N)` spreads publishing over N connections.
 
 ### Broker limits
 
@@ -259,6 +264,92 @@ wait, bounded by ctx (`Stats().SendQuota` shows the headroom). Stored
 messages that a reconnect to a stricter broker rules out complete with
 the same errors. `Client.ServerInfo()` returns everything the broker
 granted.
+
+### Publish pool: `WithPublisherPool`
+
+A broker lets each connection have at most its Receive Maximum QoS 1/2
+publishes unacknowledged (by default 20 for mosquitto, 32 for EMQX, 10
+for HiveMQ CE) and handles each connection's packets in order, so one
+connection carries at most about Receive Maximum QoS 1/2 publishes per
+round trip, however many goroutines call `Publish`. The pool opens n
+more connections to the same broker, publish-only, each with a window
+of its own, and spreads `Publish` calls over them. The client keeps one
+session: subscriptions, the Will, the session store, the lifecycle
+callbacks and `QueuePublisher` stay on the main connection.
+
+```mermaid
+flowchart LR
+    pub["Publish"] --> route{"routing:<br/>round robin, or<br/>hash of the topic"}
+    route --> m1["pool member 1"]
+    route --> m2["pool member 2"]
+    route --> m3["pool member n"]
+    route -. "no member can send" .-> main["main connection"]
+    m1 & m2 & m3 & main --> broker[("broker")]
+```
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBroker("mqtts://mqtt.example.com:8883"),
+    mqttv5.WithClientID("telemetry-gw"),
+    mqttv5.WithPublisherPool(4), // members telemetry-gw-pub-1 … -4
+    mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
+)
+```
+
+`Publish` is called as it is without a pool.
+
+- **When it helps.** When the round trip limits throughput: several
+  goroutines publishing QoS 1 or 2 to a broker across a WAN, or to one
+  slow to acknowledge. A nearby broker is limited by its own processing
+  instead, and a pool adds little; QoS 0 has no window to widen.
+  [`examples/pool`](examples/pool) measures the difference against your
+  broker.
+- **Routing.** Each `Publish` goes out on one connection. Round robin
+  (the default) takes the next member each call and may reorder a
+  topic; `PoolRoutingHashByTopic` keeps each topic on one member, and so
+  in order while that member stays connected.
+- **Failure.** A member that cannot send (not connected, or its write
+  queue full under `WriteDropNewest`) passes the message to the next;
+  when none can, the main connection sends it, counted in
+  `Stats().PoolFallbacks`. A broker refusal or ctx ending is returned as
+  is, so a message never goes out twice. A member whose first CONNECT
+  fails keeps retrying in the background; `Stats().PoolConnected` counts
+  the members connected.
+- **Guarantees.** Members have no session that outlives their
+  connection: each connects with Clean Start = 1 and Session Expiry 0.
+  A QoS 1/2 publish interrupted by a member's reconnect follows the
+  session-loss policy — sent again, possibly duplicated, so QoS 2 is not
+  exactly-once across it. Publish what must resume exactly on a
+  connection with a session: a `QueuePublisher` always uses the main
+  connection.
+- **The broker's view.** Each member is a client of its own to the
+  broker: n more connections against its connection limits, with
+  ClientIDs `<ClientID>-pub-1` … `-n` that any ACL or policy keyed on
+  the ClientID must admit (`WithPublisherPoolClientIDFn` changes them).
+  A client without a ClientID leaves its members' to the broker too.
+- **No Local.** A pooled publish comes from a member's ClientID, so a
+  No Local subscription on the main connection receives it; only a
+  publish that fell back to the main connection is held back. Mark your
+  own messages (with a user property, say) and skip them in the handler
+  instead.
+- **Brokers.** Members use the client's broker list — `SetBrokers`
+  replaces it for them too — and each starts at a random entry, so over
+  a cluster the pool spreads across its nodes. Each member follows the
+  server redirects its own broker sends.
+- **Client-wide calls.** `Reauthenticate` re-authenticates every
+  connected member along with the main connection, so the
+  `Authenticator` must be safe for concurrent use. `Stats()` counts the
+  members' connections and publishes with the main connection's.
+  `Connected()`, `AwaitConnection` and the lifecycle callbacks report
+  the main connection only.
+- **A pool of one** adds no window, but takes publishing off the
+  connection that carries the subscriptions.
+
+Members are configured from the parent: brokers, dialing, TLS,
+credentials, authenticator, CONNECT properties, timeouts, buffer sizes,
+write path, backoff, and the publish behaviour (`WithQoSDowngrade`,
+`WithSessionLossPolicy`, `WithOutboundTopicAliases`,
+`WithLenientDecoding`, `WithFollowServerRedirects`).
 
 ---
 
@@ -512,6 +603,11 @@ never be sent (invalid topic, Topic Alias): the error comes from
 `Publish`, not a dead letter later. The publisher copies the message, so
 the caller may reuse its buffers.
 
+A `QueuePublisher` publishes on the client's main connection, never
+through a [publish pool](#publish-pool-withpublisherpool): its exchanges
+are recorded in that connection's session, which is what lets them
+continue after a reconnect or restart.
+
 Use `mqttv5.NewMemoryPublisherQueue()` for in-process buffering without
 crash safety. A custom `PublisherQueue` can be checked against the
 contract with `github.com/ashtonian/mqttv5/queue/queuetest`.
@@ -577,6 +673,10 @@ Behaviour:
   CONNECT path.
 - `WithOnReauthenticated` observes every successful refresh in one
   place.
+- With a [publish pool](#publish-pool-withpublisherpool), every
+  connected member re-authenticates at the same time; a member's
+  failure is joined into the returned error, and a member that is not
+  connected presents a fresh credential when it connects.
 
 ### Mutual authentication
 
@@ -616,7 +716,7 @@ them otherwise.
 
 ## Multiple brokers
 
-One connection reaches one broker. Services outgrow that for three
+One connection reaches one broker. Services outgrow that for two
 reasons, and each has an API of its own:
 
 - **No single broker may take the service down.** Brokers that carry
@@ -630,8 +730,6 @@ reasons, and each has an API of its own:
   one publish reaches all of them and one subscription hears from all
   of them: [parallel sessions](#parallel-sessions-clientgroup), as in
   [central service over independent clusters](#central-service-over-independent-clusters).
-- **One connection limits publish throughput**:
-  [a publish pool](#publish-pool-withpublisherpool).
 
 Which one fits depends on how the brokers relate to each other:
 
@@ -639,18 +737,20 @@ Which one fits depends on how the brokers relate to each other:
 |---|---|---|---|
 | [Failover](#failover-withbrokers) | `WithBrokers(urls...)` | one at a time | are interchangeable: nodes of a cluster, or replicas |
 | [Parallel sessions](#parallel-sessions-clientgroup) | `NewClientGroup(members, opts...)` | one per member, all live | are independent: each holds its own data |
-| [Publish pool](#publish-pool-withpublisherpool) | `WithPublisherPool(n)` | n publish-only, beside the main one | are the client's own: the pool spreads its publishing |
 
 ```mermaid
 flowchart TD
     same{"Do the brokers hold<br/>the same data?"}
-    same -- "yes: a cluster or replicas" --> rate{"Does one connection<br/>limit publish throughput?"}
-    rate -- no --> failover["Failover<br/>WithBrokers"]
-    rate -- yes --> pooled["Failover + publish pool<br/>WithBrokers + WithPublisherPool"]
+    same -- "yes: a cluster or replicas" --> failover["Failover<br/>WithBrokers"]
     same -- "no: devices or data split across them" --> standby{"Does each one<br/>have a standby?"}
     standby -- no --> group["Parallel sessions<br/>ClientGroup"]
     standby -- yes --> regional["Regional HA<br/>ClientGroup, members with several Brokers"]
 ```
+
+Publishing faster than one connection allows is a separate question,
+with the same answer for one broker or many: a
+[publish pool](#publish-pool-withpublisherpool) opens more connections
+to the brokers the client already uses.
 
 They compose: a `ClientGroup` member is a full `Client`, so it can fail
 over between brokers of its own and carry its own publish pool
@@ -759,7 +859,8 @@ cli, _ := mqttv5.New(
 )
 ```
 
-`Client.SetBrokers(urls...)` replaces the list from your side, from
+`Client.SetBrokers(urls...)` replaces the list from your side, for a
+[publish pool](#publish-pool-withpublisherpool)'s connections too, from
 service discovery for example ([recipe](#brokers-from-service-discovery)).
 The live connection stays where it is; the next connection attempt uses
 the new list.
@@ -877,64 +978,6 @@ ordering. A group is used once: after `Disconnect` its methods return
 
 Use `g.Members()` or `g.Member(name)` for direct per-member access
 (per-member `Stats()`, a `QueuePublisher` per member, etc.).
-
-### Publish pool: `WithPublisherPool`
-
-A broker lets each connection have at most its Receive Maximum QoS 1/2
-publishes unacknowledged (by default 20 for mosquitto, 32 for EMQX, 10
-for HiveMQ CE) and handles each connection's packets in order, so
-concurrent publishers on one connection wait on its round trips. The
-pool adds n publish-only connections to the client's brokers, each with
-a window of its own, and spreads `Publish` calls over them.
-[`examples/pool`](examples/pool) measures the difference against your
-broker.
-
-```mermaid
-flowchart LR
-    pub["Publish"] --> route{"routing:<br/>round robin, or<br/>hash of the topic"}
-    route --> m1["pool member 1"]
-    route --> m2["pool member 2"]
-    route --> m3["pool member n"]
-    route -. "no member can send" .-> main["main connection"]
-    m1 & m2 & m3 & main --> broker[("broker")]
-```
-
-```go
-cli, _ := mqttv5.New(
-    mqttv5.WithBrokers("mqtts://mqtt-1.example.com:8883", "mqtts://mqtt-2.example.com:8883"),
-    mqttv5.WithClientID("telemetry-gw"),
-    mqttv5.WithPublisherPool(4), // members telemetry-gw-pub-1 … -4
-    mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
-)
-```
-
-- **Routing.** Each `Publish` goes out on one connection. Round robin
-  (the default) takes the next member each call and may reorder a
-  topic; `PoolRoutingHashByTopic` keeps each topic on one member, and so
-  in order while that member stays connected.
-- **Failure.** A member that cannot send (not connected, or its write
-  queue full under `WriteDropNewest`) passes the message to the next;
-  when none can, the main connection sends it, counted in
-  `Stats().PoolFallbacks`. A broker refusal or ctx ending is returned as
-  is, so a message never goes out twice. A member whose first CONNECT
-  fails keeps retrying in the background.
-- **Guarantees.** Members have no session: each connects with Clean
-  Start = 1 and Session Expiry 0. A QoS 1/2 publish interrupted by a
-  member's reconnect follows the session-loss policy — sent again,
-  possibly duplicated, so QoS 2 is not exactly-once across it. Publish
-  what must resume exactly on a connection with a session: a
-  `QueuePublisher` always uses the main connection.
-- **Brokers.** Members take the client's broker list and each starts at
-  a random entry, so over a cluster the pool spreads across its nodes.
-- **Everything else** — subscriptions, the Will, the session store,
-  the lifecycle callbacks — stays on the main connection.
-
-Members are configured from the parent: brokers, dialing, TLS,
-credentials, authenticator, CONNECT properties, timeouts, buffer sizes,
-write path, backoff, and the publish behaviour (`WithQoSDowngrade`,
-`WithSessionLossPolicy`, `WithOutboundTopicAliases`,
-`WithLenientDecoding`, `WithFollowServerRedirects`). Their ClientIDs
-come from `WithPublisherPoolClientIDFn` (default `<ClientID>-pub-<n>`).
 
 ### Recipes
 
@@ -1256,7 +1299,7 @@ instance's session expires first. Make each instance a
 
 | Combination | Gives |
 |---|---|
-| `WithBrokers` + `WithPublisherPool` | Pool members fail over too, each starting at its own entry of the list. |
+| `WithBrokers` + `WithPublisherPool` | Pool members fail over too, each starting at its own entry of the list; `SetBrokers` moves them with the main connection. |
 | `WithBrokers` + `WithStore` + `QueuePublisher` | The [durable outbox](#durable-outbox). |
 | `WithBrokers` + `WithFollowServerRedirects` | A `0x9D` move replaces the list; a `0x9C` redirect takes one attempt. |
 | `ClientGroup` member with several `Brokers` | [Regional HA](#regional-ha); a [central service](#central-service-over-independent-clusters) whose clusters fail over within themselves. |
@@ -1381,9 +1424,9 @@ See [`examples/disconnect`](examples/disconnect).
 | `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per writev syscall. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
 | `WithWriteOverflowPolicy(p)` | `WriteBlock` | QoS 0 only. See note below. |
 | `WithPublishMode(mode)` | `PublishFireAndForget` | `PublishWaitForFlush` makes QoS 0 wait until the packet is written; on an idle TCP or Unix connection the caller writes it itself, without copying the payload. ctx bounds the wait; a write it interrupts is finished by the writer goroutine. |
-| `WithPublisherPool(N)` | 0 (off) | N publish-only connections that `Publish` spreads over ([Publish pool](#publish-pool-withpublisherpool)). |
+| `WithPublisherPool(N)` | 0 (off) | N publish-only connections to the client's brokers, beside the main one, that `Publish` spreads over ([Publish pool](#publish-pool-withpublisherpool)). |
 | `WithPublisherPoolRouting(p)` | `PoolRoutingRoundRobin` | `PoolRoutingHashByTopic` preserves per-topic ordering. |
-| `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"` | Customise per-member ClientIDs. Required when the parent ClientID is empty (broker-assigned). |
+| `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"`; empty (broker-assigned) when the parent ClientID is | Each member's ClientID from the parent's and a 1-based index, e.g. to fit a broker ACL pattern. IDs must be unique across every client of the broker. |
 | `WithQoSDowngrade()` | off | Send a publish whose QoS exceeds the broker's Maximum QoS at that maximum instead of failing it with `ErrQoSNotSupported`. Weakens the guarantee (QoS 2 becomes at-least-once). |
 
 > **Broker limits.** Checked before a packet is written; see
@@ -1551,7 +1594,7 @@ them with `errors.As`.
 | `ErrSessionLost` | `Publish` (QoS 1/2) | Session lost with `WithSessionLossPolicy(SessionLossFail)`. |
 | `ErrMessageExpired` | `Publish` (QoS 1/2) | Message Expiry ran out before a republish after session loss. |
 | `ErrPacketIDsExhausted` | `Publish`, `Subscribe*` | All 65,535 packet identifiers in use until ctx ended. |
-| `ErrNoHealthyPublishers` | publisher pool internal | No pool member could send the message — falls back to the main connection. A member's broker refusal or ctx error is returned instead, never retried elsewhere. |
+| `ErrNoHealthyPublishers` | not returned | The pool's internal signal that no member could send a message; `Publish` then sends it on the main connection, counted in `Stats().PoolFallbacks`. A member's broker refusal or ctx error is returned as is, never retried elsewhere. |
 
 ### `QueuePublisher`
 
@@ -1968,13 +2011,50 @@ fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
     s.Connects, s.ConnectFailures)
 ```
 
-The counters cover connects and disconnects, publishes and
-subscriptions, inbound drops, pool fallbacks, ping timeouts, ignored
-acks, session store errors and broker protocol violations; the
-[`Stats`](https://pkg.go.dev/github.com/ashtonian/mqttv5#Stats) godoc
-lists every field. The library has no metrics dependency: export the
-fields to Prometheus, OpenTelemetry or expvar on a timer (see
-[`examples/stats`](examples/stats)).
+| Field | Kind | What it measures |
+|---|---|---|
+| `Connects` | counter | Successful CONNECT/CONNACK handshakes |
+| `ConnectFailures` | counter | Connection attempts that failed, for any reason (dial, TLS, CONNACK refusal, authentication) |
+| `Disconnects` | counter | Connections that ended, for any reason |
+| `ServerDisconnects` | counter | DISCONNECT packets the broker sent |
+| `PingTimeouts` | counter | Connections declared dead after a PINGREQ went unanswered |
+| `PublishesSent` | counter | Publishes that succeeded: QoS 0 once queued (or written, with `PublishWaitForFlush`), QoS 1/2 once the broker accepted them; `QueuePublisher` messages included |
+| `PublishesAcked` | counter | PUBACK and PUBCOMP packets received, refusals included |
+| `PublishesReplayed` | counter | QoS 1/2 publishes resent after a reconnect |
+| `PublishesInflight` | gauge | QoS 1/2 publishes waiting for their acknowledgement |
+| `SendQuota` | gauge | QoS 1/2 publishes the broker's Receive Maximum still allows in flight |
+| `InboundPublishes` | counter | PUBLISH packets received |
+| `InboundDropped` | counter | Received messages dropped because a subscription's buffer or queue was full |
+| `SubscribesSent`, `UnsubscribesSent` | counter | SUBSCRIBE and UNSUBSCRIBE packets sent |
+| `SubscriptionsActive` | gauge | Subscriptions registered on the client |
+| `PoolFallbacks` | counter | Publishes the main connection sent because no pool member could |
+| `PoolConnected` | gauge | Publish pool members with a live connection |
+| `AcksIgnored` | counter | Acknowledgements for an unknown or mismatched packet identifier |
+| `StoreErrors` | counter | Failed `session.Store` operations |
+| `ProtocolErrors` | counter | Broker protocol violations that closed the connection |
+
+Counters start at zero in `New` and are never reset: they span every
+`Connect` and `Disconnect` of the client. With a
+[publish pool](#publish-pool-withpublisherpool), every field covers the
+members' connections as well as the main one.
+
+The library has no metrics dependency. Read `Stats()` once per
+collection — from a Prometheus `Collector`, an OpenTelemetry observable
+instrument's callback, or an `expvar.Func` — and export counters as
+counters and gauges as gauges; reading it once per field takes the
+gauges' locks once per field. [`examples/stats`](examples/stats)
+prints a snapshot every second.
+
+Worth alerting on:
+
+- `ConnectFailures` or `Disconnects` rising: the connection is
+  flapping ([Troubleshooting](#troubleshooting)).
+- `InboundDropped` rising: a consumer is behind the stream.
+- `PoolConnected` below the pool size, or `PoolFallbacks` rising: pool
+  members cannot connect.
+- `StoreErrors` or `ProtocolErrors` above zero.
+- `PublishesInflight` at the broker's Receive Maximum (`SendQuota` 0)
+  for long: the broker is not acknowledging.
 
 ### Logs
 
@@ -2000,6 +2080,8 @@ Normal message traffic logs nothing.
 | `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
 | Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
 | Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
+| A publish pool is no faster than one connection | `Stats().PoolConnected` against the pool size; `PoolFallbacks` | Members not connected: check the broker's connection limit and that its ACLs admit `<ClientID>-pub-<n>`; members log with `component=publisher-pool`. All connected: the round trip is not what limits publishing ([Publish pool](#publish-pool-withpublisherpool)) |
+| Own messages arrive on a No Local subscription | `WithPublisherPool` is set | Pooled publishes come from the members' ClientIDs; skip your own messages in the handler |
 | `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
 | Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
 

@@ -121,16 +121,6 @@ func groupSubscribe() {
 	_, _ = ch, err
 }
 
-func publisherPool() {
-	cli, _ := mqttv5.New(
-		mqttv5.WithBrokers("mqtts://mqtt-1.example.com:8883", "mqtts://mqtt-2.example.com:8883"),
-		mqttv5.WithClientID("telemetry-gw"),
-		mqttv5.WithPublisherPool(4), // members telemetry-gw-pub-1 … -4
-		mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
-	)
-	_ = cli
-}
-
 func bridge() error {
 	src, _ := mqttv5.New(
 		mqttv5.WithBroker("mqtts://plant.example.com:8883"),

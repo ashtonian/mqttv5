@@ -1169,3 +1169,88 @@ func TestPoolMemberInheritsPublishBehaviour(t *testing.T) {
 		}
 	}
 }
+
+// WithPublisherPool(1) moves publishing onto one publish-only
+// connection beside the main one.
+func TestPoolOfOne(t *testing.T) {
+	rec := &publishRecorder{}
+	fb := testbroker.NewRaw(t, recordingHandler(t, rec))
+	cli, err := New(WithBroker(fb.URL()), WithClientID("one"), WithPublisherPool(1), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(context.Background())
+	if cli.pool == nil {
+		t.Fatal("WithPublisherPool(1) built no pool")
+	}
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if pubs := rec.snapshot(); len(pubs) != 1 || pubs[0].clientID != "one-pub-1" {
+		t.Fatalf("publishes = %+v, want one from one-pub-1", pubs)
+	}
+}
+
+// A client whose broker assigns its ClientID leaves its pool members'
+// to the broker as well: a derived "-pub-N" would be the same in every
+// process, and each would take the others' connections over.
+func TestPoolOfAnUnnamedClient(t *testing.T) {
+	b := testbroker.New(t)
+	cli, err := New(WithBroker(b.URL()), WithPublisherPool(2), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Disconnect(context.Background())
+	waitForPoolReady(t, cli, 2, 3*time.Second)
+
+	for i := range 3 {
+		c := b.Conn(i, time.Second)
+		if c == nil {
+			t.Fatalf("broker accepted %d connections, want 3", b.Accepted())
+		}
+		if id := c.Log()[0].Connect.ClientID; id != "" {
+			t.Errorf("connection %d: CONNECT ClientID %q, want empty", i, id)
+		}
+	}
+}
+
+// Stats covers the pool's connections as well as the main one: the
+// publishes a caller made through the pool count as the client's.
+func TestStatsCoverThePool(t *testing.T) {
+	b, _ := countingBroker(t, wire.ReasonSuccess, nil)
+	cli := tbClient(t, b, WithPublisherPool(2), WithStats())
+	waitForPoolReady(t, cli, 2, 3*time.Second)
+
+	const n = 6
+	for range n {
+		if err := cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var s Stats
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s = cli.Stats()
+		if s.PublishesSent == n && s.PublishesAcked == n && s.Connects == 3 && s.PoolConnected == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.PublishesSent != n || s.PublishesAcked != n {
+		t.Errorf("PublishesSent = %d, PublishesAcked = %d; want %d each", s.PublishesSent, s.PublishesAcked, n)
+	}
+	if s.Connects != 3 || s.PoolConnected != 2 {
+		t.Errorf("Connects = %d, PoolConnected = %d; want 3 and 2", s.Connects, s.PoolConnected)
+	}
+	if s.PoolFallbacks != 0 {
+		t.Errorf("PoolFallbacks = %d with every member connected", s.PoolFallbacks)
+	}
+}

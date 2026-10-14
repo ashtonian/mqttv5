@@ -39,6 +39,16 @@ func publish() {
 	_ = err
 }
 
+func publisherPool() {
+	cli, _ := mqttv5.New(
+		mqttv5.WithBroker("mqtts://mqtt.example.com:8883"),
+		mqttv5.WithClientID("telemetry-gw"),
+		mqttv5.WithPublisherPool(4), // members telemetry-gw-pub-1 … -4
+		mqttv5.WithPublisherPoolRouting(mqttv5.PoolRoutingHashByTopic),
+	)
+	_ = cli
+}
+
 func subscribeChannel() {
 	msgs, token, err := cli.Subscribe(ctx,
 		[]mqttv5.TopicFilter{{Topic: "events/#", QoS: 1}},

@@ -153,7 +153,7 @@ func New(opts ...Option) (*Client, error) {
 	// don't all stampede onto BrokerURLs[0].
 	c.brokerIdx.Store(mathrand.Uint32())
 	c.life.Store(newLifecycle())
-	if cfg.PublisherPoolSize > 1 {
+	if cfg.PublisherPoolSize > 0 {
 		pool, err := newPublisherPool(cfg, cfg.PublisherPoolSize, cfg.Logger)
 		if err != nil {
 			return nil, err
@@ -283,17 +283,28 @@ func (c *Client) currentBrokerURL() string {
 	return urls[int(c.brokerIdx.Load())%len(urls)]
 }
 
-// SetBrokers replaces the broker URL list at runtime; the next
-// reconnect uses it. Typical caller: [WithOnServerDisconnect] on a
-// ServerMoved / UseAnotherServer redirect. URLs are validated as in
-// [New].
+// SetBrokers replaces the broker URL list at runtime, for the main
+// connection and every publisher pool member; each one's next reconnect
+// uses it. Typical caller: [WithOnServerDisconnect] on a ServerMoved /
+// UseAnotherServer redirect. URLs are validated as in [New].
 func (c *Client) SetBrokers(urls ...string) error {
 	if err := validateBrokerURLs(urls, c.cfg.DialFunc != nil); err != nil {
 		return err
 	}
+	c.setBrokers(urls)
+	if c.pool != nil {
+		for _, m := range c.pool.members {
+			m.setBrokers(urls)
+		}
+	}
+	return nil
+}
+
+// setBrokers stores a copy of urls, already validated, as the list the
+// next connection attempt uses.
+func (c *Client) setBrokers(urls []string) {
 	cp := append([]string(nil), urls...)
 	c.brokerURLs.Store(&cp)
-	return nil
 }
 
 // Connected reports whether the client currently has a live connection.
@@ -587,14 +598,20 @@ func (s *clientStats) addProtocolError() {
 //     ServerDisconnects, PingTimeouts, PublishesSent, PublishesAcked,
 //     PublishesReplayed, InboundPublishes, InboundDropped,
 //     SubscribesSent, UnsubscribesSent, PoolFallbacks, AcksIgnored,
-//     StoreErrors, ProtocolErrors). Sampled atomically — no locking on
-//     the read side.
-//   - Point-in-time gauges (PublishesInflight, SendQuota, SubscriptionsActive)
-//     read live state under a mutex (the session state and the
-//     subscriptions map respectively). The locks are cheap but a
-//     scraper hitting Stats() at very high frequency does contend
-//     with Subscribe / Unsubscribe and the ack path. Default to
-//     sampling at most a few times per second.
+//     StoreErrors, ProtocolErrors). They start at zero in [New] and are
+//     never reset: they span every Connect and Disconnect of the
+//     Client. Sampled atomically — no locking on the read side.
+//   - Point-in-time gauges (PublishesInflight, SendQuota,
+//     SubscriptionsActive, PoolConnected) read live state under a mutex
+//     (the session state and the subscriptions map respectively). The
+//     locks are cheap but a scraper hitting Stats() at very high
+//     frequency does contend with Subscribe / Unsubscribe and the ack
+//     path. Default to sampling at most a few times per second.
+//
+// With [WithPublisherPool] every field covers the pool members'
+// connections as well as the main one: publishes made through the pool
+// count as the Client's, and a pool member's reconnects count with the
+// main connection's.
 //
 // The zero value is returned when WithStats was not set on the
 // Config — when stats are disabled the hot path skips every atomic
@@ -606,8 +623,8 @@ type Stats struct {
 	ServerDisconnects uint64 // broker-sent DISCONNECT packets
 	PingTimeouts      uint64 // PINGRESP timeouts that forced a reconnect
 
-	PublishesSent     uint64 // QoS 0/1/2 publishes handed to the writer
-	PublishesAcked    uint64 // QoS 1/2 acks received from broker
+	PublishesSent     uint64 // publishes that succeeded: QoS 0 queued or written, QoS 1/2 accepted by the broker
+	PublishesAcked    uint64 // PUBACK and PUBCOMP packets received, refusals included
 	PublishesInflight uint64 // QoS 1/2 outbound entries awaiting ack
 	SendQuota         uint64 // QoS 1/2 PUBLISHes the broker's Receive Maximum still allows in flight
 	PublishesReplayed uint64 // QoS 1/2 replays issued after reconnect
@@ -620,16 +637,60 @@ type Stats struct {
 	SubscriptionsActive uint64 // count of currently registered subscriptions
 
 	PoolFallbacks uint64 // publishes that fell back from pool to main connection
+	PoolConnected uint64 // publisher pool members with a live connection
 
 	AcksIgnored    uint64 // PUBACK/PUBREC/PUBCOMP for an unknown or mismatched packet identifier
 	StoreErrors    uint64 // failed session Store operations (see WithStore)
 	ProtocolErrors uint64 // broker protocol violations that closed the connection
 }
 
-// Stats returns a snapshot of the Client's counters. Cheap to call —
-// the returned value is detached. Returns the zero value when stats
-// are disabled (WithStats not set on the Config).
+// add sums o into s, field by field.
+func (s *Stats) add(o Stats) {
+	s.Connects += o.Connects
+	s.ConnectFailures += o.ConnectFailures
+	s.Disconnects += o.Disconnects
+	s.ServerDisconnects += o.ServerDisconnects
+	s.PingTimeouts += o.PingTimeouts
+	s.PublishesSent += o.PublishesSent
+	s.PublishesAcked += o.PublishesAcked
+	s.PublishesInflight += o.PublishesInflight
+	s.SendQuota += o.SendQuota
+	s.PublishesReplayed += o.PublishesReplayed
+	s.InboundPublishes += o.InboundPublishes
+	s.InboundDropped += o.InboundDropped
+	s.SubscribesSent += o.SubscribesSent
+	s.UnsubscribesSent += o.UnsubscribesSent
+	s.SubscriptionsActive += o.SubscriptionsActive
+	s.PoolFallbacks += o.PoolFallbacks
+	s.PoolConnected += o.PoolConnected
+	s.AcksIgnored += o.AcksIgnored
+	s.StoreErrors += o.StoreErrors
+	s.ProtocolErrors += o.ProtocolErrors
+}
+
+// Stats returns a snapshot of the Client's counters, its publisher
+// pool's included. Cheap to call — the returned value is detached.
+// Returns the zero value when stats are disabled (WithStats not set on
+// the Config).
 func (c *Client) Stats() Stats {
+	if c.stats == nil {
+		return Stats{}
+	}
+	s := c.connStats()
+	if c.pool != nil {
+		for _, m := range c.pool.members {
+			s.add(m.connStats())
+			if m.Connected() {
+				s.PoolConnected++
+			}
+		}
+	}
+	return s
+}
+
+// connStats is the snapshot of the Client's own connection, without its
+// publisher pool. Pool members share the parent's WithStats setting.
+func (c *Client) connStats() Stats {
 	if c.stats == nil {
 		return Stats{}
 	}
