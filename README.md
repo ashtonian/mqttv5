@@ -29,7 +29,7 @@ store, process restarts.
 go get github.com/ashtonian/mqttv5
 ```
 
-Requires Go 1.26 or later. Licensed under [Apache 2.0](LICENSE).
+Requires Go 1.27 or later. Licensed under [Apache 2.0](LICENSE).
 
 ## Contents
 
