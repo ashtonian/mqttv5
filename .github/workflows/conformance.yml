@@ -37,7 +37,7 @@ jobs:
       - name: wait for brokers
         timeout-minutes: 2
         run: |
-          for port in 1883 1884 1885 18084; do
+          for port in 1883 1884 1885 8083 18084; do
             echo "waiting for tcp/$port"
             until bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; do
               sleep 1
@@ -59,6 +59,10 @@ jobs:
       - name: run conformance
         run: go test -tags conformance -race -v -timeout 180s ./...
         working-directory: conformance
+
+      - name: run the examples
+        run: go test -tags smoke -v -timeout 300s -run TestExamplesRun .
+        working-directory: examples
 
       - name: broker logs (on failure)
         if: failure()

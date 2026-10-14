@@ -2384,7 +2384,7 @@ control queue that survives reconnects.
 | `codec/json`, `codec/msgpack` | `Encoding` implementations |
 | `conformance` | tests against real brokers (`-tags conformance`) |
 | `benchmarks` | head-to-head benchmarks, raw results, `benchtab` |
-| `examples`, `examples/readme` | runnable examples; the README's snippets as compiled code |
+| `examples`, `examples/readme` | runnable examples, run against the conformance brokers by `examples/smoke_test.go` (`-tags smoke`); the README's snippets as compiled code |
 
 ---
 
@@ -2416,9 +2416,11 @@ for m in . codec/json codec/msgpack store/file queue/file internal/filedb transp
 done
 
 # Conformance against mosquitto and EMQX (add `--profile hivemq` for
-# HiveMQ CE; see conformance/README.md).
+# HiveMQ CE; see conformance/README.md), then every example run against
+# the same brokers.
 docker compose -f conformance/docker-compose.yml up -d
 go -C conformance test -tags conformance -race ./...
+go -C examples test -tags smoke -v -run TestExamplesRun .
 
 # Benchmarks: see benchmarks/README.md.
 docker compose -f benchmarks/docker-compose.yml up -d

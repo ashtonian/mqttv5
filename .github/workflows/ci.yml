@@ -122,7 +122,7 @@ jobs:
         working-directory: ${{ matrix.module }}
 
       - name: go vet (with build tags)
-        run: go vet -tags 'conformance e2e' ./...
+        run: go vet -tags 'conformance e2e smoke' ./...
         working-directory: ${{ matrix.module }}
 
   test:

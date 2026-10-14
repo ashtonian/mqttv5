@@ -6,6 +6,7 @@ run:
   build-tags:
     - conformance
     - e2e
+    - smoke
 
 linters:
   default: none

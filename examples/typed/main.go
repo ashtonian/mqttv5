@@ -113,7 +113,7 @@ func run(ctx context.Context) error {
 					Reading{DeviceID: device, Temp: 20.0 + float64(i%10)})
 			}
 			if err != nil {
-				fmt.Printf("publish err: %v\n", err)
+				return err
 			}
 		case <-ctx.Done():
 			fmt.Printf("decode failures: %d\n", cli.Stats().DecodeFailures)

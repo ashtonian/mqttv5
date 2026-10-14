@@ -24,7 +24,7 @@ here and never by the core module.
 | `stats/` | `WithStats` counters printed every second | MQTT on 1883 |
 | `disconnect/` | `DisconnectWith`: reason code, reason string, Session Expiry override | MQTT on 1883 |
 | `oauth/` | `WithConnectPacketBuilder` refreshing a bearer token on every connection attempt | MQTT on 1883 (accepts any password) |
-| `ws/` | MQTT over WebSocket with `transport/ws` | a WebSocket listener |
+| `ws/` | MQTT over WebSocket with `transport/ws` | a WebSocket listener (EMQX's, on 8083, in `conformance/docker-compose.yml`) |
 | `readme/` | Every Go snippet of the repository README, as code that compiles; `TestREADMESnippets` fails when the README and these files disagree | none |
 
 Each program runs until it is done or interrupted (Ctrl-C), disconnects
@@ -78,6 +78,12 @@ MQTT_BROKER=ws://127.0.0.1:8083/mqtt go -C examples run ./ws
 # Compile everything and check the README snippets:
 go -C examples vet ./...
 go -C examples test ./...
+
+# Run every example against the conformance brokers (mosquitto on 1883,
+# EMQX on 1884 with WebSocket on 8083), as CI does: each must finish, or
+# stop cleanly when interrupted after a few seconds, with exit status 0.
+docker compose -f conformance/docker-compose.yml up -d --wait
+go -C examples test -tags smoke -v -run TestExamplesRun .
 ```
 
 Recent mosquitto images refuse anonymous clients unless the
