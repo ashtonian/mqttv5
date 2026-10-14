@@ -205,9 +205,9 @@ type ClientGroup struct {
 // Each GroupMember becomes a full *Client; the group applies the
 // configured publish policy on top.
 //
-// Member ClientIDs are deduped: if two members resolve to the same
-// ClientID, the second gets a "-N" suffix appended; members without one
-// get one each from their broker. Set GroupMember.Opts with
+// Member ClientIDs are kept unique: a member whose ClientID another
+// already uses gets the first free "-N" suffix (N from 2); members
+// without one get one each from their broker. Set GroupMember.Opts with
 // WithClientID for explicit per-member IDs.
 //
 // Defaults: GroupPublishBroadcast, parallel Connect/Disconnect.
@@ -233,7 +233,7 @@ func NewClientGroup(members []GroupMember, opts ...ClientGroupOption) (*ClientGr
 	clients := make([]*Client, 0, len(members))
 	names := make([]string, 0, len(members))
 	byName := make(map[string]*Client, len(members))
-	seenClientID := make(map[string]int, len(members))
+	usedClientID := make(map[string]bool, len(members))
 	seenName := make(map[string]bool, len(members))
 
 	for i, m := range members {
@@ -251,8 +251,7 @@ func NewClientGroup(members []GroupMember, opts ...ClientGroupOption) (*ClientGr
 
 		// Probe the resolved ClientID by applying shared+per-member
 		// opts to a throwaway Config — cheap, options are pure
-		// setters. If two members resolve to the same ID, dedupe
-		// with a "-N" suffix.
+		// setters. A ClientID another member uses gets a suffix.
 		probe := &Config{}
 		combined := append([]Option(nil), cfg.sharedOpts...)
 		combined = append(combined, m.Opts...)
@@ -264,13 +263,7 @@ func NewClientGroup(members []GroupMember, opts ...ClientGroupOption) (*ClientGr
 		if len(probe.BrokerURLs) > 0 {
 			return nil, fmt.Errorf("mqttv5: ClientGroup members[%d] (%q): set brokers in GroupMember.Brokers, not with WithBroker or WithBrokers", i, name)
 		}
-		intendedID := probe.ClientID
-		memberID := intendedID
-		// An empty ClientID asks each broker to assign one.
-		if n, dup := seenClientID[intendedID]; dup && intendedID != "" {
-			memberID = fmt.Sprintf("%s-%d", intendedID, n+1)
-		}
-		seenClientID[intendedID]++
+		memberID := uniqueClientID(probe.ClientID, usedClientID)
 
 		memberOpts := make([]Option, 0, len(combined)+2)
 		memberOpts = append(memberOpts, combined...)
@@ -589,6 +582,21 @@ func (g *ClientGroup) subscribeAll(ctx context.Context, filters []TopicFilter, c
 		return nil, err
 	}
 	return out, nil
+}
+
+// uniqueClientID returns id, or, when another member already uses it,
+// the first of id-2, id-3, … that none does, and marks it used. An empty
+// id asks each broker to assign one, so it is never suffixed.
+func uniqueClientID(id string, used map[string]bool) string {
+	if id == "" {
+		return ""
+	}
+	unique := id
+	for n := 2; used[unique]; n++ {
+		unique = fmt.Sprintf("%s-%d", id, n)
+	}
+	used[unique] = true
+	return unique
 }
 
 // Unsubscribe tears down the named member's subscription.

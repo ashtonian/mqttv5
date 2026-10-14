@@ -935,8 +935,9 @@ g, _ := mqttv5.NewClientGroup(
 per-member auth / TLS / ClientID / callbacks win; brokers come only
 from `GroupMember.Brokers`, and `NewClientGroup` rejects `WithBroker` or
 `WithBrokers` in either. Member names default to `member-N` (1-based)
-when unset. Two members with the same ClientID get a `-N` suffix on the
-second; members without one have it assigned by their broker.
+when unset. A member whose ClientID another member already uses gets
+the first free `-N` suffix (`-2`, `-3`, …); members without one have it
+assigned by their broker.
 
 `Publish` returns every member's outcome (`[]GroupResult`) and an
 error decided by the policy below:
