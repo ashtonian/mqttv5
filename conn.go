@@ -1088,7 +1088,11 @@ type keepAlive struct {
 	lastRead  time.Time
 	pingSent  time.Time // zero when no PINGREQ is outstanding
 	// heard reports a packet read since pingSent.
-	heard   bool
+	heard bool
+	// appRan reports that application code has held the read loop since
+	// pingSent, or holds it now (see Client.appCalls): an answer may be
+	// waiting unread.
+	appRan  bool
 	keep    time.Duration
 	timeout time.Duration
 }
@@ -1102,16 +1106,23 @@ type keepAlive struct {
 // After a PINGREQ, any inbound packet — not only the PINGRESP — proves
 // the broker alive: under an inbound flood the PINGRESP can sit behind
 // a long read backlog. With nothing inbound for the ping timeout the
-// connection is dead. Because the timeout is shorter than the
-// keep-alive, a dead connection is detected before the next PINGREQ
-// would be due, and a live one never goes a keep-alive without one.
+// connection is dead — unless application code held the read loop
+// meanwhile, so the answer may be waiting unread: then another PINGREQ
+// starts the timeout again and keeps the broker's keep-alive satisfied,
+// and a silent broker is detected within two timeouts of the loop being
+// free. Because the timeout is shorter than the keep-alive, a dead
+// connection is detected before the next PINGREQ would be due, and a
+// live one never goes a keep-alive without one.
 func (k keepAlive) decide() (send, dead bool, wait time.Duration) {
 	if !k.pingSent.IsZero() && !k.heard {
 		deadline := k.pingSent.Add(k.timeout)
-		if !k.now.Before(deadline) {
-			return false, true, 0
+		if k.now.Before(deadline) {
+			return false, false, deadline.Sub(k.now)
 		}
-		return false, false, deadline.Sub(k.now)
+		if k.appRan {
+			return true, false, 0
+		}
+		return false, true, 0
 	}
 	quiet := k.lastWrite
 	if k.lastRead.Before(quiet) {
@@ -1148,14 +1159,17 @@ func (c *Client) pingLoop(cs *connState) {
 	var (
 		pingSent  time.Time
 		readsThen uint64
+		appThen   uint64
 	)
 	for {
+		app := c.appCalls.Load()
 		k := keepAlive{
 			now:       cs.clk.Now(),
 			lastWrite: time.Unix(0, cs.lastWriteUnixNano.Load()),
 			lastRead:  time.Unix(0, cs.lastReadUnixNano.Load()),
 			pingSent:  pingSent,
 			heard:     cs.reads.Load() != readsThen,
+			appRan:    app != appThen || app%2 == 1,
 			keep:      keep,
 			timeout:   timeout,
 		}
@@ -1177,6 +1191,7 @@ func (c *Client) pingLoop(cs *connState) {
 			})
 			pingSent = k.now
 			readsThen = cs.reads.Load()
+			appThen = app
 			continue
 		}
 		if timer == nil {

@@ -100,6 +100,14 @@ type Client struct {
 	// safe-on-nil helper methods on *clientStats so the hot path
 	// becomes a single predicted nil-check when stats are disabled.
 	stats *clientStats
+
+	// appCalls is incremented when the read loop enters application
+	// code — a subscription's delivery: a SubscribeCallback handler, a
+	// SubOnDrop or SubOnDecodeError hook, an Encoding — and again when it
+	// leaves, so it is odd while the loop is inside. The keep-alive must
+	// not take that time for the broker's silence: the broker's answer
+	// may be waiting unread.
+	appCalls atomic.Uint64
 }
 
 // New constructs a Client. Apply WithBroker (required) plus any other

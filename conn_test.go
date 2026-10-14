@@ -520,6 +520,7 @@ func TestKeepAliveDecide(t *testing.T) {
 		{"earlier window wins", keepAlive{now: base, lastWrite: base.Add(-4 * time.Second), lastRead: base}, false, false, 6 * time.Second},
 		{"ping outstanding", keepAlive{now: base, lastWrite: base, lastRead: base.Add(-keep), pingSent: base.Add(-time.Second)}, false, false, time.Second},
 		{"ping timed out", keepAlive{now: base, lastWrite: base, lastRead: base.Add(-keep), pingSent: base.Add(-timeout)}, false, true, 0},
+		{"ping timed out while application code held the read loop", keepAlive{now: base, lastWrite: base, lastRead: base.Add(-keep), pingSent: base.Add(-timeout), appRan: true}, true, false, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -571,6 +572,7 @@ func TestPingTimeoutDefaultsAndValidation(t *testing.T) {
 type pingHarness struct {
 	t     *testing.T
 	clk   *clock.Fake
+	c     *Client
 	cs    *connState
 	pings []time.Time
 	died  time.Time
@@ -600,7 +602,7 @@ func newPingHarness(t *testing.T, keep time.Duration, timeout time.Duration) *pi
 		life.end()
 		cs.wg.Wait()
 	})
-	return &pingHarness{t: t, clk: clk, cs: cs, answer: true}
+	return &pingHarness{t: t, clk: clk, c: c, cs: cs, answer: true}
 }
 
 func (h *pingHarness) write(now time.Time) { h.cs.lastWriteUnixNano.Store(now.UnixNano()) }
@@ -740,6 +742,69 @@ func TestKeepAliveDetectsHalfOpen(t *testing.T) {
 	}
 	if got := h.died.Sub(h.pings[0]); got < timeout || got > timeout+100*time.Millisecond {
 		t.Fatalf("detected %v after the PINGREQ, want %v", got, timeout)
+	}
+}
+
+// busy marks the read loop as inside application code (a SubscribeCallback
+// handler, say) or, with false, as back from it.
+func (h *pingHarness) busy(on bool) {
+	if odd := h.c.appCalls.Load()%2 == 1; odd != on {
+		h.c.appCalls.Add(1)
+	}
+}
+
+// While application code holds the read loop the broker's PINGRESP waits
+// unread; that is no proof the broker is gone. Once the handler returns
+// the loop reads it, and the connection stays up.
+func TestKeepAliveWaitsOutApplicationCode(t *testing.T) {
+	keep, timeout := 2*time.Second, time.Second
+	h := newPingHarness(t, keep, timeout)
+	h.answer = false // what the broker answers is not read while the loop is busy
+	h.busy(true)
+	h.run(20*time.Second, 100*time.Millisecond)
+	if !h.died.IsZero() {
+		t.Fatalf("declared dead at %v while a handler held the read loop", h.died)
+	}
+	// The broker drops a client silent for 1.5 keep-alives (§3.1.2.10),
+	// so PINGREQs keep going out while the answers wait unread.
+	prev := time.Unix(1_000, 0)
+	for _, p := range h.pings {
+		if gap := p.Sub(prev); gap > keep {
+			t.Fatalf("PINGREQ gap %v exceeds keep-alive %v; pings %v", gap, keep, h.pings)
+		}
+		prev = p
+	}
+	if h.clk.Now().Sub(prev) > keep {
+		t.Fatalf("no PINGREQ since %v", prev)
+	}
+	h.busy(false)
+	h.read(h.clk.Now()) // the PINGRESP waiting in the socket
+	h.answer = true
+	h.run(20*time.Second, 100*time.Millisecond)
+	if !h.died.IsZero() {
+		t.Fatalf("declared dead at %v after the handler returned", h.died)
+	}
+}
+
+// A broker that answers nothing is still detected once the handler
+// returns: within two ping timeouts.
+func TestKeepAliveDetectsSilenceAfterApplicationCode(t *testing.T) {
+	keep, timeout := 2*time.Second, time.Second
+	h := newPingHarness(t, keep, timeout)
+	h.answer = false
+	h.busy(true)
+	h.run(10*time.Second, 100*time.Millisecond)
+	if !h.died.IsZero() {
+		t.Fatalf("declared dead at %v while a handler held the read loop", h.died)
+	}
+	freed := h.clk.Now()
+	h.busy(false)
+	h.run(time.Minute, 100*time.Millisecond)
+	if h.died.IsZero() {
+		t.Fatal("silent broker not detected after the handler returned")
+	}
+	if got := h.died.Sub(freed); got > 2*timeout+100*time.Millisecond {
+		t.Fatalf("detected %v after the handler returned, want at most %v", got, 2*timeout)
 	}
 }
 

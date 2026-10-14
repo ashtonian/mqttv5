@@ -745,7 +745,7 @@ func (r *route) dispatch(m *Message) {
 			m.ackOnReader()
 			return
 		}
-		r.deliver(m)
+		r.run(m)
 		return
 	}
 	r.mu.RLock()
@@ -754,7 +754,16 @@ func (r *route) dispatch(m *Message) {
 		m.ackOnReader()
 		return
 	}
+	r.run(m)
+}
+
+// run delivers m, marking the read loop as in application code meanwhile
+// (see Client.appCalls).
+func (r *route) run(m *Message) {
+	calls := &m.d.client.appCalls
+	calls.Add(1)
 	r.deliver(m)
+	calls.Add(1)
 }
 
 // close marks the route closed and runs onClose (which closes the

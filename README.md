@@ -456,7 +456,13 @@ cli.SubscribeCallback(ctx,
 Pass `mqttv5.SubZeroCopy()` as a trailing option to skip the copy; the
 message's fields are then valid only until the callback returns. The
 handler must not call `Disconnect`, which waits for the read goroutine;
-start it on another goroutine.
+start it on another goroutine. While a handler runs, everything else on
+the connection waits behind it: other subscriptions' messages and the
+acknowledgements of this client's own publishes (a
+[publish pool](#publish-pool-withpublisherpool) takes publishing off
+the connection). The keep-alive does not take that wait for a dead
+broker. Work that may take long belongs on a channel or queue
+subscription.
 
 ### Durable consumers
 
@@ -1494,6 +1500,11 @@ See [`examples/disconnect`](examples/disconnect).
 > nothing inbound for `PingTimeout` the connection is dead: detection
 > takes at most `KeepAlive + PingTimeout` (40 s with defaults), inside
 > the broker's 1.5×KeepAlive cutoff, so the client drives the reconnect.
+> Time the read loop spends in application code — a `SubscribeCallback`
+> handler, a `SubOnDrop` or `SubOnDecodeError` hook, an `Encoding` — is
+> not taken for the broker's silence, since the answer may be waiting
+> unread: PINGREQs keep going out, and a broker that really is silent is
+> detected within two `PingTimeout`s of the loop being free.
 
 #### Reconnect
 
@@ -1733,7 +1744,9 @@ loop.
 
 **Keep-alive.** After a PINGREQ, any packet from the broker counts as
 the answer. With none within `PingTimeout` the connection is treated as
-dead and the supervisor redials.
+dead and the supervisor redials — unless application code held the read
+loop meanwhile, which only delays the verdict (see the
+[keep-alive note](#keepalive-and-timeouts)).
 
 **Server-initiated DISCONNECT.** `WithOnServerDisconnect(fn)` receives
 a `DisconnectInfo` (reason, reason string, server reference, user
