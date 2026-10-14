@@ -14,7 +14,8 @@
 // Backpressure is per subscription: a consumer that falls behind loses
 // QoS 0 messages, acknowledged so the broker stops retransmitting,
 // while the broker's flow control holds QoS 1 and 2 messages back
-// (see [Client.Subscribe]).
+// unless the subscription opts out with [SubAutoAck] or a [DropOldest]
+// queue (see [Client.Subscribe]).
 //
 // Two multi-broker patterns are kept distinct:
 //

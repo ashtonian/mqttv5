@@ -108,8 +108,8 @@ go -C examples run ./readme/quickstart
 
 ## Why mqttv5
 
-Compared with [eclipse/paho.golang](https://github.com/eclipse/paho.golang)
-and its [autopaho](https://github.com/eclipse/paho.golang/tree/master/autopaho)
+Compared with [eclipse/paho.golang](https://github.com/eclipse-paho/paho.golang)
+and its [autopaho](https://github.com/eclipse-paho/paho.golang/tree/master/autopaho)
 supervisor:
 
 - **One client, supervisor built in.** Reconnect, in-flight replay and
@@ -125,8 +125,9 @@ supervisor:
   called more than once. `SubZeroCopy()` skips the copy on hot paths.
 - **Backpressure per subscription.** A consumer that falls behind loses
   QoS 0 messages, never QoS 1 or 2: the broker's flow control holds
-  those back. A dropped message is acknowledged so the broker stops
-  resending it.
+  those back, unless the subscription opts out with `SubAutoAck` or a
+  `DropOldest` queue. A dropped message is acknowledged so the broker
+  stops resending it.
 - **Several brokers, two distinct patterns.** Failover (`WithBrokers`)
   and parallel sessions (`ClientGroup`), each its own API, and they
   compose ([Multiple brokers](#multiple-brokers)).
@@ -542,9 +543,11 @@ when asked with `WithRequestResponseInformation(true)`.
 - A drain goroutine keeps up to `WithQueueWindow` messages in flight
   (default 32), in queue order, whenever the client is connected, and
   removes each from the queue once the broker has accepted it. Throughput
-  approaches window ÷ round-trip time: at 25 ms, about 1,200 msg/s with
-  the default window and 600 with a window of 16, against 38 msg/s one at
-  a time (`BenchmarkQueuePublisherRTT`).
+  approaches window ÷ round-trip time, the window capped by the broker's
+  Receive Maximum (20 on mosquitto): against a broker that allows the
+  whole window, at 25 ms, about 1,200 msg/s with the default window and
+  600 with a window of 16, against 38 msg/s one at a time
+  (`BenchmarkQueuePublisherRTT`).
 
 ```go
 import (
@@ -875,8 +878,7 @@ N sessions to N brokers, each member treated as itself:
 - a migration from one broker to another, publishing to both until the
   devices have moved,
 - bridges between independent brokers,
-- multi-tenant SaaS with per-broker credentials,
-- a clustered broker fleet you want N parallel sessions into.
+- multi-tenant SaaS with per-broker credentials.
 
 ```mermaid
 flowchart LR
@@ -886,7 +888,10 @@ flowchart LR
 
 Members never stand in for each other: if your brokers are
 interchangeable for the same data, use `WithBrokers` on a single
-`Client`. A member can have several `Brokers` of its own to fail over
+`Client`. Pointed at one cluster, a group's members would each
+subscribe to the same messages, so a merged subscription would deliver
+every message once per member; for publish throughput into one broker
+or cluster, use a [publish pool](#publish-pool-withpublisherpool). A member can have several `Brokers` of its own to fail over
 between ([regional HA](#regional-ha)).
 
 Construction takes a `GroupMember` list plus group-level options:
@@ -926,8 +931,8 @@ error decided by the policy below:
 | Publish policy | Behaviour | Use case |
 |---|---|---|
 | `GroupPublishBroadcast` (default) | Publishes to every member at once and returns when each has answered or ctx ends. Fails with a `*GroupError` when fewer than `WithGroupSuccess` members succeed. | Bridge / mirror / quorum — members carry different data |
-| `GroupPublishRoundRobin` | One member per call, the next each time. | Distribute publishes across a clustered broker fleet |
-| `GroupPublishHashByTopic` | FNV-1a(topic) → member. Per-topic ordering. | Shard topics across brokers; fleet throughput with per-topic affinity |
+| `GroupPublishRoundRobin` | One member per call, the next each time. | Spread publishes over independent brokers whose consumers subscribe to all of them |
+| `GroupPublishHashByTopic` | FNV-1a(topic) → member. Per-topic ordering. | Shard topics across independent brokers ([sharding with fan-in](#sharding-with-fan-in)) |
 
 RoundRobin and HashByTopic send each message once. They move to the
 next member only when the chosen one could not send it at all (not

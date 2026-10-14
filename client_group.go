@@ -51,12 +51,13 @@ const (
 	// semantic). [WithGroupSuccess] decides how many must succeed.
 	GroupPublishBroadcast GroupPublishPolicy = iota
 
-	// GroupPublishRoundRobin distributes publishes across the group
-	// for throughput against an interchangeable broker fleet. The
-	// per-call starting member advances by one; a member that cannot
-	// send (not connected) passes the message to the next. Use when
-	// members are equivalent for publish purposes (e.g. a clustered
-	// broker fleet) and you want N parallel sessions.
+	// GroupPublishRoundRobin spreads publishes over the group's
+	// brokers, one member per call. The per-call starting member
+	// advances by one; a member that cannot send (not connected) passes
+	// the message to the next. Use when any of the brokers will do for
+	// a message because its consumers subscribe to all of them. For
+	// publish throughput into one broker or cluster use
+	// [WithPublisherPool] instead.
 	GroupPublishRoundRobin
 
 	// GroupPublishHashByTopic picks the member by FNV-1a of
@@ -180,11 +181,13 @@ func WithGroupSequentialLifecycle() ClientGroupOption {
 // Each member is a full [Client] with its own session and
 // supervisor; the group adds dispatch policy on top. Use for
 // bridges across independent brokers, multi-tenant SaaS with
-// per-broker credentials, or a clustered broker fleet you want N
-// parallel sessions into. For HA failover use [WithBrokers] on a
-// single [Client] instead — [ClientGroup] does not fail over between
-// members, though a member with several [GroupMember.Brokers] fails
-// over among them. A group is used once: after Disconnect its methods
+// per-broker credentials, or devices split across independent
+// clusters. For HA failover use [WithBrokers] on a single [Client]
+// instead — [ClientGroup] does not fail over between members, though
+// a member with several [GroupMember.Brokers] fails over among them.
+// For publish throughput into one broker or cluster use
+// [WithPublisherPool]: members of a group over one cluster would each
+// receive every message a merged subscription matches. A group is used once: after Disconnect its methods
 // return [ErrClosed].
 type ClientGroup struct {
 	cfg     clientGroupConfig
