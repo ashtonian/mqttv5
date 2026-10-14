@@ -37,7 +37,7 @@ their doc comments, and prints the block to paste.
 | `TestPubSub_AllPublishProperties` | `conformance_test.go` | Content type, response topic, correlation data and user properties arrive as published. |
 | `TestPublish_Retain_DeliveredToLateSubscriber` | `conformance_test.go` | A retained message reaches a later subscriber with Retain set, and an empty retained publish clears it. |
 | `TestSubscribeQueue_OrderedDelivery` | `conformance_test.go` | SubscribeQueue delivers one publisher's QoS 1 messages in order. |
-| `TestTypedJSON_FullStructEquality` | `conformance_test.go` | `SubscribeAs` and `PublishValue` with the JSON Encoding round-trip a struct; the broker forwards the Content Type. |
+| `TestTypedJSON_FullStructEquality` | `conformance_test.go` | SubscribeAs and PublishValue with the JSON Encoding round-trip a struct, and the broker forwards the declared Content Type. |
 | `TestPublish_LargePayload_ByteEquality` | `conformance_test.go` | A 64 KiB payload arrives byte for byte. |
 | `TestTopicAlias_OutboundReducesBytes` | `conformance_test.go` | With WithOutboundTopicAliases a repeated QoS 0 topic is sent as an alias, saving at least the topic's length, and the subscriber still sees the full topic. |
 | `TestUnsubscribe_StopsDelivery` | `conformance_test.go` | Unsubscribe closes the subscription's channel and later publishes do not arrive. |
