@@ -18,9 +18,10 @@ store, process restarts.
   nodes, or reach devices spread over independent clusters with one
   publish and one merged subscription
   ([Multiple brokers](#multiple-brokers)).
-- Publishing that outgrows one connection spreads over a pool of
-  publish-only connections to the same broker, while the client keeps
-  one session ([Publish pool](#publish-pool-withpublisherpool)).
+- Publishing can move to a pool of publish-only connections to the same
+  broker: more QoS 1/2 publishes in flight than one connection allows,
+  and none waiting behind a slow subscription handler
+  ([Publish pool](#publish-pool-withpublisherpool)).
 - Decoding a PUBLISH of up to 64 KiB allocates nothing once pools are
   warm.
 
@@ -131,9 +132,10 @@ supervisor:
 - **Several brokers, two distinct patterns.** Failover (`WithBrokers`)
   and parallel sessions (`ClientGroup`), each its own API, and they
   compose ([Multiple brokers](#multiple-brokers)).
-- **Publish throughput past one connection.** `WithPublisherPool` adds
+- **Publishing apart from receiving.** `WithPublisherPool` adds
   publish-only connections to the same broker, each with a QoS 1/2
-  window of its own; subscriptions and the session stay on one
+  window of its own; subscriptions stay on the main connection, so a
+  slow `SubscribeCallback` handler never holds up a publish
   ([Publish pool](#publish-pool-withpublisherpool)).
 - **Durable publishing.** `QueuePublisher` with `queue/file` and
   `store/file` keeps publishing through outages and survives a process
@@ -274,9 +276,11 @@ for HiveMQ CE) and handles each connection's packets in order, so one
 connection carries at most about Receive Maximum QoS 1/2 publishes per
 round trip, however many goroutines call `Publish`. The pool opens n
 more connections to the same broker, publish-only, each with a window
-of its own, and spreads `Publish` calls over them. The client keeps one
-session: subscriptions, the Will, the session store, the lifecycle
-callbacks and `QueuePublisher` stay on the main connection.
+of its own, and spreads `Publish` calls over them. Only the main
+connection subscribes: subscriptions, the Will, a persistent session
+(`WithSessionExpiry`, `WithStore`), the lifecycle callbacks and
+`QueuePublisher` stay on it, and a member leaves nothing on the broker
+when it disconnects.
 
 ```mermaid
 flowchart LR
@@ -343,8 +347,16 @@ cli, _ := mqttv5.New(
   members' connections and publishes with the main connection's.
   `Connected()`, `AwaitConnection` and the lifecycle callbacks report
   the main connection only.
-- **A pool of one** adds no window, but takes publishing off the
-  connection that carries the subscriptions.
+- **Receiving and publishing apart.** A connection reads the
+  acknowledgements of its own publishes on the same loop that runs
+  `SubscribeCallback` handlers, `SubOnDrop` hooks and typed decoding,
+  so on the main connection a slow handler holds up publishes too: with
+  100 messages queued for a 10 ms handler, a QoS 1 publish waits about
+  a second. A member reads its own acknowledgements and never waits on
+  them. Channel and queue subscriptions hand messages off without
+  blocking the loop, so they hold up nothing either way.
+- **A pool of one** adds no window, but is enough to keep publishes
+  from waiting behind the subscriptions' handlers.
 
 Members are configured from the parent: brokers, dialing, TLS,
 credentials, authenticator, CONNECT properties, timeouts, buffer sizes,
@@ -418,7 +430,8 @@ peek-and-pop without racing the consumer.
 cli.SubscribeCallback(ctx,
     []mqttv5.TopicFilter{{Topic: "ctrl/+", QoS: 0}},
     func(m *mqttv5.Message) {
-        // Runs on the read goroutine — MUST be non-blocking.
+        // Runs on the read goroutine — MUST be non-blocking: the
+        // acks of this client's own publishes wait behind it.
         process(m)
         // Ack auto-fires after return.
     },
@@ -2079,6 +2092,7 @@ Normal message traffic logs nothing.
 | `Connect` returns `ErrConnectRefused` | `errors.As(err, &rce)` for the CONNACK reason code | 0x86/0x87: credentials or authorization; 0x9C/0x9D: the broker redirects, see `WithFollowServerRedirects` |
 | Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
 | `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
+| QoS 1/2 `Publish` slow while subscriptions are busy | how long `SubscribeCallback` handlers and `SubOnDrop` hooks take | They run on the read loop that also reads this client's publish acknowledgements: move slow work to a channel or queue subscription, or publish through a [publish pool](#publish-pool-withpublisherpool) |
 | `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
 | Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream. Only QoS 0 messages are dropped, unless `SubAutoAck` or `DropOldest` is set: raise `SubBuffer` / `SubMaxQueueSize`, subscribe at QoS 1, consume faster, or use a callback (backpressure) |
 | Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |

@@ -132,7 +132,8 @@ func subscribeCallback() {
 	cli.SubscribeCallback(ctx,
 		[]mqttv5.TopicFilter{{Topic: "ctrl/+", QoS: 0}},
 		func(m *mqttv5.Message) {
-			// Runs on the read goroutine — MUST be non-blocking.
+			// Runs on the read goroutine — MUST be non-blocking: the
+			// acks of this client's own publishes wait behind it.
 			process(m)
 			// Ack auto-fires after return.
 		},

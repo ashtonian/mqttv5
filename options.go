@@ -837,9 +837,11 @@ func WithDropPolicy(p DropPolicy) Option {
 // a QoS 1/2 publish interrupted by a member's reconnect follows the
 // session-loss policy (sent again, possibly duplicated). Subscriptions,
 // the Will, the session store and [QueuePublisher] stay on the main
-// connection. The broker sees each member as a client of its own
-// (see [WithPublisherPoolClientIDFn]), so No Local does not hide a
-// pooled publish from the main connection's subscriptions.
+// connection; members read their own acknowledgements, so a slow
+// [Client.SubscribeCallback] handler does not delay pooled publishes.
+// The broker sees each member as a client of its own (see
+// [WithPublisherPoolClientIDFn]), so No Local does not hide a pooled
+// publish from the main connection's subscriptions.
 func WithPublisherPool(size int) Option {
 	return func(c *Config) error {
 		c.PublisherPoolSize = size

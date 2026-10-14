@@ -1254,3 +1254,46 @@ func TestStatsCoverThePool(t *testing.T) {
 		t.Errorf("PoolFallbacks = %d with every member connected", s.PoolFallbacks)
 	}
 }
+
+// A pool member reads its own acknowledgements, so a SubscribeCallback
+// handler holding the main connection's read loop does not hold up a
+// pooled publish.
+func TestPooledPublishDoesNotWaitOnCallbackHandler(t *testing.T) {
+	b := testbroker.New(t)
+	cli := tbClient(t, b, WithPublisherPool(1))
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	entered := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	defer close(gate)
+	_, err := cli.SubscribeCallback(context.Background(), []TopicFilter{{Topic: "in"}}, func(*Message) {
+		entered <- struct{}{}
+		<-gate
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var main *testbroker.Conn
+	for i := range b.Accepted() {
+		if c := b.Conn(i, time.Second); c != nil && c.Log()[0].Connect.ClientID == cli.ClientID() {
+			main = c
+		}
+	}
+	if main == nil {
+		t.Fatal("no main connection at the broker")
+	}
+	if err := main.Publish(wire.PublishOpts{Topic: "in", Payload: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cli.Publish(ctx, PublishOptions{Topic: "out", QoS: 1}); err != nil {
+		t.Fatalf("pooled publish while the main read loop is held: %v", err)
+	}
+}

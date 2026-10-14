@@ -29,9 +29,9 @@
 //     [GroupMember.Brokers] fails over among them.
 //
 // Separately, [WithPublisherPool] adds publish-only connections to the
-// client's own brokers, so publishing is not limited to one
-// connection's window of unacknowledged QoS 1/2 messages; the client
-// keeps one session.
+// client's own brokers, each with its own window of unacknowledged QoS
+// 1/2 messages and its own read loop, while subscriptions and any
+// persistent session stay on the main connection.
 //
 // Typed publish / subscribe goes through the generic [Codec] interface;
 // JSON and msgpack ship in separate submodules so the core stays
