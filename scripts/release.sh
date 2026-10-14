@@ -81,13 +81,16 @@ siblings() {
          block { print $1 }' "$1" | grep '^github.com/ashtonian/mqttv5' | sort -u
 }
 
-# Core tag first. The release workflow trigger only matches the
-# core-style tag pattern (vX.Y.Z), so pushing it last would still
-# work but listing it first keeps the plan readable.
-TAGS=("$VERSION")
+# The release workflow listens for the core tag (vX.Y.Z). GitHub creates
+# no push event for tags when more than three are pushed at once, so the
+# submodule tags go out with the release commit and the core tag goes
+# alone, last: the workflow then fires, and finds every submodule tag
+# published when it installs the release.
+SUBMODULE_TAGS=()
 for m in "${SUBMODULES[@]}"; do
-    TAGS+=("$m/$VERSION")
+    SUBMODULE_TAGS+=("$m/$VERSION")
 done
+TAGS=("$VERSION" "${SUBMODULE_TAGS[@]}")
 
 # --- safety checks ---
 
@@ -114,7 +117,7 @@ for t in "${TAGS[@]}"; do
     if [[ "$t" == "$VERSION" ]]; then
         printf '  %-32s github.com/ashtonian/mqttv5\n' "$t"
     else
-        printf '  %-32s github.com/ashtonian/mqttv5/%s\n' "$t" "${t%/$VERSION}"
+        printf '  %-32s github.com/ashtonian/mqttv5/%s\n' "$t" "${t%/"$VERSION"}"
     fi
 done
 
@@ -184,13 +187,18 @@ for t in "${TAGS[@]}"; do
 done
 
 echo
-echo "Pushing $BRANCH and the tags to origin..."
-git push origin "HEAD:$BRANCH" "${TAGS[@]}"
+# --no-follow-tags on both pushes: with push.followTags set, git would add
+# the core tag (annotated, on the release commit) to the first push, and
+# any other annotated tag the remote lacks to the second.
+echo "Pushing $BRANCH and the submodule tags to origin..."
+git push --no-follow-tags origin "HEAD:$BRANCH" "${SUBMODULE_TAGS[@]}"
+echo "Pushing $VERSION alone, which starts the release workflow..."
+git push --no-follow-tags origin "refs/tags/$VERSION"
 
 echo
 echo "Installing $VERSION from the module proxy, outside this repository..."
 "$(dirname "$0")/verify-release.sh" "$VERSION"
 
 echo
-echo "Done. The release workflow fires on the $VERSION tag push."
-echo "Track it: gh run watch"
+echo "Done. The release workflow is running for $VERSION; it publishes the"
+echo "GitHub release once its checks pass. Track it: gh run watch"

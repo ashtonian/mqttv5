@@ -205,12 +205,12 @@ its own `go.mod`, so the core never pulls in its dependencies.
 | File publish queue | `github.com/ashtonian/mqttv5/queue/file` | Crash-safe outbound publish queue for `QueuePublisher` |
 | WebSocket transport | `github.com/ashtonian/mqttv5/transport/ws` | ws:// and wss:// — `WithDialFunc(ws.DialFunc(ws.DialOpts{...}))` |
 
-Every module is released with the same version tag (`store/file/v0.11.0`
-alongside `v0.11.0`); install a submodule at the version of the core you
+Every module is released with the same version tag (`store/file/vX.Y.Z`
+alongside `vX.Y.Z`); install a submodule at the version of the core you
 use:
 
 ```bash
-go get github.com/ashtonian/mqttv5@v0.11.0 github.com/ashtonian/mqttv5/store/file@v0.11.0
+go get github.com/ashtonian/mqttv5@latest github.com/ashtonian/mqttv5/store/file@latest
 ```
 
 `store/file` and `queue/file` bring in `internal/filedb`, the bbolt layer
