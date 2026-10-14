@@ -395,10 +395,12 @@ func (c *Client) dropInbound(cfg subscribeConfig, m *Message) {
 // SubscribeCallback registers a subscription that invokes h for every
 // matching inbound PUBLISH.
 //
-// h runs synchronously on the read goroutine and MUST NOT block — a
-// slow handler stalls PINGRESP and drops the connection. It must not
-// call [Client.Disconnect], which waits for the read goroutine: start
-// it on another goroutine. The runtime
+// h runs synchronously on the read goroutine, so keep it short: while
+// it runs the connection reads nothing, and other subscriptions'
+// messages and the acknowledgements of the client's own publishes wait
+// behind it (the keep-alive does not take that wait for a dead broker).
+// It must not call [Client.Disconnect], which waits for the read
+// goroutine: start it on another goroutine. The runtime
 // auto-acks via [Message.Ack] after h returns; use [Client.Subscribe]
 // or [Client.SubscribeQueue] when ack must be deferred past h.
 //
@@ -745,7 +747,7 @@ func (r *route) dispatch(m *Message) {
 			m.ackOnReader()
 			return
 		}
-		r.deliver(m)
+		r.run(m)
 		return
 	}
 	r.mu.RLock()
@@ -754,7 +756,16 @@ func (r *route) dispatch(m *Message) {
 		m.ackOnReader()
 		return
 	}
+	r.run(m)
+}
+
+// run delivers m, marking the read loop as in application code meanwhile
+// (see Client.appCalls).
+func (r *route) run(m *Message) {
+	calls := &m.d.client.appCalls
+	calls.Add(1)
 	r.deliver(m)
+	calls.Add(1)
 }
 
 // close marks the route closed and runs onClose (which closes the

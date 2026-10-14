@@ -88,7 +88,7 @@ two more with `--profile hivemq`:
 | Service | Port on 127.0.0.1 | Used for |
 |---|---|---|
 | `mosquitto` (eclipse-mosquitto 2.1.2) | 1883 | the default broker; [`mosquitto.conf`](mosquitto.conf) allows anonymous clients |
-| `emqx` (EMQX 6.3.1, anonymous) | 1884 | the second broker of the ClientGroup test; the whole suite can also run against it |
+| `emqx` (EMQX 6.3.1, anonymous) | 1884, WebSocket 8083 | the second broker of the ClientGroup test; the whole suite can also run against it; the examples' smoke test uses its WebSocket listener |
 | `emqx-scram` (EMQX 6.3.1) | 1885, REST 18084 | enhanced authentication: `TestReauthenticate_SCRAM_EMQX` provisions a SCRAM-SHA-256 authenticator and user through the REST API with the key in [`emqx/api_key.bootstrap`](emqx/api_key.bootstrap) |
 | `hivemq` (HiveMQ CE 2026.5, profile `hivemq`) | 1886 | the whole suite against HiveMQ's defaults (Receive Maximum 10, five topic aliases) |
 | `hivemq-strict` (HiveMQ CE 2026.5, profile `hivemq`) | 1887 | `strict_test.go`: Maximum QoS 1, 2 KiB packets, Server Keep Alive 4 s, Receive Maximum 4, two topic aliases, no retain, wildcards, shared subscriptions or Subscription Identifiers ([`hivemq/strict.xml`](hivemq/strict.xml)) |

@@ -13,8 +13,11 @@ type Reading struct {
 }
 
 cli, _ := mqttv5.New(mqttv5.WithBroker(url), mqttv5.WithEncoding(jsoncodec.Encoding{}))
-_ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "t/a1", QoS: 1}, Reading{Device: "a1", Temp: 21.5})
 readings, _, _ := cli.SubscribeAs[Reading](ctx, []mqttv5.TopicFilter{{Topic: "t/+", QoS: 1}})
+if err := cli.Connect(ctx); err != nil {
+    return err
+}
+_ = cli.PublishValue(ctx, mqttv5.PublishOptions{Topic: "t/a1", QoS: 1}, Reading{Device: "a1", Temp: 21.5})
 ```
 
 | | |

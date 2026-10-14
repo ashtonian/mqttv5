@@ -187,7 +187,8 @@ func WithGroupSequentialLifecycle() ClientGroupOption {
 // a member with several [GroupMember.Brokers] fails over among them.
 // For publish throughput into one broker or cluster use
 // [WithPublisherPool]: members of a group over one cluster would each
-// receive every message a merged subscription matches. A group is used once: after Disconnect its methods
+// receive every message a merged subscription to an unshared filter
+// matches. A group is used once: after Disconnect its methods
 // return [ErrClosed].
 type ClientGroup struct {
 	cfg     clientGroupConfig

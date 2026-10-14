@@ -338,11 +338,11 @@ func notSent(err error) bool {
 //     Round-robin across members can reorder publishes to the same
 //     topic. For ordered topics, use
 //     WithPublisherPoolRouting(PoolRoutingHashByTopic).
-//   - QoS 1/2 across reconnect. Pool members force CleanStart=true
-//     and SessionExpiry=0, so a mid-flight drop becomes at-least-once
-//     with possible duplicates (the broker has no resumable session
-//     when the supervisor replays). Use the main connection for
-//     ledger-style work.
+//   - QoS 1/2 across reconnect. Pool members connect with
+//     SessionExpiry=0 (and CleanStart=true the first time), so a
+//     member's session ends with its connection and a mid-flight drop
+//     becomes at-least-once with possible duplicates. Use the main
+//     connection for ledger-style work.
 //
 // What is propagated to pool members from the parent Config:
 //
@@ -373,8 +373,8 @@ func notSent(err error) bool {
 //     OnServerRedirect.
 //     Members manage their own reconnect silently; observe the
 //     parent for application-visible lifecycle events.
-//   - CleanStartOnReconnect — pool members force CleanStart=true on
-//     every CONNECT.
+//   - CleanStartOnReconnect — with SessionExpiry=0 there is no
+//     session for a member's reconnect to resume, whatever it asks.
 //   - RetryInitialConnect — pool members always retry a failed first
 //     CONNECT in the background, as after a lost connection: the
 //     parent is connected, so a member's refusal is taken as passing
@@ -412,9 +412,8 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 		opts := []Option{
 			WithBrokers(parent.BrokerURLs...),
 			WithClientID(clientIDFn(parent.ClientID, i)),
-			// Pool members force CleanStart=true and SessionExpiry=0 —
-			// see the publisherPool type doc. CleanStartOnReconnect is
-			// not propagated for the same reason.
+			// A member's session ends with its connection (Session
+			// Expiry 0) — see the publisherPool type doc.
 			WithCleanStart(true),
 			WithSessionExpiry(0),
 			WithRetryInitialConnect(),
@@ -498,14 +497,27 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 	}, nil
 }
 
-// connect dials every pool member at once and waits for each one's
-// first attempt. A member that fails keeps retrying on its own
+// connect dials every pool member at once and waits, bounded by ctx, for
+// each one's first attempt. A member that fails keeps retrying on its own
 // supervisor, so an error means ctx ended or the client stopped first;
 // the pool stays usable either way.
 func (p *publisherPool) connect(ctx context.Context) error {
 	p.calls.And(^poolClosing)
 	p.drained.Store(nil)
-	return p.each(func(m *Client) error { return m.Connect(ctx) })
+	// A member whose first attempt ctx cut short would end instead of
+	// retrying in the background, leaving the client without its pool:
+	// members connect on a context ctx cannot cancel, each attempt bounded
+	// by the connect timeout, and ctx bounds only the wait for them.
+	done := make(chan error, 1)
+	go func() {
+		done <- p.each(func(m *Client) error { return m.Connect(context.WithoutCancel(ctx)) })
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // enter admits a Publish call unless the pool is closing. It counts the

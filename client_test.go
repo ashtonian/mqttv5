@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -500,6 +501,35 @@ func TestStatsAddSumsEveryField(t *testing.T) {
 	for i := range sv.NumField() {
 		if sv.Field(i).Uint() != 2 {
 			t.Errorf("Stats.add leaves out %s", sv.Type().Field(i).Name)
+		}
+	}
+}
+
+// Concurrent SetBrokers calls leave the main connection and every pool
+// member on the same list.
+func TestConcurrentSetBrokersKeepsThePoolTogether(t *testing.T) {
+	cli, err := New(WithBroker("mqtt://initial:1883"), WithPublisherPool(8), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := range 2000 {
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, url := range []string{"mqtt://a:1883", "mqtt://b:1883"} {
+			wg.Go(func() {
+				<-start
+				if err := cli.SetBrokers(url); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		main := *cli.brokerURLs.Load()
+		for i, m := range cli.pool.members {
+			if got := *m.brokerURLs.Load(); !slices.Equal(got, main) {
+				t.Fatalf("round %d: main %v, member %d %v", round, main, i+1, got)
+			}
 		}
 	}
 }

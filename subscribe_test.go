@@ -976,7 +976,7 @@ func TestRouteDispatchAfterCloseAcks(t *testing.T) {
 	r := &route{deliver: func(m *Message) { ch <- m }}
 	r.close(func() { close(ch) })
 
-	d := &delivery{}
+	d := &delivery{client: &Client{}}
 	d.refs.Store(1)
 	m := &d.first
 	m.d = d
@@ -999,7 +999,7 @@ func TestRouteCloseRacingDispatch(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Go(func() {
 			for j := 0; j < 4; j++ {
-				d := &delivery{}
+				d := &delivery{client: &Client{}}
 				d.refs.Store(1)
 				d.first.d = d
 				r.dispatch(&d.first)

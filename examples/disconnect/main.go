@@ -66,7 +66,7 @@ func run(ctx context.Context) error {
 		ReasonString:          "planned shutdown",
 		SessionExpiryInterval: &expiry,
 	}); err != nil {
-		fmt.Printf("disconnect err: %v\n", err)
+		return fmt.Errorf("disconnect: %w", err)
 	}
 	return nil
 }

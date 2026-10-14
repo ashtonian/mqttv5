@@ -64,21 +64,23 @@ func run(ctx context.Context) error {
 	defer func() { _ = client.Disconnect(context.WithoutCancel(ctx)) }()
 
 	// Requests in flight at once, each matched to its reply.
+	skus := []string{"A-100", "B-200", "C-300"}
+	errs := make([]error, len(skus))
 	var wg sync.WaitGroup
-	for _, sku := range []string{"A-100", "B-200", "C-300"} {
+	for i, sku := range skus {
 		wg.Go(func() {
 			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			reply, err := req.call(rctx, "requests/price", []byte(sku))
 			if err != nil {
-				fmt.Printf("%s: %v\n", sku, err)
+				errs[i] = fmt.Errorf("%s: %w", sku, err)
 				return
 			}
 			fmt.Printf("%s: %s\n", sku, reply)
 		})
 	}
 	wg.Wait()
-	return nil
+	return errors.Join(errs...)
 }
 
 // prices is the responder's data.

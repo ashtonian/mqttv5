@@ -10,6 +10,9 @@ import msgpackcodec "github.com/ashtonian/mqttv5/codec/msgpack"
 
 cli, _ := mqttv5.New(mqttv5.WithBroker(url), mqttv5.WithEncoding(msgpackcodec.Encoding{}))
 readings, _, _ := cli.SubscribeAs[Reading](ctx, []mqttv5.TopicFilter{{Topic: "t/+", QoS: 1}})
+if err := cli.Connect(ctx); err != nil {
+    return err
+}
 ```
 
 | | |

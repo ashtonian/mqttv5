@@ -1188,3 +1188,80 @@ func TestUnroutedMessagesAreCountedAndLogged(t *testing.T) {
 		t.Errorf("logged %d warnings, want one per connection: %q", warned, log.msgs)
 	}
 }
+
+// The warning is once per connection: a later connection that drops a
+// message again says so again.
+func TestUnroutedWarningIsPerConnection(t *testing.T) {
+	serve := func(c *testbroker.Conn) {
+		c.AcceptResume(wire.ConnackOpts{})
+		for id := uint16(1); id <= 2; id++ {
+			c.Publish(wire.PublishOpts{Topic: "queued", QoS: 1, PacketID: id, Payload: []byte("x")})
+			c.Expect(wire.PUBACK, 0)
+		}
+	}
+	b := testbroker.New(t, serve, func(c *testbroker.Conn) { serve(c); c.ServeAuto() })
+	log := &recordingLog{Handler: slog.Default().Handler()}
+	cli := tbClient(t, b, WithStats(), WithCleanStart(false), WithLogger(slog.New(log)))
+	deadline := time.Now().Add(3 * time.Second)
+	for cli.Stats().InboundUnrouted < 4 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := cli.Stats().InboundUnrouted; n != 4 {
+		t.Fatalf("Stats().InboundUnrouted = %d, want 4 over two connections", n)
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	warned := 0
+	for _, m := range log.msgs {
+		if strings.HasPrefix(m, "mqttv5: a message matched no subscription") {
+			warned++
+		}
+	}
+	if warned != 2 {
+		t.Errorf("logged %d warnings over two connections, want 2", warned)
+	}
+}
+
+// A message for a subscription whose UNSUBSCRIBE is in flight is expected:
+// it is acked and counted, but not warned about.
+func TestUnroutedMessageForAnUnsubscribingFilterIsNotWarned(t *testing.T) {
+	acked := make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		p := c.Expect(wire.SUBSCRIBE, 0)
+		var ids []uint32
+		for id := range p.Properties().SubscriptionIdentifiers() {
+			ids = append(ids, id)
+		}
+		c.Suback(p.PacketID, wire.ReasonGrantedQoS1)
+		u := c.Expect(wire.UNSUBSCRIBE, 0)
+		// Sent before the broker took the UNSUBSCRIBE in.
+		c.PublishTagged(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 9, Payload: []byte("x")}, ids...)
+		c.Expect(wire.PUBACK, 0)
+		close(acked)
+		_ = c.Write(func(w io.Writer) (int64, error) {
+			return wire.WriteUnsuback(w, wire.UnsubackOpts{PacketID: u.PacketID, ReasonCodes: []wire.ReasonCode{wire.ReasonSuccess}})
+		})
+		c.ServeAuto()
+	})
+	log := &recordingLog{Handler: slog.Default().Handler()}
+	cli := tbClient(t, b, WithStats(), WithLogger(slog.New(log)))
+	_, tok, err := cli.Subscribe(context.Background(), []TopicFilter{{Topic: "t", QoS: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Unsubscribe(context.Background(), tok); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-acked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the message was never acknowledged")
+	}
+	if n := cli.Stats().InboundUnrouted; n != 1 {
+		t.Errorf("Stats().InboundUnrouted = %d, want 1", n)
+	}
+	if log.logged("mqttv5: a message matched no subscription") {
+		t.Errorf("warned about a message for a subscription being unsubscribed: %q", log.msgs)
+	}
+}
