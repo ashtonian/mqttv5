@@ -25,7 +25,7 @@ here and never by the core module.
 | `disconnect/` | `DisconnectWith`: reason code, reason string, Session Expiry override | MQTT on 1883 |
 | `oauth/` | `WithConnectPacketBuilder` refreshing a bearer token on every connection attempt | MQTT on 1883 (accepts any password) |
 | `ws/` | MQTT over WebSocket with `transport/ws` | a WebSocket listener (EMQX's, on 8083, in `conformance/docker-compose.yml`) |
-| `readme/` | Every Go snippet of the repository README, as code that compiles; `TestREADMESnippets` fails when the README and these files disagree | none |
+| `readme/` | Every Go snippet of the repository README and `docs/*.md` guides, as code that compiles; `TestREADMESnippets` fails when the documentation and these files disagree | none |
 
 Each program runs until it is done or interrupted (Ctrl-C), disconnects
 cleanly, and exits 1 with the error on failure.
@@ -110,7 +110,7 @@ needs nothing from this repository.
 | `connection refused` | `docker ps`; the port in `MQTT_BROKER` | Start the broker or point `MQTT_BROKER` at one. |
 | `ErrConnectRefused` (0x87 Not authorized) | the broker's `allow_anonymous` setting | Allow anonymous clients or add credentials to the example. |
 | `ws` example: `unexpected HTTP response status` | the broker's WebSocket listener and path | Configure a `protocol websockets` listener; most brokers serve it on `/mqtt`. |
-| `TestREADMESnippets` fails | the README snippet it names | Change the README and the matching file in `readme/` together. |
+| `TestREADMESnippets` fails | the documentation snippet it names | Change the Markdown and the matching file in `readme/` together. |
 | `failover` never moves | which broker `UP` names; whether you stopped that one | Stop the broker it reports; with one broker up it stays there. |
 | `durable` or `bridge` repeats old messages at start | `MQTT_DATA_DIR`, and the brokers' sessions for the example's ClientID | They resume earlier runs on purpose; delete `MQTT_DATA_DIR` or let the sessions expire to start over. |
 | `pool` shows no gain | the round trip to the broker; its Receive Maximum (`ServerInfo().ReceiveMaximum`) and threading | A pool widens the window of unacknowledged QoS 1 publishes, which limits publishing only when the round trip is long or the window small. Against a broker on the same host or LAN the broker's own processing is the limit, and a single-threaded broker (mosquitto) gains little. |
@@ -127,7 +127,7 @@ credentials belong. The OAuth token source in that example is a stub.
 | Path | What |
 |---|---|
 | `*/main.go` | one program per folder |
-| `readme/readme.go`, `readme/brokers.go` | README snippets that show no imports; `brokers.go` holds those of Multiple brokers |
-| `readme/typed.go`, `readme/queue.go`, `readme/websocket.go` | snippets whose import block the README shows, so each keeps a file of its own |
+| `readme/readme.go`, `readme/brokers.go` | Documentation snippets that show no imports; `brokers.go` holds those of Multiple brokers and Recipes |
+| `readme/typed.go`, `readme/queue.go`, `readme/websocket.go` | snippets whose import block the documentation shows, so each keeps a file of its own |
 | `readme/quickstart/main.go` | the quick start, a program of its own |
 | `readme/readme_test.go` | `TestREADMESnippets` |

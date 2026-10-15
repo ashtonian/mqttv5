@@ -66,7 +66,7 @@ linters:
         linters:
           - errcheck
           - gosec
-      # examples/readme is the README's Go snippets verbatim, compiled so
+      # examples/readme holds the README and guides' Go snippets, compiled so
       # they cannot drift from the API (TestREADMESnippets). It is
       # documentation: its functions are never called, snippets shadow
       # the shared variables they assume, and some show an empty branch

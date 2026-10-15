@@ -1,6 +1,6 @@
 # codec/json
 
-A JSON `Encoding` for mqttv5's [typed calls](../../README.md#typed-publish--subscribe)
+A JSON `Encoding` for mqttv5's [typed calls](../../docs/typed-payloads.md)
 (`Client.PublishValue`, `Client.SubscribeAs` and their variants), built
 on the standard library's `encoding/json`.
 
