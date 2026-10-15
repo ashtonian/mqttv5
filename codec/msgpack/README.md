@@ -1,7 +1,7 @@
 # codec/msgpack
 
 A MessagePack `Encoding` for mqttv5's
-[typed calls](../../README.md#typed-publish--subscribe)
+[typed calls](../../docs/typed-payloads.md)
 (`Client.PublishValue`, `Client.SubscribeAs` and their variants), built
 on [`github.com/vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack).
 

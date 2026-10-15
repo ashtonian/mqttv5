@@ -12,14 +12,15 @@ import (
 )
 
 // TestREADMESnippets checks that every Go snippet in the repository
-// README appears in a file of this package: each run of non-blank
-// lines, in order, with whitespace runs collapsed. These files compile,
-// so the README's code does too.
+// README and docs/*.md guides appears in a file of this package: each run
+// of non-blank lines, in order, with whitespace runs collapsed. These files
+// compile, so the documentation's code does too.
 func TestREADMESnippets(t *testing.T) {
-	readme, err := os.ReadFile("../../README.md")
+	paths, err := filepath.Glob("../../docs/*.md")
 	if err != nil {
 		t.Fatal(err)
 	}
+	paths = append([]string{"../../README.md"}, paths...)
 	var sources []string
 	err = filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() && strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
@@ -34,17 +35,25 @@ func TestREADMESnippets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, snippet := range goSnippets(readme) {
-		found := false
-		for _, src := range sources {
-			if containsChunks(src, chunks(snippet)) {
-				found = true
-				break
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			markdown, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		if !found {
-			t.Errorf("README Go snippet %d is in no file of examples/readme:\n%s", i+1, snippet)
-		}
+			for i, snippet := range goSnippets(markdown) {
+				found := false
+				for _, src := range sources {
+					if containsChunks(src, chunks(snippet)) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("%s Go snippet %d is in no file of examples/readme:\n%s", path, i+1, snippet)
+				}
+			}
+		})
 	}
 }
 
