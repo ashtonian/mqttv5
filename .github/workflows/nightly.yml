@@ -36,18 +36,21 @@ env:
 jobs:
   models:
     name: model-based tests
-    runs-on: ubuntu-latest
+    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: arc-mqttv5
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v7
+      - uses: ./.github/actions/setup-go-cache
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
 
       - name: seed base for tonight
-        run: echo "BASE=$(( $(date -u +%s) / 86400 * 10000000 ))" >> "$GITHUB_ENV"
+        run: |
+          day=$(( $(date -u +%s) / 86400 ))
+          echo "BASE=$((day * 10000000))" >> "$GITHUB_ENV"
 
       - name: session engine, 1,000,000 seeds
         run: MQTTV5_SEED_BASE=$BASE MQTTV5_SEEDS=1000000 go test -count=1 -timeout 60m -run '^TestSessionFaultInjection$' ./internal/inflight
@@ -57,10 +60,13 @@ jobs:
 
       - name: subscriptions, 2,000 seeds with -race
         run: MQTTV5_SEED_BASE=$BASE MQTTV5_SEEDS=2000 go test -race -count=1 -timeout 60m -run '^TestSubscriptionModel$' .
+      - name: Trim Go build cache
+        uses: ./.github/actions/trim-go-cache
 
   conformance:
     name: conformance (${{ matrix.broker.name }})
-    runs-on: ubuntu-latest
+    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: arc-mqttv5
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -72,8 +78,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v7
+      - uses: ./.github/actions/setup-go-cache
         with:
+          workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
           cache-dependency-path: conformance/go.sum
@@ -108,3 +115,5 @@ jobs:
       - name: stop brokers
         if: always()
         run: docker compose -f conformance/docker-compose.yml --profile hivemq down -v
+      - name: Trim Go build cache
+        uses: ./.github/actions/trim-go-cache

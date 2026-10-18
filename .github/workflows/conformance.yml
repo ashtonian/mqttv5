@@ -21,11 +21,12 @@ env:
 jobs:
   conformance:
     name: broker-backed conformance suite
-    runs-on: ubuntu-latest
+    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: arc-mqttv5
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v7
+      - uses: ./.github/actions/setup-go-cache
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -71,3 +72,5 @@ jobs:
       - name: stop brokers
         if: always()
         run: docker compose -f conformance/docker-compose.yml down -v
+      - name: Trim Go build cache
+        uses: ./.github/actions/trim-go-cache
