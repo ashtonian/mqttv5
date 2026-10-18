@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -35,9 +35,6 @@ jobs:
             (cd "$m" && go vet ./... && go test -race -timeout 5m -count=1 ./...) || exit 1
             echo "::endgroup::"
           done
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
-
   conformance:
     name: conformance (release gate)
     needs: validate
@@ -46,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -69,9 +66,6 @@ jobs:
       - name: stop brokers
         if: always()
         run: docker compose -f conformance/docker-compose.yml down -v
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
-
   install:
     name: install from the module proxy
     needs: validate
@@ -80,16 +74,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
 
       - name: go get every released module in a module outside the repository
         run: scripts/verify-release.sh "${GITHUB_REF_NAME}"
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
-
   publish:
     name: publish GitHub release
     needs: [validate, conformance, install]

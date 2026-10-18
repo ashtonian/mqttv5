@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -72,5 +72,3 @@ jobs:
       - name: stop brokers
         if: always()
         run: docker compose -f conformance/docker-compose.yml down -v
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache

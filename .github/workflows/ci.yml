@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
@@ -53,9 +53,6 @@ jobs:
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           working-directory: ${{ matrix.module }}
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
-
   test:
     name: tidy, vet and test (${{ matrix.module }})
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
@@ -77,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
@@ -109,9 +106,6 @@ jobs:
             echo "### Coverage (${{ matrix.module }}): $(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')" >> "$GITHUB_STEP_SUMMARY"
           fi
         working-directory: ${{ matrix.module }}
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
-
   build:
     name: build
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
@@ -119,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -130,16 +124,13 @@ jobs:
       - name: build examples
         run: go build ./...
         working-directory: examples
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
-
   vuln:
     name: vulnerability scans (all modules)
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: arc-mqttv5
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-go-cache
+      - uses: ashtonian/go-ci-actions@853832a13eec9e84695a009516a948fca3ce0e9d # v1.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -151,5 +142,3 @@ jobs:
             echo "Scanning $module"
             (cd "$module" && govulncheck ./...)
           done
-      - name: Trim Go build cache
-        uses: ./.github/actions/trim-go-cache
