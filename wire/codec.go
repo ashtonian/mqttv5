@@ -106,8 +106,10 @@ type FixedHeader struct {
 // concrete type (Publish, Connack, etc.) implements it.
 //
 // Release returns the packet and its frame buffer to their respective
-// pools. Calling Release more than once is a programming error and may
-// corrupt pooled memory.
+// pools. Every string and []byte field of the packet is a view of that
+// buffer and is invalid after Release; clone what must outlive it.
+// Calling Release more than once is a programming error and may corrupt
+// pooled memory.
 type Packet interface {
 	Type() PacketType
 	Release()
