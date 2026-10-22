@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,7 +32,12 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	err := run(ctx)
+	interrupted := ctx.Err() != nil
 	stop()
+	// An interrupt cancels whatever run was doing: that is a clean stop.
+	if interrupted && errors.Is(err, context.Canceled) {
+		err = nil
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reconnect:", err)
 		os.Exit(1)
