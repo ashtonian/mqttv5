@@ -25,12 +25,12 @@ done
 # Conformance against mosquitto and EMQX (add `--profile hivemq` for
 # HiveMQ CE; see conformance/README.md), then every example run against
 # the same brokers.
-docker compose -f conformance/docker-compose.yml up -d
+docker compose -f conformance/docker-compose.yml up -d --wait
 go -C conformance test -tags conformance -race ./...
 go -C examples test -tags smoke -v -run TestExamplesRun .
 
 # Benchmarks: see benchmarks/README.md.
-docker compose -f benchmarks/docker-compose.yml up -d
+docker compose -f benchmarks/docker-compose.yml up -d --wait
 benchmarks/scripts/run.sh e2e . -tags e2e -run '^$' -bench '^BenchmarkE2E_' -benchmem -timeout 3h
 go -C benchmarks run ./cmd/benchtab README.md ../README.md
 ```
