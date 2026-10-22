@@ -1,7 +1,27 @@
+# Every broker has a memory limit, so one that grows past it is killed
+# alone (docker inspect shows OOMKilled) instead of exhausting the Docker
+# daemon's memory and taking the other brokers and the CI runner with it.
+
+x-hivemq: &hivemq
+  image: hivemq/hivemq-ce:2026.5
+  profiles: ["hivemq"]
+  mem_limit: 3g
+  environment:
+    - HIVEMQ_LOG_LEVEL=WARN
+    # The image's own options, and half the memory limit for the heap: the
+    # rest is Netty's direct buffers, metaspace and thread stacks.
+    - JAVA_OPTS=-XX:+UnlockExperimentalVMOptions -XX:+UseNUMA -XX:MaxRAMPercentage=50
+  healthcheck:
+    test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/1883'"]
+    interval: 3s
+    timeout: 2s
+    retries: 40
+
 services:
   mosquitto:
     image: eclipse-mosquitto:2.1.2-alpine
     container_name: mqttv5-conformance-mosquitto
+    mem_limit: 256m
     ports:
       - "127.0.0.1:1883:1883"
     volumes:
@@ -17,6 +37,7 @@ services:
   emqx:
     image: emqx/emqx:6.3.1
     container_name: mqttv5-conformance-emqx
+    mem_limit: 1536m
     ports:
       - "127.0.0.1:1884:1883"
       - "127.0.0.1:8083:8083" # WebSocket listener, for the ws example
@@ -37,6 +58,7 @@ services:
   emqx-scram:
     image: emqx/emqx:6.3.1
     container_name: mqttv5-conformance-emqx-scram
+    mem_limit: 1536m
     ports:
       - "127.0.0.1:1885:1883"   # MQTT listener (SCRAM-authenticated)
       - "127.0.0.1:18084:18083" # REST API, for provisioning the SCRAM user
@@ -54,33 +76,20 @@ services:
   # push: start it with `docker compose --profile hivemq up -d`.
   # `hivemq` keeps the defaults (Receive Maximum 10, five topic aliases)
   # and runs the whole suite; `hivemq-strict` announces tight limits for
-  # strict_test.go (see hivemq/strict.xml).
+  # strict_test.go. Both keep their persistence in memory (see
+  # hivemq/default.xml).
   hivemq:
-    image: hivemq/hivemq-ce:2026.5
+    <<: *hivemq
     container_name: mqttv5-conformance-hivemq
-    profiles: ["hivemq"]
     ports:
       - "127.0.0.1:1886:1883"
-    environment:
-      - HIVEMQ_LOG_LEVEL=WARN
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/1883'"]
-      interval: 3s
-      timeout: 2s
-      retries: 40
+    volumes:
+      - ./hivemq/default.xml:/opt/hivemq/conf/config.xml:ro
 
   hivemq-strict:
-    image: hivemq/hivemq-ce:2026.5
+    <<: *hivemq
     container_name: mqttv5-conformance-hivemq-strict
-    profiles: ["hivemq"]
     ports:
       - "127.0.0.1:1887:1883"
-    environment:
-      - HIVEMQ_LOG_LEVEL=WARN
     volumes:
       - ./hivemq/strict.xml:/opt/hivemq/conf/config.xml:ro
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/1883'"]
-      interval: 3s
-      timeout: 2s
-      retries: 40

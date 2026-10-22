@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!--
+  HiveMQ CE with its default MQTT limits (Receive Maximum 10, five topic
+  aliases) for the whole suite. It differs from the image's own config
+  only in keeping its persistence in memory: the file persistence
+  fallocates a write-ahead log per RocksDB bucket, which where the Docker
+  root is a tmpfs (the CI runners) takes gigabytes of RAM per broker.
+-->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+    </listeners>
+    <persistence>
+        <mode>in-memory</mode>
+    </persistence>
+    <anonymous-usage-statistics>
+        <enabled>false</enabled>
+    </anonymous-usage-statistics>
+</hivemq>
