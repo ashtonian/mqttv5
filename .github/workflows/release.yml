@@ -35,37 +35,13 @@ jobs:
             (cd "$m" && go vet ./... && go test -race -timeout 5m -count=1 ./...) || exit 1
             echo "::endgroup::"
           done
+  # The same workflow every push runs, so the release gate cannot drift
+  # from it.
   conformance:
     name: conformance (release gate)
     needs: validate
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: arc-mqttv5
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ashtonian/go-ci-actions@470279e1ff775269324ca13b0aaaf7211951215e # v1.0.1
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache-dependency-path: conformance/go.sum
-
-      - name: start brokers
-        run: docker compose -f conformance/docker-compose.yml up -d
-
-      - name: wait for brokers
-        timeout-minutes: 2
-        run: |
-          for port in 1883 1884; do
-            until bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; do sleep 1; done
-          done
-
-      - name: run conformance
-        run: go test -tags conformance -race -timeout 180s ./...
-        working-directory: conformance
-
-      - name: stop brokers
-        if: always()
-        run: docker compose -f conformance/docker-compose.yml down -v
+    uses: ./.github/workflows/conformance.yml
   install:
     name: install from the module proxy
     needs: validate

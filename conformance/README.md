@@ -133,8 +133,10 @@ docker compose -f conformance/docker-compose.yml --profile hivemq up -d --wait
 MQTT_BROKER=mqtt://127.0.0.1:1886 go -C conformance test -tags conformance -race ./...
 ```
 
-CI runs the suite against mosquitto on every push and pull request
-(`.github/workflows/conformance.yml`) and before every release. A nightly
+CI runs the suite against mosquitto, and every example, on every push
+and pull request (`.github/workflows/conformance.yml`). The release
+workflow calls that same workflow on the tagged commit before it
+publishes the GitHub release. A nightly
 job (`.github/workflows/nightly.yml`) runs it against mosquitto, EMQX and
 HiveMQ, the strict-limit tests, a ten-minute soak per broker, and the
 model-based tests with a million new seeds.
@@ -149,6 +151,7 @@ modules (through `replace` directives) and `codec/json`.
 | Symptom | Check | Then |
 |---|---|---|
 | Tests skip | `docker compose -f conformance/docker-compose.yml ps` | Start the brokers; the skip message names the unreachable one. |
+| Tests against EMQX fail with `read CONNACK: EOF` or `connection reset by peer` | `curl -fsS http://127.0.0.1:18083/status` inside the container: `docker exec mqttv5-conformance-emqx curl -fsS http://127.0.0.1:18083/status` | Not 200: EMQX is still starting, and its listener closes connections until it has started. Start the brokers with `up -d --wait`, which waits on that check. |
 | `TestReauthenticate_SCRAM_EMQX` skips or fails provisioning | `curl -u conformancekey:conformanceSecret0123456789 http://127.0.0.1:18084/api/v5/authentication` | EMQX takes several seconds to start its API; wait for it. |
 | A test fails on one broker only | the broker's logs (`docker compose … logs`) | Brokers differ in defaults (Receive Maximum, topic alias limits, shared-subscription strategy); a difference the spec allows belongs in the test as a skip or a per-broker expectation, not in the client. |
 | A broker stops mid-run, or the nightly runner vanishes | `docker inspect --format '{{.Name}} oom-killed={{.State.OOMKilled}}' $(docker compose -f conformance/docker-compose.yml --profile hivemq ps -aq)`; in the nightly, the `broker-memory-*` artifact and the "broker logs" step | `oom-killed=true`: the broker outgrew its `mem_limit`; read its growth in the artifact before raising the limit. A runner that vanishes has hit its Docker daemon's own limit: compare the sum of the brokers' memory with the runner's dind limit. |

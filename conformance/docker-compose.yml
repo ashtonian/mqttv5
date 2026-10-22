@@ -17,6 +17,16 @@ x-hivemq: &hivemq
     timeout: 2s
     retries: 40
 
+# `emqx ctl status` exits 0 while the node is still starting, when its
+# MQTT listener already accepts connections and closes them before a
+# CONNACK. /status answers 200 only once the broker has started.
+x-emqx-healthcheck: &emqx-healthcheck
+  test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:18083/status"]
+  interval: 3s
+  timeout: 3s
+  retries: 20
+  start_period: 120s
+
 services:
   mosquitto:
     image: eclipse-mosquitto:2.1.2-alpine
@@ -43,11 +53,7 @@ services:
       - "127.0.0.1:8083:8083" # WebSocket listener, for the ws example
     environment:
       - EMQX_ALLOW_ANONYMOUS=true
-    healthcheck:
-      test: ["CMD", "emqx", "ctl", "status"]
-      interval: 5s
-      timeout: 5s
-      retries: 15
+    healthcheck: *emqx-healthcheck
 
   # emqx-scram is a dedicated EMQX with MQTT 5 enhanced authentication
   # (SCRAM-SHA-256) for the re-authentication conformance test, kept
@@ -66,11 +72,7 @@ services:
       - EMQX_API_KEY__BOOTSTRAP_FILE=/opt/emqx/etc/api_key.bootstrap
     volumes:
       - ./emqx/api_key.bootstrap:/opt/emqx/etc/api_key.bootstrap:ro
-    healthcheck:
-      test: ["CMD", "emqx", "ctl", "status"]
-      interval: 5s
-      timeout: 5s
-      retries: 15
+    healthcheck: *emqx-healthcheck
 
   # HiveMQ CE runs in the nightly conformance job, not on every
   # push: start it with `docker compose --profile hivemq up -d`.

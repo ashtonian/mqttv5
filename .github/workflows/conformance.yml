@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # The release gate runs this workflow on the tagged commit.
+  workflow_call:
 
 concurrency:
   group: conformance-${{ github.workflow }}-${{ github.ref }}
@@ -32,19 +34,11 @@ jobs:
           check-latest: true
           cache-dependency-path: conformance/go.sum
 
+      # --wait returns once every broker's healthcheck passes. A port that
+      # accepts a TCP connection is not a broker that is ready: EMQX
+      # resets connections until it has started.
       - name: start brokers
-        run: docker compose -f conformance/docker-compose.yml up -d
-
-      - name: wait for brokers
-        timeout-minutes: 2
-        run: |
-          for port in 1883 1884 1885 8083 18084; do
-            echo "waiting for tcp/$port"
-            until bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; do
-              sleep 1
-            done
-            echo "tcp/$port up"
-          done
+        run: docker compose -f conformance/docker-compose.yml up -d --wait --wait-timeout 300
 
       - name: wait for emqx-scram REST API
         timeout-minutes: 2
