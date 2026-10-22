@@ -85,6 +85,18 @@ jobs:
       - name: start brokers
         run: docker compose -f conformance/docker-compose.yml --profile hivemq up -d --wait
 
+      # Every 15 s, each broker's memory as its cgroup counts it. The
+      # runner's Docker root is a tmpfs, so that includes the files a
+      # broker writes, preallocated space too, which docker's own size
+      # reports leave out.
+      - name: sample broker memory
+        run: |
+          docker system df > "$RUNNER_TEMP/broker-memory.log"
+          (while sleep 15; do
+            echo "== $(date -u +%T)"
+            docker stats --no-stream --format '{{.Name}} mem={{.MemUsage}} cpu={{.CPUPerc}}'
+          done) >> "$RUNNER_TEMP/broker-memory.log" 2>&1 &
+
       - name: wait for the emqx-scram REST API
         timeout-minutes: 2
         run: |
@@ -107,7 +119,16 @@ jobs:
 
       - name: broker logs (on failure)
         if: failure()
-        run: docker compose -f conformance/docker-compose.yml --profile hivemq logs --no-color
+        run: |
+          docker compose -f conformance/docker-compose.yml --profile hivemq ps --all --quiet \
+            | xargs docker inspect --format '{{.Name}} {{.State.Status}} exit={{.State.ExitCode}} oom-killed={{.State.OOMKilled}}'
+          docker compose -f conformance/docker-compose.yml --profile hivemq logs --no-color
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: broker-memory-${{ matrix.broker.name }}
+          path: ${{ runner.temp }}/broker-memory.log
 
       - name: stop brokers
         if: always()

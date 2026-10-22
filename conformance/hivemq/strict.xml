@@ -2,7 +2,8 @@
 <!--
   HiveMQ CE with tight limits for the limit-enforcement tests
   (strict_test.go): every value here is announced in CONNACK, and the
-  client must honour it before anything reaches the wire.
+  client must honour it before anything reaches the wire. Persistence is
+  in memory for the reason given in default.xml.
 -->
 <hivemq>
     <listeners>
@@ -42,6 +43,9 @@
             <enabled>false</enabled>
         </subscription-identifier>
     </mqtt>
+    <persistence>
+        <mode>in-memory</mode>
+    </persistence>
     <anonymous-usage-statistics>
         <enabled>false</enabled>
     </anonymous-usage-statistics>

@@ -90,8 +90,16 @@ two more with `--profile hivemq`:
 | `mosquitto` (eclipse-mosquitto 2.1.2) | 1883 | the default broker; [`mosquitto.conf`](mosquitto.conf) allows anonymous clients |
 | `emqx` (EMQX 6.3.1, anonymous) | 1884, WebSocket 8083 | the second broker of the ClientGroup test; the whole suite can also run against it; the examples' smoke test uses its WebSocket listener |
 | `emqx-scram` (EMQX 6.3.1) | 1885, REST 18084 | enhanced authentication: `TestReauthenticate_SCRAM_EMQX` provisions a SCRAM-SHA-256 authenticator and user through the REST API with the key in [`emqx/api_key.bootstrap`](emqx/api_key.bootstrap) |
-| `hivemq` (HiveMQ CE 2026.5, profile `hivemq`) | 1886 | the whole suite against HiveMQ's defaults (Receive Maximum 10, five topic aliases) |
+| `hivemq` (HiveMQ CE 2026.5, profile `hivemq`) | 1886 | the whole suite against HiveMQ's defaults (Receive Maximum 10, five topic aliases) ([`hivemq/default.xml`](hivemq/default.xml)) |
 | `hivemq-strict` (HiveMQ CE 2026.5, profile `hivemq`) | 1887 | `strict_test.go`: Maximum QoS 1, 2 KiB packets, Server Keep Alive 4 s, Receive Maximum 4, two topic aliases, no retain, wildcards, shared subscriptions or Subscription Identifiers ([`hivemq/strict.xml`](hivemq/strict.xml)) |
+
+Each broker has a memory limit in the compose file (HiveMQ 3 GiB with
+half of it for the JVM heap, EMQX 1.5 GiB, mosquitto 256 MiB), so a
+broker that outgrows it is killed on its own. Both HiveMQ instances keep
+their persistence in memory: HiveMQ's file persistence preallocates a
+write-ahead log for each of its RocksDB buckets, and on the CI runners,
+whose Docker root is a tmpfs, that preallocation is RAM, several GiB per
+broker. No test restarts a broker, so nothing depends on persistence.
 
 ## Configuration
 
@@ -143,6 +151,7 @@ modules (through `replace` directives) and `codec/json`.
 | Tests skip | `docker compose -f conformance/docker-compose.yml ps` | Start the brokers; the skip message names the unreachable one. |
 | `TestReauthenticate_SCRAM_EMQX` skips or fails provisioning | `curl -u conformancekey:conformanceSecret0123456789 http://127.0.0.1:18084/api/v5/authentication` | EMQX takes several seconds to start its API; wait for it. |
 | A test fails on one broker only | the broker's logs (`docker compose … logs`) | Brokers differ in defaults (Receive Maximum, topic alias limits, shared-subscription strategy); a difference the spec allows belongs in the test as a skip or a per-broker expectation, not in the client. |
+| A broker stops mid-run, or the nightly runner vanishes | `docker inspect --format '{{.Name}} oom-killed={{.State.OOMKilled}}' $(docker compose -f conformance/docker-compose.yml --profile hivemq ps -aq)`; in the nightly, the `broker-memory-*` artifact and the "broker logs" step | `oom-killed=true`: the broker outgrew its `mem_limit`; read its growth in the artifact before raising the limit. A runner that vanishes has hit its Docker daemon's own limit: compare the sum of the brokers' memory with the runner's dind limit. |
 | `TestREADMEListsEveryTest` fails | the block it prints | Paste it into this README between the `tests` markers. |
 
 ## Broker notes
@@ -211,7 +220,7 @@ synthetic payloads only.
 | `reauth_test.go` | SCRAM-SHA-256 re-authentication against EMQX |
 | `strict_test.go` | a broker announcing tight limits |
 | `readme_test.go` | generates and checks the test list above |
-| `docker-compose.yml`, `mosquitto.conf`, `emqx/` | the brokers |
+| `docker-compose.yml`, `mosquitto.conf`, `emqx/`, `hivemq/` | the brokers |
 
 <!-- MQTT v5.0 citations -->
 
