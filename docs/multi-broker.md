@@ -101,7 +101,9 @@ cli, _ := mqttv5.New(
   messages it queued since included.
 - **Callers.** A `Publish` waiting for its acknowledgement keeps waiting
   across the failover, bounded by its ctx. While no broker is
-  connected, `Publish` returns `ErrNotConnected`; a
+  connected, `Publish` returns `ErrNotConnected`, or with
+  `WithPublishWaitForConnection()` waits for the broker it fails over
+  to; a
   [`QueuePublisher`](durable-publishing.md#durable-publishing-with-queuepublisher) queues.
 
 ```mermaid

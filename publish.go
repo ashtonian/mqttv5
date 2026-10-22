@@ -38,6 +38,10 @@ import (
 // writer goroutine, so the packet may still reach the broker after
 // Publish returned ctx's error.
 //
+// With no connection up Publish returns [ErrNotConnected], which
+// guarantees the message was not sent; with
+// [WithPublishWaitForConnection] it waits for the next connection.
+//
 // With [WithPublisherPool] the call first tries the pool per
 // [PoolRoutingPolicy] and falls back to the main connection if every
 // pool member is unhealthy.
@@ -54,9 +58,9 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 		c.stats.addPoolFallback()
 	}
 
-	cs := c.cur.Load()
-	if cs == nil {
-		return ErrNotConnected
+	cs, err := c.publishConnection(ctx)
+	if err != nil {
+		return err
 	}
 	opts := po.wire()
 	if err := c.applyServerLimits(cs, &opts); err != nil {
@@ -78,6 +82,29 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 		return err
 	}
 	return nil
+}
+
+// publishConnection is the connection a Publish sends on. With none up
+// it returns ErrNotConnected or, with [WithPublishWaitForConnection],
+// waits for one, bounded by ctx; a client that has been disconnected
+// answers ErrNotConnected either way.
+func (c *Client) publishConnection(ctx context.Context) (*connState, error) {
+	for {
+		if cs := c.cur.Load(); cs != nil {
+			return cs, nil
+		}
+		if !c.cfg.PublishWaitForConnection {
+			return nil, ErrNotConnected
+		}
+		// A connection that drops again before this call sees it sends
+		// the loop round to wait for the next one.
+		switch err := c.AwaitConnection(ctx); {
+		case errors.Is(err, ErrClosed):
+			return nil, ErrNotConnected
+		case err != nil:
+			return nil, err
+		}
+	}
 }
 
 // publishTracked starts a QoS 1/2 exchange on the current connection

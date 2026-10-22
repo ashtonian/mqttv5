@@ -1500,3 +1500,164 @@ func TestPoolMemberSurvivesConnectDeadline(t *testing.T) {
 	}
 	waitForPoolReady(t, cli, 1, 3*time.Second)
 }
+
+// gatedReconnectBroker accepts the first connection and drops it once drop
+// closes. Every later connection gets its CONNACK only after release
+// closes, so the client has no connection until the test lets it
+// reconnect; it sends the topic of each PUBLISH on got and acks QoS 1.
+func gatedReconnectBroker(t *testing.T, drop, release <-chan struct{}, got chan<- string) *testbroker.Broker {
+	t.Helper()
+	var conns atomic.Int32
+	return testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		if conns.Add(1) == 1 {
+			acceptConnect(t, c, dec)
+			select {
+			case <-drop:
+			case <-fb.Done():
+			}
+			return
+		}
+		select {
+		case <-release:
+		case <-fb.Done():
+			return
+		}
+		acceptConnect(t, c, dec)
+		for {
+			pkt, err := dec.ReadPacket()
+			if err != nil {
+				return
+			}
+			if pub, ok := pkt.(*wire.Publish); ok {
+				got <- strings.Clone(pub.Topic)
+				if pub.QoS == 1 {
+					_, _ = wire.WritePuback(c, wire.PubRespOpts{PacketID: pub.PacketID})
+				}
+			}
+			pkt.Release()
+		}
+	})
+}
+
+// connectThenDrop connects a client with opts to a gatedReconnectBroker,
+// has the broker drop the connection and returns once the client knows it
+// is down; it stays down until release closes.
+func connectThenDrop(t *testing.T, release <-chan struct{}, got chan<- string, opts ...Option) *Client {
+	t.Helper()
+	drop := make(chan struct{})
+	fb := gatedReconnectBroker(t, drop, release, got)
+	down := make(chan struct{}, 1)
+	cli, err := New(append([]Option{
+		WithBroker(fb.URL()),
+		WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+		WithLogger(quietLogger()),
+		WithOnConnectionDown(func() bool {
+			select {
+			case down <- struct{}{}:
+			default:
+			}
+			return true
+		}),
+	}, opts...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	close(drop)
+	select {
+	case <-down:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the client did not see its connection drop")
+	}
+	return cli
+}
+
+// While the client reconnects, Publish fails fast by default; with
+// WithPublishWaitForConnection it waits and sends on the next connection.
+func TestPublishWaitForConnection(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		wait bool
+		qos  byte
+	}{
+		{"fails fast by default", false, 1},
+		{"waits for the reconnect at QoS 0", true, 0},
+		{"waits for the reconnect at QoS 1", true, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			release := make(chan struct{})
+			got := make(chan string, 4)
+			var opts []Option
+			if tt.wait {
+				opts = append(opts, WithPublishWaitForConnection())
+			}
+			cli := connectThenDrop(t, release, got, opts...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			po := PublishOptions{Topic: "during-reconnect", QoS: tt.qos, Payload: []byte("x")}
+
+			if !tt.wait {
+				err := cli.Publish(ctx, po)
+				close(release)
+				if !errors.Is(err, ErrNotConnected) {
+					t.Fatalf("Publish while reconnecting = %v, want ErrNotConnected", err)
+				}
+				return
+			}
+			// Let the reconnect through once Publish is waiting for it.
+			time.AfterFunc(100*time.Millisecond, func() { close(release) })
+			if err := cli.Publish(ctx, po); err != nil {
+				t.Fatalf("Publish while reconnecting = %v, want it sent on the next connection", err)
+			}
+			select {
+			case topic := <-got:
+				if topic != po.Topic {
+					t.Fatalf("broker got %q, want %q", topic, po.Topic)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the publish never reached the broker")
+			}
+		})
+	}
+}
+
+// ctx bounds a Publish waiting for a connection that does not come.
+func TestPublishWaitForConnectionEndsWithCtx(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	cli := connectThenDrop(t, release, make(chan string, 1), WithPublishWaitForConnection())
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Publish = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+// A disconnected client waits for nothing: Publish returns ErrNotConnected.
+func TestPublishWaitForConnectionAfterDisconnect(t *testing.T) {
+	fb := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		<-fb.Done()
+	})
+	cli, err := New(WithBroker(fb.URL()), WithPublishWaitForConnection(), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("Publish after Disconnect = %v, want ErrNotConnected", err)
+	}
+}

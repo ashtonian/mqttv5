@@ -85,6 +85,7 @@
 | Option | Default | Effect |
 |---|---|---|
 | `WithReconnectBackoff(b)` | `ExponentialBackoff(1s, 30s, 200ms)` | Delay before reconnect attempt n. `ConstantBackoff(d)` also shipped. The attempt count carries over connections that drop sooner than the delay before them. |
+| `WithPublishWaitForConnection()` | off | `Publish` with no connection up waits, bounded by its ctx, for the next one — before the first connection, and between a drop and the reconnect — instead of returning `ErrNotConnected`. After `Disconnect` it still returns `ErrNotConnected` at once. |
 | `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure: with `WithBrokers`, once every broker has failed. |
 | `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Changing brokers at runtime](multi-broker.md#changing-brokers-at-runtime)). |
 
@@ -222,7 +223,7 @@ them with `errors.As`.
 
 | Error | Source | Meaning |
 |---|---|---|
-| `ErrNotConnected` | `Publish`, `Reauthenticate` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect (`AwaitConnection`). |
+| `ErrNotConnected` | `Publish`, `Reauthenticate` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect (`AwaitConnection`), or let `Publish` wait (`WithPublishWaitForConnection`). |
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
 | `ErrClosed` | any after `Disconnect` | Client torn down. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason; the error is a `*ReasonCodeError` carrying the code, reason string and server reference. |
