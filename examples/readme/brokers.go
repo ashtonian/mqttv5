@@ -247,3 +247,15 @@ func sharedSubscription() {
 	jobs, _, _ := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: "$share/workers/jobs/#", QoS: 1}})
 	_ = jobs
 }
+
+func primaryAndStandby() {
+	cli, _ := mqttv5.New(
+		mqttv5.WithBrokers(
+			"mqtts://primary.example.com:8883",
+			"mqtts://standby.example.com:8883",
+		),
+		mqttv5.WithFailoverOrder(mqttv5.FailoverPriority),
+		mqttv5.WithClientID("ingest-7"),
+	)
+	_ = cli
+}

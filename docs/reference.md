@@ -14,7 +14,8 @@
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. Several URLs fail over: `Connect` and each reconnect attempt move to the next ([Failover](multi-broker.md#failover-withbrokers)). |
+| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. Several URLs fail over in the `WithFailoverOrder` order ([Failover](multi-broker.md#failover-withbrokers)). |
+| `WithFailoverOrder(o)` | `FailoverRotate` | How several brokers are tried. `FailoverRotate`: each client starts at a random entry and each reconnect attempt moves on one. `FailoverPriority`: the list is a preference order; `Connect` and each reconnect start at the first entry, and one reconnect attempt is a pass over the list with no backoff between entries ([Primary and standby](multi-broker.md#primary-and-standby-failoverpriority)). |
 | `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial. Takes precedence over `WithDialer`/`WithTLSConfig`. Nil rejected. |
 | `WithTLSConfig(*tls.Config)` | — | TLS for `mqtts://`. |
 | `WithDialer(*net.Dialer)` | default | Override transport `net.Dialer`. |

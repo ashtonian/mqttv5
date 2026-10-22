@@ -660,10 +660,9 @@ func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 }
 
 // supervisor watches the current connState's done channel and
-// reconnects (with backoff) until Disconnect is called. Each reconnect
-// attempt advances brokerIdx so multi-broker URL lists rotate through
-// healthy endpoints; a successful connect leaves the index parked on
-// whichever URL accepted us.
+// reconnects (with backoff) until Disconnect is called. The reconnect
+// attempts follow the FailoverOrder (see redial); a successful connect
+// leaves the index parked on whichever URL accepted us.
 func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 	defer life.running.Done()
 	// attempts counts reconnect attempts since the last connection that
@@ -738,9 +737,11 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 	}
 }
 
-// redial keeps advancing brokerIdx, backing off and dialling until a
-// connection is up, or the span ends (false). The backoff continues from
-// attempt; redial returns the attempts made so far.
+// redial keeps backing off and making reconnect attempts until a
+// connection is up, or the span ends (false). Under FailoverRotate an
+// attempt dials the entry after the current one; under FailoverPriority
+// it is one pass over the list from the first entry. The backoff
+// continues from attempt; redial returns the attempts made so far.
 func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, int) {
 	for {
 		delay := c.cfg.ReconnectBackoff(attempt)
@@ -755,46 +756,76 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 		if !c.events.flush(life.shutdown) {
 			return false, attempt
 		}
-
-		// Advance the URL pointer for this attempt. The first attempt
-		// after a drop already moves off the URL that just failed —
-		// fail-fast over a known-bad endpoint.
-		c.brokerIdx.Add(1)
 		attempt++
 
-		brokerURL, _ := c.nextBrokerURL()
-		if fn := c.cfg.OnReconnectAttempt; fn != nil {
-			c.events.post(func() { fn(attempt, brokerURL) })
-			if !c.events.flush(life.shutdown) {
+		dials := 1
+		if c.cfg.FailoverOrder == FailoverPriority {
+			c.brokerIdx.Store(0)
+			dials = len(*c.brokerURLs.Load())
+		} else {
+			// The first attempt after a drop already moves off the URL
+			// that just failed — fail-fast over a known-bad endpoint.
+			c.brokerIdx.Add(1)
+		}
+		fromList := false
+		for i := range dials {
+			if i > 0 {
+				// A callback may change the brokers, as in connectFirst.
+				if !c.events.flush(life.shutdown) {
+					return false, attempt
+				}
+				if fromList {
+					c.brokerIdx.Add(1)
+				}
+			}
+			brokerURL, redirected := c.nextBrokerURL()
+			fromList = !redirected
+			result, live := c.tryBroker(life, attempt, brokerURL, cleanStart)
+			if !live {
 				return false, attempt
 			}
-		}
-
-		ctx, cancel := life.context(context.Background())
-		result, err := c.connectOnce(ctx, brokerURL, cleanStart)
-		cancel()
-		if err != nil {
-			select {
-			case <-life.shutdown:
-				// The span ended during the attempt and cut it short.
-				return false, attempt
-			default:
+			if result == nil {
+				continue
 			}
-			c.stats.addConnectFailure()
-			c.redirectFrom(err)
-			c.connectError(err)
-			c.cfg.Logger.Warn("mqttv5: reconnect failed",
-				slog.String("broker", brokerURL),
-				slog.Int("attempt", attempt),
-				slog.Any("error", err),
-			)
-			continue
+			if err := c.runConnection(life, result); err != nil {
+				return false, attempt
+			}
+			return true, attempt
 		}
-		if err := c.runConnection(life, result); err != nil {
-			return false, attempt
-		}
-		return true, attempt
 	}
+}
+
+// tryBroker makes reconnect attempt's dial of brokerURL. It returns the
+// connection when the broker accepts it and nil when it fails; live is
+// false when the span ended.
+func (c *Client) tryBroker(life *lifecycle, attempt int, brokerURL string, cleanStart bool) (result *connectResult, live bool) {
+	if fn := c.cfg.OnReconnectAttempt; fn != nil {
+		c.events.post(func() { fn(attempt, brokerURL) })
+		if !c.events.flush(life.shutdown) {
+			return nil, false
+		}
+	}
+	ctx, cancel := life.context(context.Background())
+	result, err := c.connectOnce(ctx, brokerURL, cleanStart)
+	cancel()
+	if err == nil {
+		return result, true
+	}
+	select {
+	case <-life.shutdown:
+		// The span ended during the attempt and cut it short.
+		return nil, false
+	default:
+	}
+	c.stats.addConnectFailure()
+	c.redirectFrom(err)
+	c.connectError(err)
+	c.cfg.Logger.Warn("mqttv5: reconnect failed",
+		slog.String("broker", brokerURL),
+		slog.Int("attempt", attempt),
+		slog.Any("error", err),
+	)
+	return nil, true
 }
 
 // sendDisconnectWith best-effort writes a graceful DISCONNECT carrying
@@ -965,12 +996,16 @@ type ServerRedirect struct {
 func (r ServerRedirect) Permanent() bool { return r.Reason == ReasonServerMoved }
 
 // connectFirst makes a span's first connection. It makes one attempt
-// per listed broker, starting from the current one, so that Connect
+// per listed broker, starting from the current one (the first under
+// FailoverPriority), so that Connect
 // fails only when none of them accepts; a redirect it follows takes one
 // of those attempts. Each failure is counted and reported as a reconnect
 // failure is, and the brokers' errors are joined, each naming its
 // broker.
 func (c *Client) connectFirst(ctx context.Context, life *lifecycle, cleanStart bool) (*connectResult, error) {
+	if c.cfg.FailoverOrder == FailoverPriority {
+		c.brokerIdx.Store(0)
+	}
 	attempts := len(*c.brokerURLs.Load())
 	var errs []error
 	fromList := false

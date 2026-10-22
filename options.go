@@ -87,14 +87,19 @@ var DefaultReconnectBackoff = ExponentialBackoff(
 // Config carries the resolved configuration for a [Client]. Construct
 // via [New].
 type Config struct {
-	// BrokerURLs is the ordered list of broker URLs. The supervisor
-	// rotates through it on reconnect; [Client.SetBrokers] replaces
-	// it at runtime.
+	// BrokerURLs is the ordered list of broker URLs. FailoverOrder
+	// decides which one each connection attempt dials;
+	// [Client.SetBrokers] replaces it at runtime.
 	BrokerURLs []string
-	ClientID   string
-	Username   string
-	Password   []byte
-	KeepAlive  uint16
+
+	// FailoverOrder is how a connection attempt picks its broker from
+	// BrokerURLs. Default [FailoverRotate].
+	FailoverOrder FailoverOrder
+
+	ClientID  string
+	Username  string
+	Password  []byte
+	KeepAlive uint16
 
 	// CleanStart sets the CleanStart flag on the initial CONNECT
 	// (§3.1.2.4). When not set explicitly it is true unless there is
@@ -341,6 +346,40 @@ func WithBrokers(urls ...string) Option {
 			return ErrMissingBroker
 		}
 		c.BrokerURLs = append(c.BrokerURLs[:0], urls...)
+		return nil
+	}
+}
+
+// FailoverOrder is how a client with several brokers ([WithBrokers])
+// picks the broker each connection attempt dials.
+type FailoverOrder uint8
+
+const (
+	// FailoverRotate treats the brokers as equals. Each client starts
+	// at a random entry, so a fleet that restarts together spreads over
+	// the list, and each reconnect attempt, after the backoff, moves on
+	// one entry, so the client stays on whichever broker accepts it.
+	FailoverRotate FailoverOrder = iota
+
+	// FailoverPriority treats the list as a preference order, the
+	// primary first. Connect and every reconnect start at the first
+	// entry and move to the next only when one fails to connect: a dial
+	// error, a timeout or a CONNACK refusal. A reconnect attempt is one
+	// pass over the list after the backoff, with no delay between
+	// entries, so a client reaches a standby as soon as the primary
+	// refuses it and returns to the primary on its next reconnect.
+	FailoverPriority
+)
+
+func (o FailoverOrder) valid() bool { return o == FailoverRotate || o == FailoverPriority }
+
+// WithFailoverOrder sets the [FailoverOrder]. Default [FailoverRotate].
+func WithFailoverOrder(o FailoverOrder) Option {
+	return func(c *Config) error {
+		if !o.valid() {
+			return fmt.Errorf("mqttv5: invalid FailoverOrder %d", o)
+		}
+		c.FailoverOrder = o
 		return nil
 	}
 }

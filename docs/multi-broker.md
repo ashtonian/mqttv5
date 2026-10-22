@@ -79,14 +79,16 @@ cli, _ := mqttv5.New(
 ```
 
 - **Connect.** Each client starts at a random entry, so a fleet that
-  restarts together spreads over the list. `Connect` tries each broker
+  restarts together spreads over the list ([`FailoverPriority`](#primary-and-standby-failoverpriority)
+  starts at the first instead). `Connect` tries each broker
   once and fails only when none accepts; its error joins every
   broker's, each naming its URL, and `errors.Is` sees them all. With
   `WithRetryInitialConnect` the client keeps trying in the background
   instead.
 - **A drop.** After the reconnect backoff the supervisor dials the next
   entry, so the first attempt leaves the broker that just failed, and
-  each further attempt moves on one. The client stays on whichever
+  each further attempt moves on one ([`FailoverPriority`](#primary-and-standby-failoverpriority)
+  starts each attempt at the first entry instead). The client stays on whichever
   broker accepts it; `ConnackInfo.Broker`, in `OnConnectionUp` and
   `ServerInfo()`, names it.
 - **The session.** Nodes of a cluster share sessions: the next one
@@ -127,6 +129,39 @@ sequenceDiagram
     end
     Note over C: Publish returns
 ```
+
+### Primary and standby: `FailoverPriority`
+
+The brokers above are equals. When they are not, because one is the
+primary and the rest stand by in a preference order, a site's own
+broker before a remote one, say, `WithFailoverOrder(FailoverPriority)`
+makes the list that order:
+
+```go
+cli, _ := mqttv5.New(
+    mqttv5.WithBrokers(
+        "mqtts://primary.example.com:8883",
+        "mqtts://standby.example.com:8883",
+    ),
+    mqttv5.WithFailoverOrder(mqttv5.FailoverPriority),
+    mqttv5.WithClientID("ingest-7"),
+)
+```
+
+- **Connect** starts at the first entry, every time.
+- **A reconnect attempt** is one pass over the list from the first
+  entry, after the reconnect backoff. An entry that fails, by a dial
+  error, a timeout or a CONNACK refusal such as `0x88` Server
+  unavailable or `0x9C` Use another server, hands over to the next one at
+  once; the backoff runs between passes, never between entries. A
+  primary that refuses its clients, while it drains for maintenance for
+  example, moves them to the standby in one pass.
+- **Coming back.** A client on a standby stays there while the
+  connection lasts and tries the primary first on its next reconnect.
+  Nothing moves a healthy connection back.
+
+`OnReconnectAttempt` reports each entry a pass dials, all with the
+pass's attempt number.
 
 ### Changing brokers at runtime
 
@@ -276,7 +311,7 @@ Use `g.Members()` or `g.Member(name)` for direct per-member access
 
 | Combination | Gives |
 |---|---|
-| `WithBrokers` + `WithPublisherPool` | Pool members fail over too, each starting at its own entry of the list; `SetBrokers` moves them with the main connection. |
+| `WithBrokers` + `WithPublisherPool` | Pool members fail over too, in the client's `WithFailoverOrder`: each from its own entry of the list, or with `FailoverPriority` from the first; `SetBrokers` moves them with the main connection. |
 | `WithBrokers` + `WithStore` + `QueuePublisher` | The [durable outbox](recipes.md#durable-outbox). |
 | `WithBrokers` + `WithFollowServerRedirects` | A `0x9D` move replaces the list; a `0x9C` redirect takes one attempt. |
 | `ClientGroup` member with several `Brokers` | [Regional HA](recipes.md#regional-ha); a [central service](recipes.md#central-service-over-independent-clusters) whose clusters fail over within themselves. |

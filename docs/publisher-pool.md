@@ -71,8 +71,10 @@ cli, _ := mqttv5.New(
   own messages (with a user property, say) and skip them in the handler
   instead.
 - **Brokers.** Members use the client's broker list — `SetBrokers`
-  replaces it for them too — and each starts at a random entry, so over
-  a cluster the pool spreads across its nodes. Each member follows the
+  replaces it for them too — and its failover order. Under the default
+  `FailoverRotate` each starts at a random entry, so over a cluster the
+  pool spreads across its nodes; under `FailoverPriority` they all start
+  at the first. Each member follows the
   server redirects its own broker sends.
 - **Lifetime.** Members connect with the client and disconnect with
   it, never on their own: an idle member stays connected and sends

@@ -42,10 +42,11 @@ type Client struct {
 	// each reconnect attempt.
 	brokerURLs atomic.Pointer[[]string]
 
-	// brokerIdx is the round-robin pointer into brokerURLs. Each
-	// reconnect attempt advances it by one. The initial value is
-	// random per-process so coordinated restarts of many clients
-	// don't all hit BrokerURLs[0] simultaneously.
+	// brokerIdx points into brokerURLs at the entry the next attempt
+	// dials. Under FailoverRotate each reconnect attempt advances it by
+	// one from a random start, so coordinated restarts of many clients
+	// don't all hit BrokerURLs[0] simultaneously; under FailoverPriority
+	// every pass over the list starts it at zero.
 	brokerIdx atomic.Uint32
 
 	// redirectOnce, when set, is the URL the next attempt dials instead
@@ -163,9 +164,11 @@ func New(opts ...Option) (*Client, error) {
 	})
 	urls := append([]string(nil), cfg.BrokerURLs...)
 	c.brokerURLs.Store(&urls)
-	// Randomise the starting index so N processes restarting together
-	// don't all stampede onto BrokerURLs[0].
-	c.brokerIdx.Store(mathrand.Uint32())
+	if cfg.FailoverOrder == FailoverRotate {
+		// Randomise the starting index so N processes restarting
+		// together don't all stampede onto BrokerURLs[0].
+		c.brokerIdx.Store(mathrand.Uint32())
+	}
 	c.life.Store(newLifecycle())
 	if cfg.PublisherPoolSize > 0 {
 		pool, err := newPublisherPool(cfg, cfg.PublisherPoolSize, cfg.Logger)
