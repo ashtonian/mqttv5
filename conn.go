@@ -88,6 +88,11 @@ type connState struct {
 	life *lifecycle
 
 	dying chan struct{}
+	// resumed is closed once the connection has queued the SUBSCRIBEs
+	// and UNSUBSCRIBEs it re-issues; every PUBLISH made on it waits for
+	// that, so a broker that kept no session has the subscriptions
+	// before it gets any message.
+	resumed chan struct{}
 	// writerDone is closed once the writer goroutine has exited and
 	// answered every request it took.
 	writerDone chan struct{}
@@ -172,16 +177,47 @@ func (cs *connState) Wake() {
 
 // SendOrdered implements inflight.Link: the session engine's QoS 1/2
 // PUBLISH packets up to seq go out behind every write already queued,
-// so one never overtakes an earlier QoS 0 publish from the same caller.
-// With nothing queued the caller writes them itself; ctx ending stops
-// that write and the writer goroutine sends the rest.
+// so one never overtakes an earlier QoS 0 publish from the same caller,
+// nor the subscriptions the connection re-issues. With nothing queued
+// the caller writes them itself; ctx ending stops that write and the
+// writer goroutine sends the rest.
 func (cs *connState) SendOrdered(ctx context.Context, seq uint64) error {
+	if err := cs.awaitResumed(ctx); err != nil {
+		return err
+	}
+	return cs.sendOrdered(ctx, seq)
+}
+
+// sendOrdered is SendOrdered without waiting for the connection to
+// resume its subscriptions.
+func (cs *connState) sendOrdered(ctx context.Context, seq uint64) error {
 	if cs.gen.Load() != 0 && cs.acquireIdle() {
 		_, err := cs.flushEngine(ctx, seq)
 		cs.wmu.Unlock()
 		return err
 	}
 	return cs.queue(ctx, writeReq{mark: seq}, true)
+}
+
+// awaitResumed waits until the connection has queued the subscriptions
+// it re-issues. It returns ErrNotConnected if the connection ends first:
+// nothing waiting for it was sent.
+func (cs *connState) awaitResumed(ctx context.Context) error {
+	select {
+	case <-cs.resumed:
+		return nil
+	default:
+	}
+	select {
+	case <-cs.resumed:
+		return nil
+	case <-cs.dying:
+		return ErrNotConnected
+	case <-cs.life.shutdown:
+		return ErrNotConnected
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // queue hands req to the writer goroutine, waiting for room or ctx unless

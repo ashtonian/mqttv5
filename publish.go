@@ -54,9 +54,9 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 		c.stats.addPoolFallback()
 	}
 
-	cs := c.cur.Load()
-	if cs == nil {
-		return ErrNotConnected
+	cs, err := c.publishConnection(ctx)
+	if err != nil {
+		return err
 	}
 	opts := po.wire()
 	if err := c.applyServerLimits(cs, &opts); err != nil {
@@ -78,6 +78,20 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 		return err
 	}
 	return nil
+}
+
+// publishConnection is the connection a Publish sends on, once it has
+// re-issued its subscriptions. With none up, or when it ends meanwhile,
+// it returns ErrNotConnected.
+func (c *Client) publishConnection(ctx context.Context) (*connState, error) {
+	cs := c.cur.Load()
+	if cs == nil {
+		return nil, ErrNotConnected
+	}
+	if err := cs.awaitResumed(ctx); err != nil {
+		return nil, err
+	}
+	return cs, nil
 }
 
 // publishTracked starts a QoS 1/2 exchange on the current connection

@@ -55,7 +55,10 @@ for duplicates, and an `Ack` on a message from the old session is a
 no-op. Unacknowledged outbound QoS 1/2 messages follow
 `WithSessionLossPolicy`: republished as new messages (the default; a
 duplicate is possible, and QoS 2 cannot stay exactly-once across the
-loss) or failed with `ErrSessionLost`. A broker that reports a present
+loss) or failed with `ErrSessionLost`. Every subscription is re-issued
+before the connection sends any PUBLISH, a republished one or one made
+on it, so the broker has the client's subscriptions before its
+messages, the client's own echo included. A broker that reports a present
 session for a CleanStart=1 CONNECT is a protocol error (DISCONNECT
 `0x82`). With `WithBrokers`, failover to a broker that does not share
 the session (not a node of the same cluster) is a session loss.

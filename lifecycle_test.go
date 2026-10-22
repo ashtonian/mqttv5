@@ -2340,3 +2340,185 @@ func TestStoppedSupervisorsLeaveNoGoroutines(t *testing.T) {
 		check()
 	})
 }
+
+// resumeOrderBroker serves a client holding subs subscriptions. The first
+// connection acknowledges them and is dropped: once they are all
+// acknowledged, or, with dropOnPublish, once it has read a PUBLISH it
+// leaves unacknowledged. The next connection keeps no session; it
+// acknowledges what it reads and reports each SUBSCRIBE and PUBLISH on
+// order, in the order it read them.
+func resumeOrderBroker(t *testing.T, subs int, dropOnPublish bool, order chan<- string) *testbroker.Broker {
+	t.Helper()
+	var conns atomic.Int32
+	return testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		first := conns.Add(1) == 1
+		acceptConnect(t, c, dec)
+		acked := 0
+		for {
+			pkt, err := dec.ReadPacket()
+			if err != nil {
+				return
+			}
+			switch p := pkt.(type) {
+			case *wire.Subscribe:
+				codes := make([]wire.ReasonCode, len(p.Filters))
+				for i := range codes {
+					codes[i] = wire.ReasonGrantedQoS1
+				}
+				_, _ = wire.WriteSuback(c, wire.SubackOpts{PacketID: p.PacketID, ReasonCodes: codes})
+				acked++
+				if !first {
+					order <- "SUBSCRIBE"
+				}
+			case *wire.Publish:
+				if first {
+					pkt.Release()
+					return
+				}
+				order <- "PUBLISH " + strings.Clone(p.Topic)
+				if p.QoS == 1 {
+					_, _ = wire.WritePuback(c, wire.PubRespOpts{PacketID: p.PacketID})
+				}
+			}
+			pkt.Release()
+			if first && !dropOnPublish && acked == subs {
+				return
+			}
+		}
+	})
+}
+
+// subscribeBeforeConnect gives cli n subscriptions, each its own SUBSCRIBE.
+func subscribeBeforeConnect(t *testing.T, cli *Client, n int) {
+	t.Helper()
+	for i := range n {
+		if _, err := cli.SubscribeCallback(context.Background(),
+			[]TopicFilter{{Topic: fmt.Sprintf("resume/%d", i), QoS: 1}}, func(*Message) {}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// awaitPublishAfterSubscribes reads order until the PUBLISH of topic and
+// fails unless every one of the subs re-issued SUBSCRIBEs came first.
+func awaitPublishAfterSubscribes(t *testing.T, order <-chan string, subs int, topic string) {
+	t.Helper()
+	before := 0
+	for {
+		select {
+		case got := <-order:
+			if got == "SUBSCRIBE" {
+				before++
+				continue
+			}
+			if got != "PUBLISH "+topic {
+				t.Fatalf("broker read %q, want PUBLISH %s", got, topic)
+			}
+			if before != subs {
+				t.Fatalf("PUBLISH %s reached a broker that kept no session after %d of the %d re-issued SUBSCRIBEs", topic, before, subs)
+			}
+			return
+		case <-time.After(5 * time.Second):
+			t.Fatalf("PUBLISH %s never reached the broker (%d SUBSCRIBEs did)", topic, before)
+		}
+	}
+}
+
+// A connection whose broker kept no session re-issues every subscription
+// before it sends a PUBLISH made on it, from Publish at either QoS or a
+// QueuePublisher.
+func TestPublishAfterSessionLossFollowsResubscribe(t *testing.T) {
+	const subs = 64
+	direct := func(_ *testing.T, cli *Client) func(context.Context, PublishOptions) error {
+		return cli.Publish
+	}
+	for _, tt := range []struct {
+		name string
+		qos  byte
+		// publisher returns what sends a message for cli.
+		publisher func(t *testing.T, cli *Client) func(context.Context, PublishOptions) error
+	}{
+		{"Publish QoS 0", 0, direct},
+		{"Publish QoS 1", 1, direct},
+		{"QueuePublisher", 1, func(t *testing.T, cli *Client) func(context.Context, PublishOptions) error {
+			qp, err := NewQueuePublisher(cli, NewMemoryPublisherQueue())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := qp.Close(ctx); err != nil {
+					t.Errorf("QueuePublisher.Close: %v", err)
+				}
+			})
+			return qp.Publish
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			order := make(chan string, subs+4)
+			fb := resumeOrderBroker(t, subs, false, order)
+			published := make(chan error, 1)
+			var publish func(context.Context, PublishOptions) error
+			var ups atomic.Int32
+			cli, err := New(
+				WithBroker(fb.URL()),
+				WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+				WithLogger(quietLogger()),
+				WithOnConnectionUp(func(ConnackInfo) {
+					if ups.Add(1) == 2 {
+						go func() { published <- publish(context.Background(), PublishOptions{Topic: "fresh", QoS: tt.qos}) }()
+					}
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Cleanups run last first: the publisher closes, settling its
+			// exchange, before the client disconnects.
+			t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+			publish = tt.publisher(t, cli)
+			subscribeBeforeConnect(t, cli, subs)
+			if err := cli.Connect(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			awaitPublishAfterSubscribes(t, order, subs, "fresh")
+			if err := <-published; err != nil {
+				t.Fatalf("publish = %v", err)
+			}
+		})
+	}
+}
+
+// A QoS 1 message a lost session sends again goes out behind the
+// re-issued subscriptions too.
+func TestRepublishAfterSessionLossFollowsResubscribe(t *testing.T) {
+	const subs = 16
+	order := make(chan string, subs+4)
+	fb := resumeOrderBroker(t, subs, true, order)
+	cli, err := New(
+		WithBroker(fb.URL()),
+		WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+		WithLogger(quietLogger()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscribeBeforeConnect(t, cli, subs)
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	published := make(chan error, 1)
+	go func() { published <- cli.Publish(ctx, PublishOptions{Topic: "in-flight", QoS: 1}) }()
+	awaitPublishAfterSubscribes(t, order, subs, "in-flight")
+	if err := <-published; err != nil {
+		t.Fatalf("Publish = %v, want the republished message acknowledged", err)
+	}
+}
