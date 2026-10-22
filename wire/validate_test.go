@@ -251,30 +251,70 @@ func TestValidUTF8Bytes(t *testing.T) {
 	}
 }
 
-func FuzzValidUTF8(f *testing.F) {
-	for _, s := range []string{"", "abc", "héllo", "a\x00b", "\xff", "\xed\xa0\x80"} {
-		f.Add([]byte(s))
-	}
-	f.Fuzz(func(t *testing.T, b []byte) {
-		want := utf8.Valid(b) && bytes.IndexByte(b, 0) < 0
-		if got := validUTF8Bytes(b); got != want {
-			t.Fatalf("validUTF8Bytes(%q) = %v, want %v", b, got, want)
+// The eight-byte screens in validUTF8Bytes and scanTopicName agree with
+// the byte-at-a-time definition wherever up to two NULs, invalid or
+// multi-byte sequences, or wildcards fall relative to the word windows.
+func TestEncodingScreensAtEveryOffset(t *testing.T) {
+	marks := []string{"", "\x00", "\x80", "\xff", "é", "\xed\xa0\x80", "\xe2\x82", "+", "#"}
+	for n := 0; n <= 17; n++ {
+		filler := strings.Repeat("a", n)
+		for i := 0; i <= n; i++ {
+			for j := i; j <= n; j++ {
+				for _, first := range marks {
+					for _, second := range marks {
+						s := filler[:i] + first + filler[i:j] + second + filler[j:]
+						want := utf8.ValidString(s) && !strings.Contains(s, "\x00")
+						if got := validUTF8Bytes([]byte(s)); got != want {
+							t.Fatalf("validUTF8Bytes(%q) = %v, want %v", s, got, want)
+						}
+						valid, wildcard := scanTopicName(s)
+						if valid != want {
+							t.Fatalf("scanTopicName(%q) valid = %v, want %v", s, valid, want)
+						}
+						// The wildcard answer only matters for valid names.
+						if valid && wildcard != strings.ContainsAny(s, "+#") {
+							t.Fatalf("scanTopicName(%q) wildcard = %v", s, wildcard)
+						}
+					}
+				}
+			}
 		}
-	})
+	}
 }
 
-func FuzzScanTopicName(f *testing.F) {
-	for _, s := range []string{"", "a/b", "a/+/b", "long/topic/name/with/#", "héllo/+", "\x00", "\xff#"} {
-		f.Add(s)
+// PropertiesFromBytes takes bytes the decoder has not validated, so the
+// accessors read a value that runs past the end, or that sits behind one
+// that does, as absent.
+func TestPropertiesTruncatedValuesReadAsAbsent(t *testing.T) {
+	contentType := func(p Properties) bool { _, ok := p.String(PropContentType); return ok }
+	correlation := func(p Properties) bool { _, ok := p.Binary(PropCorrelationData); return ok }
+	subscriptionID := func(p Properties) bool { _, ok := p.Varint(PropSubscriptionIdentifier); return ok }
+	userProperties := func(p Properties) bool {
+		for range p.UserProperties() {
+			return true
+		}
+		return false
 	}
-	f.Fuzz(func(t *testing.T, s string) {
-		valid, wildcard := scanTopicName(s)
-		if want := utf8.ValidString(s) && !strings.Contains(s, "\x00"); valid != want {
-			t.Fatalf("valid(%q) = %v, want %v", s, valid, want)
-		}
-		// The wildcard answer only matters for valid names.
-		if want := strings.ContainsAny(s, "+#"); valid && wildcard != want {
-			t.Fatalf("wildcard(%q) = %v, want %v", s, wildcard, want)
-		}
-	})
+	tests := []struct {
+		name  string
+		raw   []byte
+		found func(Properties) bool
+	}{
+		{"string longer than the bytes left", []byte{PropContentType, 0x00, 0x05, 'a'}, contentType},
+		{"binary longer than the bytes left", []byte{PropCorrelationData, 0x00, 0x05, 'a'}, correlation},
+		{"unterminated variable byte integer", []byte{PropSubscriptionIdentifier, 0x80}, subscriptionID},
+		{"absent variable byte integer", nil, subscriptionID},
+		{"lookup behind a five-byte variable byte integer", []byte{PropSubscriptionIdentifier, 0x80, 0x80, 0x80, 0x80, 0x01, PropContentType, 0x00, 0x00}, contentType},
+		{"lookup behind a truncated string", []byte{PropReasonString, 0x00}, contentType},
+		{"lookup behind a truncated user property", []byte{PropUserProperty, 0x00, 0x05, 'k'}, contentType},
+		{"user property behind a truncated string", []byte{PropContentType, 0x00}, userProperties},
+		{"user property key longer than the bytes left", []byte{PropUserProperty, 0x00, 0x05, 'k'}, userProperties},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.found(PropertiesFromBytes(tt.raw)) {
+				t.Fatalf("% x: truncated value read as present", tt.raw)
+			}
+		})
+	}
 }

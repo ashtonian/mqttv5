@@ -75,10 +75,8 @@ resume after PUBREC, replay order, duplicate handling, refused
 subscriptions, protocol violations — is covered in the core module
 against `internal/testbroker`, a scripted peer that can produce the
 exact packet sequences and failures a real broker produces only by
-chance. The `wire` package carries fuzz targets for the decoder
-(`FuzzReadPacket`, `FuzzProperties`, `FuzzDecodeVarint`,
-`FuzzPublishRoundTrip`, `FuzzValidUTF8`, `FuzzScanTopicName`), run
-nightly by `.github/workflows/fuzz.yml`.
+chance. The `wire` package tests the decoder against a matrix of
+malformed packets, each rejected with the reason code the spec assigns.
 
 ## Brokers
 
@@ -189,7 +187,7 @@ modules (through `replace` directives) and `codec/json`.
 
 - Broker conformance: this suite tests the client.
 - Malformed or adversarial broker traffic: the scripted-peer tests in
-  the core module and the `wire` fuzz targets cover it, since a real
+  the core module and the `wire` malformed-input tests cover it, since a real
   broker does not misbehave on request.
 
 ## Extending

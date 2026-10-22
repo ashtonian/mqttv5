@@ -8,8 +8,6 @@ name: nightly
 #   - the conformance suite against mosquitto, EMQX and HiveMQ CE,
 #     with the strict-limit tests against a HiveMQ that announces tight
 #     CONNACK limits, and a ten-minute connection-cut soak per broker.
-#
-# Fuzzing runs in fuzz.yml.
 
 on:
   schedule:
