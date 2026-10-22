@@ -495,6 +495,7 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		aliasSlot:     make(chan struct{}, 1),
 		life:          life,
 		dying:         make(chan struct{}),
+		resumed:       make(chan struct{}),
 		writerDone:    make(chan struct{}),
 		done:          make(chan struct{}),
 		aliasMap:      make(map[uint16]string),
@@ -525,7 +526,7 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		_ = r.conn.Close()
 		return err
 	}
-	gen, _, err := c.engine.Connected(inflight.ConnInfo{
+	gen, held, err := c.engine.Connected(inflight.ConnInfo{
 		SessionPresent: r.info.SessionPresent,
 		ReceiveMaximum: r.info.ReceiveMaximum,
 		Limits: &inflight.Limits{
@@ -534,7 +535,8 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 			MaximumPacketSize: r.info.MaximumPacketSize,
 			Downgrade:         c.cfg.QoSDowngrade,
 		},
-		Link: cs,
+		Link:            cs,
+		HoldRepublished: true,
 	})
 	if err != nil {
 		_ = r.conn.Close()
@@ -569,7 +571,7 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		go c.pingLoop(cs)
 	}
 	cs.wg.Add(1)
-	go c.resumeSubscriptions(cs)
+	go c.resumeSubscriptions(cs, held)
 
 	go func() {
 		cs.wg.Wait()

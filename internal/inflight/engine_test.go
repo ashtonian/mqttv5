@@ -74,15 +74,23 @@ func newHarness(t *testing.T, cfg Config) *harness {
 }
 
 // connect binds the engine to a new fake connection.
-func (h *harness) connect(sp bool, recvMax uint16) bool {
+func (h *harness) connect(sp bool, recvMax uint16) {
+	h.t.Helper()
+	h.connectWith(ConnInfo{SessionPresent: sp, ReceiveMaximum: recvMax})
+}
+
+// connectWith binds the engine to a new fake connection with ci and
+// returns the sequence number that releases the PUBLISHes it held.
+func (h *harness) connectWith(ci ConnInfo) uint64 {
 	h.t.Helper()
 	h.link = &fakeLink{}
-	gen, resub, err := h.e.Connected(ConnInfo{SessionPresent: sp, ReceiveMaximum: recvMax, Link: h.link})
+	ci.Link = h.link
+	gen, held, err := h.e.Connected(ci)
 	if err != nil {
 		h.t.Fatalf("Connected: %v", err)
 	}
 	h.gen = gen
-	return resub
+	return held
 }
 
 func (h *harness) disconnect() { h.e.Disconnected(h.link) }
@@ -91,11 +99,18 @@ func (h *harness) disconnect() { h.e.Disconnected(h.link) }
 // registered flows.
 func (h *harness) collect() []frame {
 	h.t.Helper()
+	return h.collectUpTo(^uint64(0) >> 1)
+}
+
+// collectUpTo drains what the writer would send now with flows up to
+// seq released.
+func (h *harness) collectUpTo(seq uint64) []frame {
+	h.t.Helper()
 	var out []frame
 	var f Frames
 	for {
 		f.Reset()
-		if h.e.Collect(h.gen, ^uint64(0)>>1, &f) == 0 {
+		if h.e.Collect(h.gen, seq, &f) == 0 {
 			return out
 		}
 		var buf bytes.Buffer
@@ -358,6 +373,45 @@ func TestSendQuotaFollowsServerReceiveMaximum(t *testing.T) {
 	}
 }
 
+// With HoldRepublished a lost session's republished PUBLISHes wait for
+// the marker Connected returns, while a message registered afterwards
+// waits for its own; a resumed session's resends are never held.
+func TestSessionLossHoldsRepublishedUntilReleased(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.connect(true, 0)
+	a, b := h.publish(1, "a"), h.publish(1, "b")
+	h.collect()
+	h.disconnect()
+
+	held := h.connectWith(ConnInfo{HoldRepublished: true})
+	if held == 0 {
+		t.Fatal("a lost session with unacknowledged flows must hold them")
+	}
+	c := h.publish(1, "c")
+	want(t, h.collectUpTo(0))
+	want(t, h.collectUpTo(held),
+		fmt.Sprintf("PUBLISH#%d", a.PacketID()),
+		fmt.Sprintf("PUBLISH#%d", b.PacketID()))
+	want(t, h.collectUpTo(c.Seq()), fmt.Sprintf("PUBLISH#%d", c.PacketID()))
+	h.disconnect()
+
+	if held := h.connectWith(ConnInfo{SessionPresent: true, HoldRepublished: true}); held != 0 {
+		t.Fatalf("a resumed session held up to %d, want nothing held", held)
+	}
+	want(t, h.collectUpTo(0),
+		fmt.Sprintf("PUBLISH#%d+dup", a.PacketID()),
+		fmt.Sprintf("PUBLISH#%d+dup", b.PacketID()),
+		fmt.Sprintf("PUBLISH#%d+dup", c.PacketID()))
+	for _, o := range []*Out{a, b, c} {
+		h.e.HandlePuback(o.PacketID(), 0, nil)
+	}
+	h.disconnect()
+
+	if held := h.connectWith(ConnInfo{HoldRepublished: true}); held != 0 {
+		t.Fatalf("a lost session with nothing unacknowledged held up to %d", held)
+	}
+}
+
 func TestSessionLossRepublishesInOrderAsNew(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.connect(false, 0)
@@ -366,9 +420,7 @@ func TestSessionLossRepublishesInOrderAsNew(t *testing.T) {
 	h.e.HandlePubrec(a.PacketID(), 0, nil) // a reaches AwaitPubcomp
 	h.collect()
 	h.disconnect()
-	if !h.connect(false, 0) {
-		t.Fatal("session loss must request resubscription")
-	}
+	h.connect(false, 0)
 	want(t, h.collect(),
 		fmt.Sprintf("PUBLISH#%d", a.PacketID()),
 		fmt.Sprintf("PUBLISH#%d", b.PacketID()),

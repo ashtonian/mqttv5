@@ -414,8 +414,8 @@ type SessionLossPolicy uint8
 
 const (
 	// SessionLossRepublish sends them again as new messages (DUP=0) in
-	// their original order; their Publish calls keep waiting for the new
-	// acknowledgement. Delivery stays at-least-once, and a message the
+	// their original order, behind the re-issued subscriptions; their
+	// Publish calls keep waiting for the new acknowledgement. Delivery stays at-least-once, and a message the
 	// old broker had already forwarded is delivered twice — including
 	// QoS 2, whose exactly-once guarantee cannot survive a session loss.
 	// Messages whose Message Expiry Interval ran out complete with

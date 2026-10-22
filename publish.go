@@ -84,25 +84,39 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 	return nil
 }
 
-// publishConnection is the connection a Publish sends on. With none up
-// it returns ErrNotConnected or, with [WithPublishWaitForConnection],
-// waits for one, bounded by ctx; a client that has been disconnected
-// answers ErrNotConnected either way.
+// publishConnection is the connection a Publish sends on, once it has
+// re-issued its subscriptions. With none up, or when it ends before
+// that, it returns ErrNotConnected or, with
+// [WithPublishWaitForConnection], waits for the next one, bounded by
+// ctx; a client that has been disconnected answers ErrNotConnected
+// either way.
 func (c *Client) publishConnection(ctx context.Context) (*connState, error) {
+	var ended *connState
 	for {
-		if cs := c.cur.Load(); cs != nil {
-			return cs, nil
+		changed := c.connChanged()
+		cs := c.cur.Load()
+		if cs != nil && cs != ended {
+			err := cs.awaitResumed(ctx)
+			if err == nil {
+				return cs, nil
+			}
+			if !errors.Is(err, ErrNotConnected) || !c.cfg.PublishWaitForConnection {
+				return nil, err
+			}
+			// It ended before it resumed; it stays current until the
+			// supervisor clears it, so wait for a change, not for it.
+			ended = cs
+			continue
 		}
 		if !c.cfg.PublishWaitForConnection {
 			return nil, ErrNotConnected
 		}
-		// A connection that drops again before this call sees it sends
-		// the loop round to wait for the next one.
-		switch err := c.AwaitConnection(ctx); {
-		case errors.Is(err, ErrClosed):
+		select {
+		case <-changed:
+		case <-c.done():
 			return nil, ErrNotConnected
-		case err != nil:
-			return nil, err
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 }

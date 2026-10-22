@@ -129,6 +129,11 @@ type ConnInfo struct {
 	// messages that break them are failed rather than sent.
 	Limits *Limits
 	Link   Link
+	// HoldRepublished keeps the PUBLISHes a lost session sends again
+	// from the writer until a Collect or SendOrdered marker releases
+	// them, so the client can re-issue its subscriptions ahead of them.
+	// It has no effect when SessionPresent is set.
+	HoldRepublished bool
 }
 
 // Limits are the CONNACK properties that rule out a PUBLISH.
@@ -413,16 +418,17 @@ func (e *Engine) OutboundLen() int {
 // SessionLoss policy; with Session Present = 1 everything unacknowledged
 // is resent. A flow whose record it changes is sent once the new record
 // is stored. It returns the connection's generation, which its writer
-// passes to Collect, and whether subscriptions must be re-issued (the
-// broker has none of them when the session is new). It fails only when
-// the session has failed and not been restored.
-func (e *Engine) Connected(ci ConnInfo) (gen uint64, resubscribe bool, err error) {
+// passes to Collect, and, when ci.HoldRepublished kept the republished
+// PUBLISHes back, the sequence number that releases them all (0 when
+// none are held). It fails only when the session has failed and not
+// been restored.
+func (e *Engine) Connected(ci ConnInfo) (gen, held uint64, err error) {
 	var jobs []*job
 
 	e.mu.Lock()
 	if e.failure != nil {
 		defer e.mu.Unlock()
-		return 0, false, e.failure
+		return 0, 0, e.failure
 	}
 	e.lastGen++
 	e.gen = e.lastGen
@@ -446,12 +452,18 @@ func (e *Engine) Connected(ci ConnInfo) (gen uint64, resubscribe bool, err error
 	}
 	e.cursor = e.pub.head
 	e.released = e.nextSeq - 1
+	if !ci.SessionPresent && ci.HoldRepublished && e.pub.head != nil {
+		// Every flow is in pub as new and none is sent before the
+		// marker; flows registered from now on wait for their own.
+		held = e.released
+		e.released = 0
+	}
 	gen = e.gen
 	e.mu.Unlock()
 
 	e.start(jobs...)
 	ci.Link.Wake()
-	return gen, !ci.SessionPresent, nil
+	return gen, held, nil
 }
 
 // resumeLocked prepares a resumed session: PUBRELs are regenerated in
