@@ -3,7 +3,7 @@ module github.com/ashtonian/mqttv5/benchmarks
 go 1.27.2
 
 require (
-	github.com/ashtonian/mqttv5 v0.12.0
+	github.com/ashtonian/mqttv5 v0.13.0
 	github.com/eclipse/paho.golang v0.23.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	golang.org/x/perf v0.0.0-20260929162123-406019bb8b68

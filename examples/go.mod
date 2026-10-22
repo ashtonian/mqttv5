@@ -3,15 +3,15 @@ module github.com/ashtonian/mqttv5/examples
 go 1.27.2
 
 require (
-	github.com/ashtonian/mqttv5 v0.12.0
-	github.com/ashtonian/mqttv5/codec/json v0.12.0
-	github.com/ashtonian/mqttv5/queue/file v0.12.0
-	github.com/ashtonian/mqttv5/store/file v0.12.0
-	github.com/ashtonian/mqttv5/transport/ws v0.12.0
+	github.com/ashtonian/mqttv5 v0.13.0
+	github.com/ashtonian/mqttv5/codec/json v0.13.0
+	github.com/ashtonian/mqttv5/queue/file v0.13.0
+	github.com/ashtonian/mqttv5/store/file v0.13.0
+	github.com/ashtonian/mqttv5/transport/ws v0.13.0
 )
 
 require (
-	github.com/ashtonian/mqttv5/internal/filedb v0.12.0 // indirect
+	github.com/ashtonian/mqttv5/internal/filedb v0.13.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.4.0 // indirect
