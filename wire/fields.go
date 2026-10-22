@@ -246,12 +246,17 @@ func DecodeVarint(buf []byte) (value uint32, n int, err error) {
 
 // ReadVarint reads a VBI byte-at-a-time from r. Used to parse the fixed
 // header's Remaining Length before the body has been buffered. The
-// returned byte count is what was consumed from r (≤ 4).
+// returned byte count is what was consumed from r (≤ 4). Like
+// io.ReadFull, it returns io.EOF only if r ends before the first byte and
+// io.ErrUnexpectedEOF if r ends inside the integer.
 func ReadVarint(r io.ByteReader) (value uint32, n int, err error) {
 	var multiplier uint32 = 1
 	for n = 0; n < maxVarintBytes; n++ {
 		b, rerr := r.ReadByte()
 		if rerr != nil {
+			if n > 0 && errors.Is(rerr, io.EOF) {
+				rerr = io.ErrUnexpectedEOF
+			}
 			return 0, n, rerr
 		}
 		value += uint32(b&0x7F) * multiplier

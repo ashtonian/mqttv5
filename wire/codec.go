@@ -215,6 +215,10 @@ func (d *Decoder) ReadPacket() (Packet, error) {
 
 	// Bytes 2-5: VBI Remaining Length.
 	remaining, n, err := ReadVarint(d.br)
+	if errors.Is(err, io.EOF) {
+		// The packet's first byte has arrived, so it is cut short.
+		err = io.ErrUnexpectedEOF
+	}
 	if err != nil {
 		return nil, asPacketError(pktType, fmt.Errorf("mqttv5: read remaining length: %w", err))
 	}

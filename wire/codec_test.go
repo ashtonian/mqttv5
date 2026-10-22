@@ -326,6 +326,43 @@ func TestReadVarint(t *testing.T) {
 	if v != 64 || n != 2 {
 		t.Fatalf("got value=%d bytes=%d, want value=64 bytes=2", v, n)
 	}
+	if _, _, err := ReadVarint(bytes.NewReader(nil)); err != io.EOF {
+		t.Fatalf("empty reader: %v, want io.EOF", err)
+	}
+	if _, n, err := ReadVarint(bytes.NewReader([]byte{0x80})); err != io.ErrUnexpectedEOF || n != 1 {
+		t.Fatalf("reader ending inside the integer: n=%d, %v, want n=1, io.ErrUnexpectedEOF", n, err)
+	}
+}
+
+// A stream that ends between packets reports io.EOF, one that ends
+// anywhere inside a packet io.ErrUnexpectedEOF: the client logs the
+// second as a connection error and treats the first as a clean close.
+func TestDecoderEndOfStream(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+		want error
+	}{
+		{"between packets", []byte{0xd0, 0x00}, io.EOF},
+		{"after the first byte", []byte{0x30}, io.ErrUnexpectedEOF},
+		{"inside the remaining length", []byte{0x30, 0x80}, io.ErrUnexpectedEOF},
+		{"inside the body", []byte{0x30, 0x05, 0x00}, io.ErrUnexpectedEOF},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dec := NewDecoder(bytes.NewReader(tt.in))
+			for {
+				p, err := dec.ReadPacket()
+				if err != nil {
+					if !errors.Is(err, tt.want) {
+						t.Fatalf("got %v, want %v", err, tt.want)
+					}
+					return
+				}
+				p.Release()
+			}
+		})
+	}
 }
 
 // itoa avoids strconv to keep test fixtures stdlib-tiny.
