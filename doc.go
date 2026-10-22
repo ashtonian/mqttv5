@@ -19,8 +19,9 @@
 //
 // Two multi-broker patterns are kept distinct:
 //
-//   - Failover within one logical client (interchangeable brokers,
-//     one session identity): [WithBrokers].
+//   - Failover within one logical client (one session identity):
+//     [WithBrokers], over interchangeable brokers or, with
+//     [FailoverPriority], a primary and its standbys.
 //   - N parallel sessions to N independent brokers, each treated as
 //     itself: [ClientGroup]. Configurable per-broker auth / TLS /
 //     ClientID via [GroupMember.Opts]; pluggable publish policy

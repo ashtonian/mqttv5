@@ -20,7 +20,9 @@ until then `Publish` returns `ErrNotConnected`, `Subscribe` waits for
 the connection, and a `QueuePublisher` keeps queuing.
 
 **Reconnect.** `ExponentialBackoff(1s, 30s, 200ms)` by default. With
-`WithBrokers`, URLs rotate per attempt and a successful connect sticks.
+`WithBrokers`, URLs rotate per attempt and a successful connect sticks;
+`WithFailoverOrder(FailoverPriority)` makes each attempt a pass over the
+list from the first URL instead.
 The backoff starts over only after a connection outlives the delay that
 preceded it, so a broker that accepts the CONNECT and drops the
 connection at once is retried at a growing interval, not in a tight

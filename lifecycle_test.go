@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1714,6 +1715,172 @@ func TestConnectEveryBrokerFails(t *testing.T) {
 	}
 	if n := cli.Stats().ConnectFailures; n != 2 {
 		t.Fatalf("ConnectFailures = %d, want 2", n)
+	}
+}
+
+// Under FailoverPriority Connect starts at the first broker, wherever
+// the list pointer was left.
+func TestFailoverPriorityConnectStartsAtFirst(t *testing.T) {
+	hold := func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		<-fb.Done()
+	}
+	primary := testbroker.NewRaw(t, hold)
+	standby := testbroker.NewRaw(t, hold)
+	cli, err := New(WithBrokers(primary.URL(), standby.URL()), WithFailoverOrder(FailoverPriority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.brokerIdx.Store(1)
+
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+	if info, _ := cli.ServerInfo(); info.Broker != primary.URL() {
+		t.Fatalf("ServerInfo().Broker = %q, want the primary %q", info.Broker, primary.URL())
+	}
+}
+
+// Under FailoverPriority a reconnect goes back to the primary, where
+// FailoverRotate moves on to the next broker.
+func TestFailoverPriorityReconnectReturnsToPrimary(t *testing.T) {
+	var primaryConns atomic.Int32
+	primary := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		if primaryConns.Add(1) == 1 {
+			return // drop the first connection
+		}
+		<-fb.Done()
+	})
+	standby := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		<-fb.Done()
+	})
+	ups := make(chan string, 4)
+	cli, err := New(
+		WithBrokers(primary.URL(), standby.URL()),
+		WithFailoverOrder(FailoverPriority),
+		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
+		WithLogger(quietLogger()),
+		WithOnConnectionUp(func(info ConnackInfo) { ups <- info.Broker }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	for i, want := range []string{primary.URL(), primary.URL()} {
+		select {
+		case got := <-ups:
+			if got != want {
+				t.Fatalf("connection %d went to %q, want the primary %q", i+1, got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("connection %d did not come up within 2s", i+1)
+		}
+	}
+}
+
+// Under FailoverPriority one reconnect attempt is a pass over the list:
+// a primary that refuses the CONNECT and a broker that is down are tried
+// back to back, without the backoff between them, before the standby
+// takes the client. FailoverRotate would wait the backoff after the
+// broker that is down.
+func TestFailoverPriorityPassFallsThroughWithoutBackoff(t *testing.T) {
+	const down = "mqtt://127.0.0.1:1"
+	var primaryConns atomic.Int32
+	primary := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		dec := wire.NewDecoder(c)
+		if primaryConns.Add(1) == 1 {
+			acceptConnect(t, c, dec)
+			return // drop the first connection
+		}
+		acceptConnectWith(t, c, dec, wire.ConnackOpts{ReasonCode: wire.ReasonServerUnavailable})
+	})
+	onStandby := make(chan struct{}, 1)
+	standby := testbroker.NewRaw(t, func(fb *testbroker.Broker, c net.Conn) {
+		defer c.Close()
+		acceptConnect(t, c, wire.NewDecoder(c))
+		select {
+		case onStandby <- struct{}{}:
+		default:
+		}
+		<-fb.Done()
+	})
+
+	type dial struct {
+		attempt int
+		broker  string
+	}
+	var mu sync.Mutex
+	var dials []dial
+	cli, err := New(
+		WithBrokers(primary.URL(), down, standby.URL()),
+		WithFailoverOrder(FailoverPriority),
+		// No delay before the first reconnect attempt, an hour before any
+		// later one: reaching the standby in time takes a single pass.
+		WithReconnectBackoff(func(attempt int) time.Duration {
+			if attempt == 0 {
+				return 0
+			}
+			return time.Hour
+		}),
+		WithLogger(quietLogger()),
+		WithOnReconnectAttempt(func(attempt int, broker string) {
+			mu.Lock()
+			dials = append(dials, dial{attempt, broker})
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	select {
+	case <-onStandby:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the standby did not take the client within one pass")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []dial{{1, primary.URL()}, {1, down}, {1, standby.URL()}}
+	if !slices.Equal(dials, want) {
+		t.Fatalf("reconnect dials = %v, want %v", dials, want)
+	}
+}
+
+func TestWithFailoverOrderRejectsUnknown(t *testing.T) {
+	if _, err := New(WithBroker("mqtt://127.0.0.1:1883"), WithFailoverOrder(FailoverOrder(7))); err == nil {
+		t.Fatal("New accepted FailoverOrder(7)")
+	}
+}
+
+// A publisher pool's members fail over in the parent's order.
+func TestPublisherPoolInheritsFailoverOrder(t *testing.T) {
+	cli, err := New(
+		WithBrokers("mqtt://127.0.0.1:1883", "mqtt://127.0.0.1:1884"),
+		WithFailoverOrder(FailoverPriority),
+		WithPublisherPool(2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range cli.pool.members {
+		if m.cfg.FailoverOrder != FailoverPriority {
+			t.Fatalf("pool member %d FailoverOrder = %d, want FailoverPriority", i+1, m.cfg.FailoverOrder)
+		}
 	}
 }
 

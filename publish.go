@@ -411,6 +411,7 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 	for i := 1; i <= size; i++ {
 		opts := []Option{
 			WithBrokers(parent.BrokerURLs...),
+			WithFailoverOrder(parent.FailoverOrder),
 			WithClientID(clientIDFn(parent.ClientID, i)),
 			// A member's session ends with its connection (Session
 			// Expiry 0) — see the publisherPool type doc.
