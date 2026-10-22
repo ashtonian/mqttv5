@@ -16,8 +16,10 @@
 there are several. With it,
 `Connect` returns nil, the supervisor retries with the reconnect
 backoff, and `Client.AwaitConnection(ctx)` waits for the connection;
-until then `Publish` returns `ErrNotConnected`, `Subscribe` waits for
-the connection, and a `QueuePublisher` keeps queuing.
+until then `Publish` returns `ErrNotConnected` (with
+`WithPublishWaitForConnection()` it waits for the connection, bounded
+by its ctx), `Subscribe` waits for the connection, and a
+`QueuePublisher` keeps queuing.
 
 **Reconnect.** `ExponentialBackoff(1s, 30s, 200ms)` by default. With
 `WithBrokers`, URLs rotate per attempt and a successful connect sticks;

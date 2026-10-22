@@ -38,6 +38,10 @@ import (
 // writer goroutine, so the packet may still reach the broker after
 // Publish returned ctx's error.
 //
+// With no connection up Publish returns [ErrNotConnected], which
+// guarantees the message was not sent; with
+// [WithPublishWaitForConnection] it waits for the next connection.
+//
 // With [WithPublisherPool] the call first tries the pool per
 // [PoolRoutingPolicy] and falls back to the main connection if every
 // pool member is unhealthy.
@@ -81,17 +85,40 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 }
 
 // publishConnection is the connection a Publish sends on, once it has
-// re-issued its subscriptions. With none up, or when it ends meanwhile,
-// it returns ErrNotConnected.
+// re-issued its subscriptions. With none up, or when it ends before
+// that, it returns ErrNotConnected or, with
+// [WithPublishWaitForConnection], waits for the next one, bounded by
+// ctx; a client that has been disconnected answers ErrNotConnected
+// either way.
 func (c *Client) publishConnection(ctx context.Context) (*connState, error) {
-	cs := c.cur.Load()
-	if cs == nil {
-		return nil, ErrNotConnected
+	var ended *connState
+	for {
+		changed := c.connChanged()
+		cs := c.cur.Load()
+		if cs != nil && cs != ended {
+			err := cs.awaitResumed(ctx)
+			if err == nil {
+				return cs, nil
+			}
+			if !errors.Is(err, ErrNotConnected) || !c.cfg.PublishWaitForConnection {
+				return nil, err
+			}
+			// It ended before it resumed; it stays current until the
+			// supervisor clears it, so wait for a change, not for it.
+			ended = cs
+			continue
+		}
+		if !c.cfg.PublishWaitForConnection {
+			return nil, ErrNotConnected
+		}
+		select {
+		case <-changed:
+		case <-c.done():
+			return nil, ErrNotConnected
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	if err := cs.awaitResumed(ctx); err != nil {
-		return nil, err
-	}
-	return cs, nil
 }
 
 // publishTracked starts a QoS 1/2 exchange on the current connection

@@ -140,6 +140,10 @@ type Config struct {
 	// to the supervisor's reconnect loop instead of returning its error.
 	RetryInitialConnect bool
 
+	// PublishWaitForConnection makes Publish wait, bounded by its ctx,
+	// for a connection instead of returning ErrNotConnected.
+	PublishWaitForConnection bool
+
 	// CleanStartOnReconnect sets CleanStart on every CONNECT after
 	// the first. Default false (preserve broker session for QoS 1/2
 	// resume).
@@ -563,6 +567,22 @@ func WithFollowServerRedirects() Option {
 func WithRetryInitialConnect() Option {
 	return func(c *Config) error {
 		c.RetryInitialConnect = true
+		return nil
+	}
+}
+
+// WithPublishWaitForConnection makes [Client.Publish] wait for a
+// connection when the client has none — before Connect's first
+// connection is up, and between a drop and the reconnect — instead of
+// returning [ErrNotConnected]. The message then goes out on the
+// connection that comes up, so a publish made during a failover reaches
+// the broker the client fails over to, as a QoS 1/2 message accepted
+// just before the drop does. ctx bounds the wait: one without a deadline
+// waits for as long as the client keeps reconnecting. After
+// [Client.Disconnect], Publish returns ErrNotConnected at once.
+func WithPublishWaitForConnection() Option {
+	return func(c *Config) error {
+		c.PublishWaitForConnection = true
 		return nil
 	}
 }

@@ -22,7 +22,8 @@ When `Publish` returns depends on the QoS:
 | 2 | when the broker's PUBCOMP arrives |
 
 `ctx` bounds the call. While the client is disconnected `Publish`
-returns `ErrNotConnected`; with a
+returns `ErrNotConnected`, or with `WithPublishWaitForConnection()`
+waits for the next connection and sends the message on it; with a
 [publish pool](publisher-pool.md#publish-pool-withpublisherpool) that means no member is
 connected either, since publishing goes on through the members while
 the main connection reconnects. A
