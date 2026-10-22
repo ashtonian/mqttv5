@@ -672,15 +672,26 @@ func (c *Client) markSessionLost() {
 
 // resumeSubscriptions brings the broker's subscriptions in line on a new
 // connection: whatever was not acknowledged on the last one is sent
-// again, and everything is re-subscribed when the session was lost.
-func (c *Client) resumeSubscriptions(cs *connState) {
+// again, and everything is re-subscribed when the session was lost. Only
+// then does the connection take PUBLISHes: the ones a lost session sends
+// again, held back by the session engine up to held, and every new one,
+// which waits for cs.resumed. A broker that kept no session so has the
+// subscriptions before any message the client sends, its own echo
+// included.
+func (c *Client) resumeSubscriptions(cs *connState, held uint64) {
 	defer cs.wg.Done()
+	defer close(cs.resumed)
 	if err := c.lockCtrl(context.Background(), cs.dying); err != nil {
 		return
 	}
 	defer c.unlockCtrl()
 	if err := c.flushCtrl(context.Background(), cs.dying); err != nil && !errors.Is(err, ErrClosed) {
 		c.cfg.Logger.Warn("mqttv5: re-issuing subscriptions failed", slog.Any("error", err))
+	}
+	if held != 0 {
+		// A failed marker is harmless: the connection is ending, and the
+		// next one sends every registered flow.
+		_ = cs.sendOrdered(context.Background(), held)
 	}
 }
 

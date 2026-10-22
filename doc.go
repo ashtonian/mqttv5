@@ -172,7 +172,8 @@
 //
 // A supervisor goroutine reconnects with configurable backoff, resumes
 // the session, replays unacknowledged QoS 1/2 publishes with DUP=1 in
-// their original order, and re-issues every tracked subscription.
+// their original order, and re-issues every tracked subscription when
+// the broker kept no session, ahead of any PUBLISH on that connection.
 //
 // # Benchmarks
 //
