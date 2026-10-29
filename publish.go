@@ -398,7 +398,7 @@ func notSent(err error) bool {
 //     ConnectTimeout, PingTimeout, DisconnectFlushTimeout,
 //     ReadBufferSize, WriteQueueSize, WriteBatch, WriteOverflowPolicy,
 //     ReconnectBackoff, PublishMode.
-//   - Publish behaviour: QoSDowngrade, SessionLossPolicy,
+//   - Publish behaviour: MaxInflight, QoSDowngrade, SessionLossPolicy,
 //     OutboundTopicAliases, LenientDecoding, FollowServerRedirects
 //     (each member follows a redirect on its own connection).
 //   - ConnectPacketBuilder (so per-attempt credential rotation
@@ -500,6 +500,9 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 		}
 		if parent.ReceiveMaximum != 0 {
 			opts = append(opts, WithReceiveMaximum(parent.ReceiveMaximum))
+		}
+		if parent.MaxInflight != 0 {
+			opts = append(opts, WithMaxInflight(parent.MaxInflight))
 		}
 		if len(parent.ConnectUserProperties) > 0 {
 			opts = append(opts, WithConnectUserProperties(parent.ConnectUserProperties))

@@ -1156,6 +1156,7 @@ func TestPoolMemberInheritsPublishBehaviour(t *testing.T) {
 		WithLenientDecoding(),
 		WithFollowServerRedirects(),
 		WithReadBufferSize(4096),
+		WithMaxInflight(7),
 		withClock(fake),
 	)
 	if err != nil {
@@ -1164,7 +1165,8 @@ func TestPoolMemberInheritsPublishBehaviour(t *testing.T) {
 	for i, m := range cli.pool.members {
 		c := m.cfg
 		if !c.QoSDowngrade || c.SessionLossPolicy != SessionLossFail || !c.OutboundTopicAliases ||
-			!c.LenientDecoding || !c.FollowServerRedirects || c.ReadBufferSize != 4096 || c.clock != fake {
+			!c.LenientDecoding || !c.FollowServerRedirects || c.ReadBufferSize != 4096 || c.MaxInflight != 7 ||
+			c.clock != fake {
 			t.Errorf("member %d config = %+v, want the parent's publish behaviour", i+1, *c)
 		}
 	}

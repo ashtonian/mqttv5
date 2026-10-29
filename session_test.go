@@ -456,39 +456,58 @@ func TestQoS1DoesNotOvertakeEarlierQoS0(t *testing.T) {
 	}
 }
 
-// Server Receive Maximum caps the QoS > 0 PUBLISHes in flight (§4.9).
-func TestServerReceiveMaximumHonoured(t *testing.T) {
-	const max = 3
-	limit := uint16(max)
-	release := make(chan struct{})
-	b := testbroker.New(t, func(c *testbroker.Conn) {
-		c.AcceptConnect(wire.ConnackOpts{ReceiveMaximum: &limit})
-		var held []uint16
-		for len(held) < max {
-			p := c.Expect(wire.PUBLISH, 0)
-			held = append(held, p.PacketID)
-		}
-		c.ExpectNone(wire.PUBLISH, 300*time.Millisecond)
-		<-release
-		for _, id := range held {
-			c.Puback(id, wire.ReasonSuccess)
-		}
-		c.ServeAuto()
-	})
-	cli := tbClient(t, b)
-	var wg sync.WaitGroup
-	for i := 0; i < 2*max; i++ {
-		wg.Go(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := cli.Publish(ctx, PublishOptions{Topic: "rm", QoS: 1}); err != nil {
-				t.Error(err)
+// The QoS > 0 PUBLISHes in flight are capped by the broker's Receive
+// Maximum (§4.9), or by WithMaxInflight when that is lower: a send quota
+// may be lower than the Receive Maximum, never higher [MQTT-4.9.0-1].
+func TestOutboundInflightLimit(t *testing.T) {
+	tests := []struct {
+		name        string
+		brokerLimit uint16 // 0: CONNACK without Receive Maximum (65,535)
+		maxInflight uint16
+		want        int
+	}{
+		{name: "broker's Receive Maximum", brokerLimit: 3, want: 3},
+		{name: "MaxInflight below it", brokerLimit: 10, maxInflight: 2, want: 2},
+		{name: "MaxInflight above it", brokerLimit: 3, maxInflight: 50, want: 3},
+		{name: "MaxInflight without one", maxInflight: 4, want: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			release := make(chan struct{})
+			b := testbroker.New(t, func(c *testbroker.Conn) {
+				var connack wire.ConnackOpts
+				if tt.brokerLimit != 0 {
+					connack.ReceiveMaximum = &tt.brokerLimit
+				}
+				c.AcceptConnect(connack)
+				var held []uint16
+				for len(held) < tt.want {
+					p := c.Expect(wire.PUBLISH, 0)
+					held = append(held, p.PacketID)
+				}
+				c.ExpectNone(wire.PUBLISH, 300*time.Millisecond)
+				<-release
+				for _, id := range held {
+					c.Puback(id, wire.ReasonSuccess)
+				}
+				c.ServeAuto()
+			})
+			cli := tbClient(t, b, WithMaxInflight(tt.maxInflight))
+			var wg sync.WaitGroup
+			for range 2 * tt.want {
+				wg.Go(func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := cli.Publish(ctx, PublishOptions{Topic: "rm", QoS: 1}); err != nil {
+						t.Error(err)
+					}
+				})
 			}
+			time.Sleep(500 * time.Millisecond)
+			close(release)
+			wg.Wait()
 		})
 	}
-	time.Sleep(500 * time.Millisecond)
-	close(release)
-	wg.Wait()
 }
 
 // Unless told otherwise the client advertises DefaultReceiveMaximum,
