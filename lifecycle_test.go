@@ -1827,12 +1827,12 @@ func TestFailoverPriorityPassFallsThroughWithoutBackoff(t *testing.T) {
 		WithFailoverOrder(FailoverPriority),
 		// No delay before the first reconnect attempt, an hour before any
 		// later one: reaching the standby in time takes a single pass.
-		WithReconnectBackoff(func(attempt int) time.Duration {
+		WithReconnectBackoff(BackoffFunc(func(attempt int) time.Duration {
 			if attempt == 0 {
 				return 0
 			}
 			return time.Hour
-		}),
+		})),
 		WithLogger(quietLogger()),
 		WithOnReconnectAttempt(func(attempt int, broker string) {
 			mu.Lock()

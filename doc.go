@@ -62,6 +62,8 @@
 //   - [WithOnConnectError] / [WithOnReconnectAttempt] feed metrics
 //     and alerting per attempt; [WithOnConnectionDown] returns false
 //     to terminate the supervisor.
+//   - [WithReconnectBackoff] takes an [ExponentialBackoff] with
+//     Initial, Max, Multiplier and Jitter.
 //
 // The MQTT v5 client feature set: shared subscriptions, Subscription
 // Identifiers, topic aliases (in and out), session expiry and

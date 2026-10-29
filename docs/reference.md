@@ -85,10 +85,25 @@
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithReconnectBackoff(b)` | `ExponentialBackoff(1s, 30s, 200ms)` | Delay before reconnect attempt n. `ConstantBackoff(d)` also shipped. The attempt count carries over connections that drop sooner than the delay before them. |
+| `WithReconnectBackoff(b)` | `ExponentialBackoff{Initial: 1s, Max: 30s, Jitter: 0.5}` | Delay before reconnect attempt n; see [Backoff policies](#backoff-policies). The attempt count carries over connections that drop sooner than the delay before them. `New` rejects an invalid policy. |
 | `WithPublishWaitForConnection()` | off | `Publish` with no connection up waits, bounded by its ctx, for the next one — before the first connection, and between a drop and the reconnect — instead of returning `ErrNotConnected`. After `Disconnect` it still returns `ErrNotConnected` at once. |
 | `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure: with `WithBrokers`, once every broker has failed. |
 | `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Changing brokers at runtime](multi-broker.md#changing-brokers-at-runtime)). |
+
+##### Backoff policies
+
+`Backoff` is an interface with one method, `Delay(attempt int) time.Duration`,
+where attempt counts from 0. The same policies serve
+`WithReconnectBackoff` and `WithQueueRetryBackoff`.
+
+| Policy | Fields | Validated by `New` / `NewQueuePublisher` |
+|---|---|---|
+| `ExponentialBackoff{Initial, Max, Multiplier, Jitter}` | `Initial` is the delay before attempt 0; each attempt multiplies it by `Multiplier` (zero means 2), up to `Max`. `Jitter` in [0, 1] is the random fraction of each delay: a delay d becomes a uniform draw from [(1−Jitter)·d, d]. 0 retries at exactly d, 0.5 keeps at least half, 1 ("full jitter") spreads a fleet widest. Jitter never lengthens a delay, so `Max` is a ceiling. | `Initial` > 0, `Max` ≥ `Initial`, `Multiplier` 0 or ≥ 1, `Jitter` within [0, 1] |
+| `ConstantBackoff(d)` | The same delay before every attempt. Clients that fail together retry in lockstep. | d ≥ 0 |
+| `BackoffFunc(fn)` | Any function `func(attempt int) time.Duration`; must be safe for concurrent use. | fn not nil |
+
+A fleet that loses its broker at once reconnects together unless the
+delays are spread: keep `Jitter` above 0 for reconnects.
 
 #### Write path and publishing
 
@@ -194,7 +209,7 @@ after five seconds.
 | `WithQueueTTL(d)` | `time.Duration` | 0 (none) | Longest a message may wait, from `Publish`; the remaining lifetime is sent as Message Expiry Interval. |
 | `WithDeadLetter(fn)` | `func(QueueEntry, error)` | none | Messages removed without the broker accepting them, with the reason. Called from internal goroutines, possibly concurrently; must not block. |
 | `WithQueueClassifier(fn)` | `func(error) bool` | `PermanentPublishError` | Which failures are dead-lettered rather than retried. |
-| `WithQueueRetryBackoff(b)` | `Backoff` | `DefaultQueueRetryBackoff` (1 s doubling to 1 min, ±0.5 s) | Delay before retrying a message whose publish failed for a reason that may pass. |
+| `WithQueueRetryBackoff(b)` | `Backoff` | `DefaultQueueRetryBackoff` (`ExponentialBackoff{Initial: 1s, Max: 1min, Jitter: 0.5}`) | Delay before retrying a message whose publish failed for a reason that may pass; see [Backoff policies](#backoff-policies). |
 | `WithQueueIdempotencyKey()` | — | off | Adds the `mqttv5-msg-id` user property with the message's ID. |
 
 ### Per-`ClientGroup`

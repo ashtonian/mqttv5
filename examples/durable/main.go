@@ -67,7 +67,7 @@ func run(ctx context.Context) error {
 		mqttv5.WithClientID("mqttv5-durable"),
 		mqttv5.WithStore(st),
 		mqttv5.WithRetryInitialConnect(),
-		mqttv5.WithReconnectBackoff(mqttv5.ExponentialBackoff(250*time.Millisecond, 5*time.Second, 100*time.Millisecond)),
+		mqttv5.WithReconnectBackoff(mqttv5.ExponentialBackoff{Initial: 250 * time.Millisecond, Max: 5 * time.Second, Jitter: 0.5}),
 		mqttv5.WithOnConnectionUp(func(info mqttv5.ConnackInfo) {
 			fmt.Printf("UP    %s session_present=%t\n", info.Broker, info.SessionPresent)
 		}),

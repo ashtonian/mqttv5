@@ -36,8 +36,9 @@ const (
 
 // DefaultQueueRetryBackoff spaces the attempts of a message whose
 // publish failed for a reason that may pass (a refusal such as 0x97
-// Quota exceeded, a store error).
-var DefaultQueueRetryBackoff = ExponentialBackoff(time.Second, time.Minute, 500*time.Millisecond)
+// Quota exceeded, a store error): 1 s doubling to 1 min, each delay
+// drawn from its upper half.
+var DefaultQueueRetryBackoff = ExponentialBackoff{Initial: time.Second, Max: time.Minute, Jitter: 0.5}
 
 // QueuePublisher accepts QoS 1/2 messages into a [PublisherQueue] and
 // publishes them in the background, many at a time.
@@ -165,7 +166,8 @@ func WithQueueClassifier(fn func(err error) bool) QueueOption {
 }
 
 // WithQueueRetryBackoff spaces the attempts of a message whose publish
-// failed for a reason that may pass. Default
+// failed for a reason that may pass. [NewQueuePublisher] rejects an
+// invalid [ExponentialBackoff] or [ConstantBackoff]. Default
 // [DefaultQueueRetryBackoff].
 func WithQueueRetryBackoff(b Backoff) QueueOption {
 	return func(c *queueConfig) { c.backoff = b }
@@ -220,8 +222,11 @@ func NewQueuePublisher(client *Client, queue PublisherQueue, opts ...QueueOption
 		return nil, fmt.Errorf("mqttv5: WithQueueTTL(%v): must not be negative", cfg.ttl)
 	case cfg.dropPolicy != DropNewest && cfg.dropPolicy != DropOldest:
 		return nil, fmt.Errorf("mqttv5: WithQueueDropPolicy(%d): unknown policy", cfg.dropPolicy)
-	case cfg.permanent == nil || cfg.backoff == nil:
-		return nil, errors.New("mqttv5: WithQueueClassifier and WithQueueRetryBackoff need a function")
+	case cfg.permanent == nil:
+		return nil, errors.New("mqttv5: WithQueueClassifier needs a function")
+	}
+	if err := validateBackoff(cfg.backoff); err != nil {
+		return nil, fmt.Errorf("mqttv5: WithQueueRetryBackoff: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &QueuePublisher{
@@ -505,7 +510,7 @@ func (p *QueuePublisher) failed(m *queuedMessage, err error) error {
 		p.mu.Unlock()
 		p.logger.Warn("publishing a queued message failed; will retry",
 			slog.String("topic", m.entry.Publish.Topic), slog.Int("attempt", attempts), slog.Any("error", err))
-		p.retry(m, p.clk.Now().Add(p.cfg.backoff(attempts-1)))
+		p.retry(m, p.clk.Now().Add(p.cfg.backoff.Delay(attempts-1)))
 	}
 	return nil
 }
@@ -548,7 +553,7 @@ func (p *QueuePublisher) remove(m *queuedMessage) error {
 		p.mu.Unlock()
 		p.logger.Error("removing a finished message from the queue failed; will retry",
 			slog.String("id", m.entry.ID), slog.Int("attempt", attempts), slog.Any("error", err))
-		p.retry(m, p.clk.Now().Add(p.cfg.backoff(attempts-1)))
+		p.retry(m, p.clk.Now().Add(p.cfg.backoff.Delay(attempts-1)))
 		return err
 	}
 	p.mu.Lock()

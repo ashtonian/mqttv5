@@ -76,7 +76,8 @@ control queue that survives reconnects.
 | Path | What |
 |---|---|
 | `client.go` | `Client`, `New`, `ServerInfo` (what CONNACK granted), `Stats` counters |
-| `options.go` | `Config`, every `With…` option, backoff policies |
+| `options.go` | `Config`, every `With…` option |
+| `backoff.go` | `Backoff` and the policies: `ExponentialBackoff`, `ConstantBackoff`, `BackoffFunc` |
 | `lifecycle.go` | `Connect`/`Disconnect`, the supervisor, lifecycle callbacks and their queue, server redirects |
 | `conn.go`, `conn_unix.go`, `conn_other.go` | per-connection state: read loop and dispatch, writer goroutine, direct writes, keep-alive; the non-blocking socket write on unix |
 | `auth.go` | `Authenticator` interfaces, AUTH handling, `Reauthenticate` |

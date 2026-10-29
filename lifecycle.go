@@ -729,7 +729,7 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 		// was healthy: start the backoff over. One that died sooner —
 		// a broker that accepts the CONNECT and drops what follows —
 		// keeps it growing instead of retrying in a tight loop.
-		if c.cfg.clock.Now().Sub(cs.connectedAt) >= c.cfg.ReconnectBackoff(attempts) {
+		if c.cfg.clock.Now().Sub(cs.connectedAt) >= c.cfg.ReconnectBackoff.Delay(attempts) {
 			attempts = 0
 		}
 		var ok bool
@@ -746,7 +746,7 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 // continues from attempt; redial returns the attempts made so far.
 func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, int) {
 	for {
-		delay := c.cfg.ReconnectBackoff(attempt)
+		delay := c.cfg.ReconnectBackoff.Delay(attempt)
 		select {
 		case <-c.cfg.clock.After(delay):
 		case <-life.shutdown:
