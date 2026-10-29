@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package clock abstracts time so timing-dependent code (keep-alive, backoff,
 // queue draining) can be tested without sleeping. Production code uses Real;
 // tests use Fake and advance it explicitly.

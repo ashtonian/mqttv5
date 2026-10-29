@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package queuetest checks a [mqttv5.PublisherQueue] implementation
 // against the interface's contract. Use it from the implementation's
 // tests:

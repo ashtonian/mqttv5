@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package filedb is the bbolt layer shared by the file-backed session
 // store (store/file) and publisher queue (queue/file): one database file
 // held under an exclusive lock, writes committed per a [SyncPolicy] with

@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Typed example: one client, one JSON Encoding, two payload types.
 // Readings and commands each arrive decoded into their own struct;
 // PublishValue encodes any value and declares its Content Type. A

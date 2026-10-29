@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Pool example: publish the same burst of QoS 1 messages over the main
 // connection alone, then through a publisher pool, and compare.
 //

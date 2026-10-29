@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Subscribe example: the three delivery shapes, and what each does with
 // a consumer that falls behind.
 //

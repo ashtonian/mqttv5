@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Shared example: three workers share one subscription
 // ($share/workers/jobs/#), and the broker hands each job to one of
 // them. In production each worker is its own process; here they are

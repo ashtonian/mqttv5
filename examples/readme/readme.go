@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package readme holds every Go snippet of the repository README and
 // docs/*.md guides in a form that compiles, so documentation cannot drift
 // from the API. TestREADMESnippets fails when a snippet is not found, line for

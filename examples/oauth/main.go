@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // OAuth credential-rotation example: WithConnectPacketBuilder lets
 // you mutate the CONNECT packet immediately before each attempt.
 // This is the standard place to refresh an OAuth bearer token, fetch

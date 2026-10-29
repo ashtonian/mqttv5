@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package trie implements an MQTT v5 topic filter matcher used by the
 // client to dispatch inbound PUBLISH packets to subscribed handlers.
 //

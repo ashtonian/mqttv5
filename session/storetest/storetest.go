@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package storetest checks that a [session.Store] implementation honours
 // the contract the client relies on. Call [Run] from the
 // implementation's tests:

@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package json is a JSON Encoding for mqttv5's typed calls
 // (Client.PublishValue, Client.SubscribeAs and their variants), built
 // on the standard library's encoding/json. It sits in its own module so

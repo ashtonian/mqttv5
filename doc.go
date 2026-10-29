@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package mqttv5 is an MQTT v5 client for Go that allocates little per
 // message, with an ergonomic API. The supervisor (reconnect, replay-in-flight,
 // auto-resubscribe) is baked into every [Client]; there is no separate

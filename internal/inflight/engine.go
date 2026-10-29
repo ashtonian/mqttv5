@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package inflight is the client's MQTT v5 session state machine: packet
 // identifier ownership, outbound QoS 1/2 flows, inbound QoS 1/2 flows and
 // the acknowledgements owed to the broker.

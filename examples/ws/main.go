@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // WebSocket example: connect via ws:// (or wss://) by composing
 // mqttv5.WithDialFunc with the transport/ws Dial. The core mqttv5
 // module stays stdlib-only; the gobwas/ws dependency lives only in

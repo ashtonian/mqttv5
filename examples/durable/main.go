@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Durable example: a QueuePublisher on queue/file with the session in
 // store/file. Publish returns once a message is on disk, so the program
 // keeps publishing while no broker is up, and a restarted program

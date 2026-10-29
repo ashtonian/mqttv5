@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Bridge example: copy plant/# from a source broker to a destination
 // broker as site-3/plant/#, at least once. Each message is acked to the
 // source only after the destination acknowledged its copy, and the

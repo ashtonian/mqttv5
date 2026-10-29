@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package msgpack is a MessagePack Encoding for mqttv5's typed calls
 // (Client.PublishValue, Client.SubscribeAs and their variants).
 //
