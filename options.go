@@ -253,6 +253,12 @@ type Config struct {
 	// Runs with the other lifecycle callbacks (see the package documentation).
 	OnReconnectAttempt func(attempt int, brokerURL string)
 
+	// OnReconnectLimit fires once when the client has stopped because
+	// MaxReconnectAttempts or MaxReconnectTime ran out; err is a
+	// [*ReconnectLimitError]. Runs with the other lifecycle callbacks
+	// (see the package documentation).
+	OnReconnectLimit func(err error)
+
 	// StatsEnabled toggles the [Client.Stats] counter set. Default
 	// false — when disabled the hot path skips every atomic
 	// increment and Stats returns the zero value.
@@ -287,6 +293,15 @@ type Config struct {
 	// ReconnectBackoff is the delay before each reconnect attempt.
 	// Default [DefaultReconnectBackoff].
 	ReconnectBackoff Backoff
+
+	// MaxReconnectAttempts stops the client after that many failed
+	// reconnect attempts in a row. Zero (the default) never stops.
+	MaxReconnectAttempts int
+
+	// MaxReconnectTime stops the client once the next reconnect attempt
+	// would start more than this long after the connection was lost.
+	// Zero (the default) never stops.
+	MaxReconnectTime time.Duration
 
 	Logger *slog.Logger
 
@@ -572,7 +587,9 @@ func WithRetryInitialConnect() Option {
 // the broker the client fails over to, as a QoS 1/2 message accepted
 // just before the drop does. ctx bounds the wait: one without a deadline
 // waits for as long as the client keeps reconnecting. After
-// [Client.Disconnect], Publish returns ErrNotConnected at once.
+// [Client.Disconnect], or once a reconnect limit
+// ([WithMaxReconnectAttempts], [WithMaxReconnectTime]) has stopped the
+// client, Publish returns ErrNotConnected at once.
 func WithPublishWaitForConnection() Option {
 	return func(c *Config) error {
 		c.PublishWaitForConnection = true
@@ -774,7 +791,8 @@ func WithOnConnectionUp(fn func(ConnackInfo)) Option {
 
 // WithOnConnectionDown registers a callback fired when the connection
 // is lost. Does NOT fire on user-initiated Disconnect. Return false
-// to terminate the supervisor — no further reconnect attempts; the
+// to terminate the supervisor — no further reconnect attempts (to stop
+// after some, see [WithMaxReconnectAttempts]); the
 // supervisor waits for the answer. A subsequent Connect on the same
 // Client re-starts the lifecycle. Runs with the other lifecycle
 // callbacks (see the package documentation).
@@ -859,13 +877,64 @@ func WithConnectPacketBuilder(fn func(ctx context.Context, opts *ConnectOptions)
 // before it, so a broker that drops connections right after accepting
 // them is retried at the growing interval rather than at the first one.
 // [New] rejects an invalid [ExponentialBackoff] or [ConstantBackoff].
-// Default [DefaultReconnectBackoff].
+// Default [DefaultReconnectBackoff]. [WithMaxReconnectAttempts] and
+// [WithMaxReconnectTime] bound how long the client keeps trying.
 func WithReconnectBackoff(b Backoff) Option {
 	return func(c *Config) error {
 		if err := validateBackoff(b); err != nil {
 			return fmt.Errorf("mqttv5: WithReconnectBackoff: %w", err)
 		}
 		c.ReconnectBackoff = b
+		return nil
+	}
+}
+
+// WithMaxReconnectAttempts stops the client after n reconnect attempts
+// in a row have failed: one outage, from the lost connection (or, with
+// [WithRetryInitialConnect], from Connect's failed attempt) to the next
+// connection, gets n attempts. Under [FailoverPriority] an attempt is a
+// pass over the broker list. When they run out the client ends as
+// [Client.Disconnect] would, and calls cut short by it, and
+// [Client.AwaitConnection], return a [*ReconnectLimitError] matching
+// [ErrReconnectLimit] and [ErrClosed]; [WithOnReconnectLimit] reports
+// it, and [Client.Connect] starts the client again. Publisher pool
+// members keep reconnecting while the main connection stands. Zero, the
+// default, keeps trying for as long as the client runs.
+func WithMaxReconnectAttempts(n int) Option {
+	return func(c *Config) error {
+		if n < 0 {
+			return fmt.Errorf("mqttv5: WithMaxReconnectAttempts(%d): must not be negative", n)
+		}
+		c.MaxReconnectAttempts = n
+		return nil
+	}
+}
+
+// WithMaxReconnectTime stops the client once its next reconnect attempt
+// would start more than d after the connection was lost (or, with
+// [WithRetryInitialConnect], after Connect's attempt failed). It stops
+// as soon as the backoff shows that, without waiting out the delay; an
+// attempt under way is not cut short. The client then stops as with
+// [WithMaxReconnectAttempts]. Zero, the default, keeps trying for as
+// long as the client runs.
+func WithMaxReconnectTime(d time.Duration) Option {
+	return func(c *Config) error {
+		if d < 0 {
+			return fmt.Errorf("mqttv5: WithMaxReconnectTime(%v): must not be negative", d)
+		}
+		c.MaxReconnectTime = d
+		return nil
+	}
+}
+
+// WithOnReconnectLimit registers a callback fired once when the client
+// has stopped because [WithMaxReconnectAttempts] or
+// [WithMaxReconnectTime] ran out; err is a [*ReconnectLimitError]. Call
+// [Client.Connect], from the callback or later, to start again. Runs
+// with the other lifecycle callbacks (see the package documentation).
+func WithOnReconnectLimit(fn func(err error)) Option {
+	return func(c *Config) error {
+		c.OnReconnectLimit = fn
 		return nil
 	}
 }

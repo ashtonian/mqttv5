@@ -207,8 +207,6 @@ func newLifecycle() *lifecycle {
 	return &lifecycle{shutdown: make(chan struct{}), finished: make(chan struct{})}
 }
 
-func (l *lifecycle) end() { l.endWith(nil) }
-
 // isStopping reports whether the span's teardown has started.
 func (l *lifecycle) isStopping() bool {
 	l.mu.Lock()
@@ -253,12 +251,14 @@ func (l *lifecycle) context(parent context.Context) (context.Context, context.Ca
 }
 
 // endWith ends the span, recording err as the reason when it is the
-// first to.
-func (l *lifecycle) endWith(err error) {
+// first to, and reports whether it was.
+func (l *lifecycle) endWith(err error) (ended bool) {
 	l.endOnce.Do(func() {
 		l.err = err
 		close(l.shutdown)
+		ended = true
 	})
+	return ended
 }
 
 // closedErr is what a call cut short by the end of the span returns:
