@@ -86,6 +86,8 @@
 | Option | Default | Effect |
 |---|---|---|
 | `WithReconnectBackoff(b)` | `ExponentialBackoff{Initial: 1s, Max: 30s, Jitter: 0.5}` | Delay before reconnect attempt n; see [Backoff policies](#backoff-policies). The attempt count carries over connections that drop sooner than the delay before them. `New` rejects an invalid policy. |
+| `WithMaxReconnectAttempts(n)` | 0 (no limit) | Stop the client after n failed reconnect attempts in one outage (from the lost connection, or with `WithRetryInitialConnect` from `Connect`'s failed attempt, to the next connection). Under `FailoverPriority` an attempt is a pass over the list. See [Reconnect limits](#reconnect-limits). Negative rejected. |
+| `WithMaxReconnectTime(d)` | 0 (no limit) | Stop the client once the next reconnect attempt would start more than d after the connection was lost. It stops as soon as the backoff shows that, without waiting out the delay; an attempt under way is not cut short. Negative rejected. |
 | `WithPublishWaitForConnection()` | off | `Publish` with no connection up waits, bounded by its ctx, for the next one — before the first connection, and between a drop and the reconnect — instead of returning `ErrNotConnected`. After `Disconnect` it still returns `ErrNotConnected` at once. |
 | `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure: with `WithBrokers`, once every broker has failed. |
 | `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Changing brokers at runtime](multi-broker.md#changing-brokers-at-runtime)). |
@@ -104,6 +106,28 @@ where attempt counts from 0. The same policies serve
 
 A fleet that loses its broker at once reconnects together unless the
 delays are spread: keep `Jitter` above 0 for reconnects.
+
+##### Reconnect limits
+
+Without limits the client reconnects for as long as it runs. With
+`WithMaxReconnectAttempts` or `WithMaxReconnectTime`, an outage that
+runs out of either stops the client as `Disconnect` would:
+
+- a QoS 1/2 `Publish` still waiting, and `AwaitConnection`, return a
+  `*ReconnectLimitError` (`errors.Is(err, ErrReconnectLimit)` and
+  `errors.Is(err, ErrClosed)`), whose `Attempts`, `Elapsed` and `Err`
+  (the last attempt's failure, one error per broker) say what happened;
+  `Err` is not in the error's chain, so a classifier does not take the
+  client stopping for one CONNACK refusal;
+- `Publish`, with or without `WithPublishWaitForConnection`, returns
+  `ErrNotConnected`;
+- `WithOnReconnectLimit` fires once, with the error;
+- `Connect` starts the client again, with a fresh budget.
+
+A reconnect that succeeds ends the outage: the next one gets the whole
+budget. `OnConnectionDown` returning false still stops the client at
+once, without an error. Publisher pool members keep reconnecting while
+the main connection stands and stop with it.
 
 #### Write path and publishing
 
@@ -168,6 +192,7 @@ after five seconds.
 | `WithOnResubscribeError(fn)` | `func(SubscriptionToken, error)` — the broker refused filters when the client re-subscribed after a session loss | The token's `Err()` is set when no filter is left. |
 | `WithOnReauthenticated(fn)` | when a re-authentication started with `Reauthenticate` concludes with broker AUTH `0x00` | Observability only. |
 | `WithOnStoreFailure(fn)` | `func(error)` — once, after a `WithStore` write failed and the client stopped because of it | The error is a `*StoreError` (`errors.Is(err, ErrStoreFailed)`). Call `Connect` to start again from what the store holds. |
+| `WithOnReconnectLimit(fn)` | `func(error)` — once, after `WithMaxReconnectAttempts` or `WithMaxReconnectTime` ran out and the client stopped | The error is a `*ReconnectLimitError` (`errors.Is(err, ErrReconnectLimit)`). Call `Connect` to start again. |
 
 #### Observability
 
@@ -241,7 +266,8 @@ them with `errors.As`.
 |---|---|---|
 | `ErrNotConnected` | `Publish`, `Reauthenticate` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect (`AwaitConnection`), or let `Publish` wait (`WithPublishWaitForConnection`). |
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
-| `ErrClosed` | any after `Disconnect` | Client torn down. |
+| `ErrClosed` | any after `Disconnect` | Client torn down. Also matched by `*ReconnectLimitError`. |
+| `ErrReconnectLimit` | QoS 1/2 `Publish`, `AwaitConnection`, `WithOnReconnectLimit` | A reconnect limit ran out and the client stopped; the error is a `*ReconnectLimitError` with `Attempts`, `Elapsed` and the last attempt's failure in `Err` (see [Reconnect limits](#reconnect-limits)). `Connect` starts again. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason; the error is a `*ReasonCodeError` carrying the code, reason string and server reference. |
 | joined errors | `Connect` with `WithBrokers` | No broker accepted: one error per broker, each prefixed with its URL; `errors.Is` / `errors.As` see every one. |
 | `*ProtocolError` | `Connect`, connection drops | The broker broke MQTT v5 (e.g. Session Present for CleanStart=1, a packet above the client's Maximum Packet Size, more in-flight messages than the client's Receive Maximum). The client sent DISCONNECT with `Reason` and reconnects; counted in `Stats().ProtocolErrors`. |

@@ -9,6 +9,7 @@ import (
 	"iter"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/wire"
@@ -366,6 +367,11 @@ var (
 	// [WithStore] store failed.
 	ErrStoreFailed = inflight.ErrStoreFailed
 
+	// ErrReconnectLimit is matched by every [*ReconnectLimitError]: the
+	// client stopped because [WithMaxReconnectAttempts] or
+	// [WithMaxReconnectTime] ran out.
+	ErrReconnectLimit = errors.New("mqttv5: reconnect limit reached")
+
 	// ErrQoSNotSupported is returned by Publish for a QoS above the
 	// broker's Maximum QoS (see [WithQoSDowngrade]), and completes a
 	// stored message that a reconnect to such a broker can no longer
@@ -417,6 +423,30 @@ var (
 // the write and Err is the store's error. errors.Is matches both
 // [ErrStoreFailed] and Err.
 type StoreError = inflight.StoreError
+
+// ReconnectLimitError reports that the client stopped reconnecting
+// because [WithMaxReconnectAttempts] or [WithMaxReconnectTime] ran out.
+// errors.Is matches [ErrReconnectLimit] and [ErrClosed], but not Err: a
+// caller that classifies errors must not take the client stopping for
+// the broker's answer to one attempt.
+type ReconnectLimitError struct {
+	Attempts int           // reconnect attempts made in the outage
+	Elapsed  time.Duration // from the lost connection to the stop
+	// Err is the last attempt's failure, one error per broker it dialled,
+	// each prefixed with its URL; nil when no attempt was made.
+	Err error
+}
+
+func (e *ReconnectLimitError) Error() string {
+	msg := fmt.Sprintf("mqttv5: stopped reconnecting after %d attempts in %v", e.Attempts, e.Elapsed)
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap returns [ErrReconnectLimit] and [ErrClosed].
+func (e *ReconnectLimitError) Unwrap() []error { return []error{ErrReconnectLimit, ErrClosed} }
 
 // ReasonCodeError is a broker's refusal: a reason code of 0x80 or above
 // on CONNACK, PUBACK, PUBREC, SUBACK, UNSUBACK or DISCONNECT, with the

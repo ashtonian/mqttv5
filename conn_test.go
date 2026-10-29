@@ -599,7 +599,7 @@ func newPingHarness(t *testing.T, keep time.Duration, timeout time.Duration) *pi
 	cs.wg.Add(1)
 	go c.pingLoop(cs)
 	t.Cleanup(func() {
-		life.end()
+		life.endWith(nil)
 		cs.wg.Wait()
 	})
 	return &pingHarness{t: t, clk: clk, c: c, cs: cs, answer: true}

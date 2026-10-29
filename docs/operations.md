@@ -92,7 +92,8 @@ Normal message traffic logs nothing.
 - **Warn:** recoverable problems: reconnects, refused filters, stray
   acknowledgements, typed decode failures, a teardown waiting on a
   handler.
-- **Error:** protocol violations and store failures.
+- **Error:** protocol violations, store failures and a reconnect limit
+  stopping the client.
 
 ## Troubleshooting
 
@@ -114,6 +115,7 @@ Normal message traffic logs nothing.
 | Own messages arrive on a No Local subscription | `WithPublisherPool` is set | Pooled publishes come from the members' ClientIDs; skip your own messages in the handler |
 | `Disconnect` does not return; Warn log `disconnect is waiting for a SubscribeCallback handler` | goroutine dump (`SIGQUIT`) for the handler's stack | A handler or `SubOnDrop` hook is blocked, or called `Disconnect` itself: make it return, and run `Disconnect` from another goroutine |
 | Reconnects start late | a lifecycle callback that takes long to return | The client waits for the callbacks before each attempt: keep them short, hand slow work to another goroutine |
+| Client stopped, `WithOnReconnectLimit` fired, `AwaitConnection` returns `ErrReconnectLimit`, `Publish` returns `ErrNotConnected` | the `*ReconnectLimitError`'s `Err` (each broker's failure in the last attempt) and `Attempts` / `Elapsed`; the Error log `reconnect limit reached` | Dial errors: the broker or the network is down. CONNACK refusals: the reason code (0x86/0x87 credentials, 0x88/0x89 broker overloaded). Fix the cause, then `Connect` again; raise `WithMaxReconnectAttempts` / `WithMaxReconnectTime` if outages this long are expected |
 
 ## Store failures
 

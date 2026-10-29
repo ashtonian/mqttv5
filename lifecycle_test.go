@@ -2522,3 +2522,215 @@ func TestRepublishAfterSessionLossFollowsResubscribe(t *testing.T) {
 		t.Fatalf("Publish = %v, want the republished message acknowledged", err)
 	}
 }
+
+// refuseConnect answers a CONNECT with 0x88 Server unavailable.
+func refuseConnect(c *testbroker.Conn) {
+	c.AcceptConnect(wire.ConnackOpts{ReasonCode: wire.ReasonServerUnavailable})
+}
+
+// holdConnect accepts a CONNECT and serves the connection until it drops.
+func holdConnect(c *testbroker.Conn) { c.AcceptResume(wire.ConnackOpts{}); c.ServeAuto() }
+
+// After WithMaxReconnectAttempts failed attempts in one outage the client
+// stops: a Publish waiting on the lost connection and AwaitConnection
+// return the limit's error, WithOnReconnectLimit reports it, and a later
+// Connect starts over.
+func TestMaxReconnectAttemptsStopsTheClient(t *testing.T) {
+	// The first connection drops once it has the PUBLISH, unacknowledged.
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptResume(wire.ConnackOpts{})
+		c.Await(wire.PUBLISH, 0)
+	})
+	b.SetFallback(refuseConnect)
+
+	var attempts atomic.Int32
+	limited := make(chan error, 1)
+	cli, err := New(WithBroker(b.URL()), WithClientID("limit"), WithLogger(quietLogger()), WithoutKeepAlive(),
+		WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+		WithMaxReconnectAttempts(3),
+		WithOnReconnectAttempt(func(int, string) { attempts.Add(1) }),
+		WithOnReconnectLimit(func(err error) { limited <- err }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+
+	published := make(chan error, 1)
+	go func() {
+		published <- cli.Publish(context.Background(), PublishOptions{Topic: "t", Payload: []byte("x"), QoS: 1})
+	}()
+
+	var limitErr error
+	select {
+	case limitErr = <-limited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnReconnectLimit did not fire")
+	}
+	var rle *ReconnectLimitError
+	if !errors.As(limitErr, &rle) || rle.Attempts != 3 {
+		t.Fatalf("OnReconnectLimit(%v), want a *ReconnectLimitError after 3 attempts", limitErr)
+	}
+	if !errors.Is(limitErr, ErrReconnectLimit) || !errors.Is(limitErr, ErrClosed) {
+		t.Errorf("%v does not match ErrReconnectLimit and ErrClosed", limitErr)
+	}
+	// The broker's refusal is the cause, not what the error is: a
+	// classifier must not take the client stopping for a refusal.
+	if errors.Is(limitErr, ErrConnectRefused) || !errors.Is(rle.Err, ErrConnectRefused) {
+		t.Errorf("Err = %v: want the last attempt's refusal there, and only there", rle.Err)
+	}
+	if n := attempts.Load(); n != 3 {
+		t.Errorf("%d reconnect attempts, want 3", n)
+	}
+
+	select {
+	case err := <-published:
+		if !errors.Is(err, ErrReconnectLimit) {
+			t.Errorf("Publish = %v, want ErrReconnectLimit", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Publish still waiting after the client stopped")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cli.AwaitConnection(ctx); !errors.Is(err, ErrReconnectLimit) {
+		t.Errorf("AwaitConnection = %v, want ErrReconnectLimit", err)
+	}
+
+	b.SetFallback(holdConnect)
+	if err := cli.Connect(ctx); err != nil {
+		t.Fatalf("Connect after the limit: %v", err)
+	}
+}
+
+// WithMaxReconnectTime stops the client as soon as the next attempt would
+// start later than the limit after the connection was lost, without
+// waiting out that attempt's delay.
+func TestMaxReconnectTimeStopsTheClient(t *testing.T) {
+	clk := clock.NewFake(time.Unix(1_000, 0))
+	b := testbroker.New(t, holdConnect)
+	b.SetFallback(refuseConnect)
+
+	limited := make(chan error, 1)
+	up := make(chan struct{}, 1)
+	cli, err := New(WithBroker(b.URL()), WithClientID("limit-time"), WithLogger(quietLogger()), WithoutKeepAlive(),
+		withClock(clk), WithReconnectBackoff(ConstantBackoff(10*time.Second)),
+		WithMaxReconnectTime(25*time.Second),
+		WithOnConnectionUp(func(ConnackInfo) { up <- struct{}{} }),
+		WithOnReconnectLimit(func(err error) { limited <- err }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	<-up
+
+	b.DropAll()
+	for range 2 {
+		if !clk.WaitPending(1, 5*time.Second) {
+			t.Fatal("no reconnect timer")
+		}
+		clk.Advance(10 * time.Second)
+	}
+	// The third attempt would start 30 s after the drop.
+	select {
+	case err := <-limited:
+		var rle *ReconnectLimitError
+		if !errors.As(err, &rle) || rle.Attempts != 2 || rle.Elapsed != 20*time.Second {
+			t.Fatalf("OnReconnectLimit(%v), want a *ReconnectLimitError after 2 attempts in 20s", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnReconnectLimit did not fire")
+	}
+}
+
+// The attempt limit counts the attempts of one outage: a reconnect that
+// succeeds gives the next outage the whole budget again.
+func TestMaxReconnectAttemptsCountsPerOutage(t *testing.T) {
+	b := testbroker.New(t, holdConnect, refuseConnect, refuseConnect, holdConnect, refuseConnect, refuseConnect)
+	b.SetFallback(holdConnect)
+
+	up := make(chan struct{}, 1)
+	limited := make(chan error, 1)
+	cli, err := New(WithBroker(b.URL()), WithClientID("limit-outage"), WithLogger(quietLogger()), WithoutKeepAlive(),
+		WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+		WithMaxReconnectAttempts(3),
+		WithOnConnectionUp(func(ConnackInfo) { up <- struct{}{} }),
+		WithOnReconnectLimit(func(err error) { limited <- err }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+
+	for outage := range 3 {
+		select {
+		case <-up:
+		case err := <-limited:
+			t.Fatalf("outage %d: %v", outage, err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("outage %d: no reconnect", outage)
+		}
+		b.DropAll()
+	}
+}
+
+// With WithRetryInitialConnect the limits apply to the attempts after
+// Connect's failed one.
+func TestMaxReconnectAttemptsAfterFailedInitialConnect(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(refuseConnect)
+	cli, err := New(WithBroker(b.URL()), WithClientID("limit-initial"), WithLogger(quietLogger()), WithoutKeepAlive(),
+		WithReconnectBackoff(ConstantBackoff(time.Millisecond)),
+		WithRetryInitialConnect(), WithMaxReconnectAttempts(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = cli.AwaitConnection(ctx)
+	var rle *ReconnectLimitError
+	if !errors.As(err, &rle) || rle.Attempts != 2 {
+		t.Fatalf("AwaitConnection = %v, want a *ReconnectLimitError after 2 attempts", err)
+	}
+	if n := b.Accepted(); n != 3 {
+		t.Errorf("broker accepted %d connections, want Connect's and 2 reconnect attempts", n)
+	}
+}
+
+func TestReconnectLimitsValidated(t *testing.T) {
+	for name, opt := range map[string]Option{
+		"negative attempts": WithMaxReconnectAttempts(-1),
+		"negative time":     WithMaxReconnectTime(-time.Second),
+	} {
+		if _, err := New(WithBroker("mqtt://127.0.0.1:1883"), opt); err == nil {
+			t.Errorf("%s: New accepted it", name)
+		}
+	}
+}
+
+// Publisher pool members keep reconnecting while the main connection
+// stands: the limits are the client's, and the pool stops with it.
+func TestPublisherPoolIgnoresReconnectLimits(t *testing.T) {
+	cli, err := New(WithBroker("mqtt://127.0.0.1:1883"), WithPublisherPool(2),
+		WithMaxReconnectAttempts(2), WithMaxReconnectTime(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range cli.pool.members {
+		if m.cfg.MaxReconnectAttempts != 0 || m.cfg.MaxReconnectTime != 0 {
+			t.Errorf("pool member %d has reconnect limits %d / %v", i+1, m.cfg.MaxReconnectAttempts, m.cfg.MaxReconnectTime)
+		}
+	}
+}

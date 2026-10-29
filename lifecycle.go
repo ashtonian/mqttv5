@@ -127,8 +127,8 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 	}
 
 	result, err := c.connectFirst(ctx, life, cleanStart)
-	connected := err == nil
-	if connected {
+	var down *outage
+	if err == nil {
 		if err = c.runConnection(life, result); err != nil {
 			return err
 		}
@@ -144,6 +144,7 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 			}
 			return err
 		}
+		down = &outage{since: c.cfg.clock.Now(), last: err}
 		c.cfg.Logger.Warn("mqttv5: initial connect failed; retrying in the background", slog.Any("error", err))
 	}
 
@@ -162,24 +163,27 @@ func (c *Client) start(ctx context.Context, life *lifecycle) error {
 		return err
 	}
 	life.running.Add(1)
-	go c.supervisor(life, cleanStart, connected)
+	go c.supervisor(life, cleanStart, down)
 	return nil
 }
 
 // AwaitConnection waits until the client is connected and returns nil,
-// at once if it already is. It returns ErrClosed when the client is
-// disconnected, or ctx's error. Pair with [WithRetryInitialConnect] to
-// start without the broker and wait for it.
+// at once if it already is. Once the client has stopped it returns why:
+// ErrClosed after [Client.Disconnect], a [*ReconnectLimitError] when a
+// reconnect limit ran out, a [*StoreError] when the session store
+// failed. Otherwise it returns ctx's error. Pair with
+// [WithRetryInitialConnect] to start without the broker and wait for it.
 func (c *Client) AwaitConnection(ctx context.Context) error {
 	for {
+		life := c.life.Load()
 		changed := c.connChanged()
 		if c.cur.Load() != nil {
 			return nil
 		}
 		select {
 		case <-changed:
-		case <-c.done():
-			return ErrClosed
+		case <-life.shutdown:
+			return life.closedErr()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -662,17 +666,19 @@ func (c *Client) stopForStoreFailure(life *lifecycle, err error) {
 }
 
 // supervisor watches the current connState's done channel and
-// reconnects (with backoff) until Disconnect is called. The reconnect
-// attempts follow the FailoverOrder (see redial); a successful connect
-// leaves the index parked on whichever URL accepted us.
-func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
+// reconnects (with backoff) until Disconnect is called or a reconnect
+// limit runs out. The reconnect attempts follow the FailoverOrder (see
+// redial); a successful connect leaves the index parked on whichever URL
+// accepted us. down, when not nil, is the outage Connect's failed attempt
+// began: the supervisor starts by reconnecting.
+func (c *Client) supervisor(life *lifecycle, cleanStart bool, down *outage) {
 	defer life.running.Done()
 	// attempts counts reconnect attempts since the last connection that
 	// lasted; it carries the backoff across connections that do not.
 	attempts := 0
-	if !connected {
+	if down != nil {
 		var ok bool
-		if ok, attempts = c.redial(life, cleanStart, 0); !ok {
+		if ok, attempts = c.redial(life, cleanStart, 0, down); !ok {
 			return
 		}
 	}
@@ -691,6 +697,7 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 			// DISCONNECT: that is the teardown, not a drop.
 			return
 		}
+		down := &outage{since: c.cfg.clock.Now()}
 
 		// Connection has dropped. Clear current pointer + notify.
 		c.engine.Disconnected(cs)
@@ -717,12 +724,9 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 			}
 		}
 		if !keepRetrying {
-			// Caller wants no further reconnect attempts: end the span
-			// as Disconnect would, so a later Connect starts clean.
-			life.end()
-			ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
-			_ = c.finish(ctx, life)
-			cancel()
+			// Caller wants no further reconnect attempts: a later Connect
+			// starts clean.
+			c.quit(life, nil)
 			return
 		}
 		// A connection that outlived the delay before the next attempt
@@ -733,20 +737,48 @@ func (c *Client) supervisor(life *lifecycle, cleanStart, connected bool) {
 			attempts = 0
 		}
 		var ok bool
-		if ok, attempts = c.redial(life, c.cfg.CleanStartOnReconnect, attempts); !ok {
+		if ok, attempts = c.redial(life, c.cfg.CleanStartOnReconnect, attempts, down); !ok {
 			return
 		}
 	}
 }
 
+// quit ends span life from its supervisor, which has no connection, as
+// Disconnect would: calls cut short return cause, or ErrClosed when it
+// is nil. It reports whether it ended the span; when a teardown ended it
+// first, that teardown finishes it once the supervisor has returned.
+func (c *Client) quit(life *lifecycle, cause error) bool {
+	if !life.endWith(cause) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
+	_ = c.finish(ctx, life)
+	cancel()
+	return true
+}
+
+// outage is a stretch without a connection, which the reconnect limits
+// measure.
+type outage struct {
+	since    time.Time
+	attempts int   // reconnect attempts made in it
+	last     error // why the last attempt failed
+}
+
 // redial keeps backing off and making reconnect attempts until a
-// connection is up, or the span ends (false). Under FailoverRotate an
-// attempt dials the entry after the current one; under FailoverPriority
-// it is one pass over the list from the first entry. The backoff
-// continues from attempt; redial returns the attempts made so far.
-func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, int) {
+// connection is up (true), or the span ends, which redial does itself
+// when a reconnect limit runs out for outage down (false). Under
+// FailoverRotate an attempt dials the entry after the current one; under
+// FailoverPriority it is one pass over the list from the first entry.
+// The backoff continues from attempt; redial returns the attempts made
+// so far.
+func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int, down *outage) (bool, int) {
 	for {
 		delay := c.cfg.ReconnectBackoff.Delay(attempt)
+		if err := c.reconnectLimit(down, delay); err != nil {
+			c.stopReconnecting(life, err)
+			return false, attempt
+		}
 		select {
 		case <-c.cfg.clock.After(delay):
 		case <-life.shutdown:
@@ -759,6 +791,7 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			return false, attempt
 		}
 		attempt++
+		down.attempts++
 
 		dials := 1
 		if c.cfg.FailoverOrder == FailoverPriority {
@@ -770,6 +803,7 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			c.brokerIdx.Add(1)
 		}
 		fromList := false
+		var errs []error
 		for i := range dials {
 			if i > 0 {
 				// A callback may change the brokers, as in connectFirst.
@@ -782,11 +816,12 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			}
 			brokerURL, redirected := c.nextBrokerURL()
 			fromList = !redirected
-			result, live := c.tryBroker(life, attempt, brokerURL, cleanStart)
+			result, live, err := c.tryBroker(life, attempt, brokerURL, cleanStart)
 			if !live {
 				return false, attempt
 			}
 			if result == nil {
+				errs = append(errs, fmt.Errorf("%s: %w", brokerURL, err))
 				continue
 			}
 			if err := c.runConnection(life, result); err != nil {
@@ -794,29 +829,55 @@ func (c *Client) redial(life *lifecycle, cleanStart bool, attempt int) (bool, in
 			}
 			return true, attempt
 		}
+		down.last = errors.Join(errs...)
+	}
+}
+
+// reconnectLimit is the error that ends outage down when the next
+// attempt, after delay, would be past a reconnect limit, and nil while
+// the limits allow it.
+func (c *Client) reconnectLimit(down *outage, delay time.Duration) error {
+	elapsed := c.cfg.clock.Now().Sub(down.since)
+	tooMany := c.cfg.MaxReconnectAttempts > 0 && down.attempts >= c.cfg.MaxReconnectAttempts
+	tooLate := c.cfg.MaxReconnectTime > 0 && elapsed+delay > c.cfg.MaxReconnectTime
+	if !tooMany && !tooLate {
+		return nil
+	}
+	return &ReconnectLimitError{Attempts: down.attempts, Elapsed: elapsed, Err: down.last}
+}
+
+// stopReconnecting stops the client because a reconnect limit ran out,
+// unless a Disconnect stopped it first.
+func (c *Client) stopReconnecting(life *lifecycle, err error) {
+	if !c.quit(life, err) {
+		return
+	}
+	c.cfg.Logger.Error("mqttv5: reconnect limit reached; stopping the client", slog.Any("error", err))
+	if fn := c.cfg.OnReconnectLimit; fn != nil {
+		c.events.post(func() { fn(err) })
 	}
 }
 
 // tryBroker makes reconnect attempt's dial of brokerURL. It returns the
-// connection when the broker accepts it and nil when it fails; live is
-// false when the span ended.
-func (c *Client) tryBroker(life *lifecycle, attempt int, brokerURL string, cleanStart bool) (result *connectResult, live bool) {
+// connection when the broker accepts it, or nil and why it failed; live
+// is false when the span ended.
+func (c *Client) tryBroker(life *lifecycle, attempt int, brokerURL string, cleanStart bool) (result *connectResult, live bool, err error) {
 	if fn := c.cfg.OnReconnectAttempt; fn != nil {
 		c.events.post(func() { fn(attempt, brokerURL) })
 		if !c.events.flush(life.shutdown) {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	ctx, cancel := life.context(context.Background())
-	result, err := c.connectOnce(ctx, brokerURL, cleanStart)
+	result, err = c.connectOnce(ctx, brokerURL, cleanStart)
 	cancel()
 	if err == nil {
-		return result, true
+		return result, true, nil
 	}
 	select {
 	case <-life.shutdown:
 		// The span ended during the attempt and cut it short.
-		return nil, false
+		return nil, false, nil
 	default:
 	}
 	c.stats.addConnectFailure()
@@ -827,7 +888,7 @@ func (c *Client) tryBroker(life *lifecycle, attempt int, brokerURL string, clean
 		slog.Int("attempt", attempt),
 		slog.Any("error", err),
 	)
-	return nil, true
+	return nil, true, err
 }
 
 // sendDisconnectWith best-effort writes a graceful DISCONNECT carrying

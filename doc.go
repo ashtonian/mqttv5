@@ -63,7 +63,9 @@
 //     and alerting per attempt; [WithOnConnectionDown] returns false
 //     to terminate the supervisor.
 //   - [WithReconnectBackoff] takes an [ExponentialBackoff] with
-//     Initial, Max, Multiplier and Jitter.
+//     Initial, Max, Multiplier and Jitter; [WithMaxReconnectAttempts]
+//     and [WithMaxReconnectTime] stop a client whose outage outlasts
+//     them, reported through [WithOnReconnectLimit].
 //
 // The MQTT v5 client feature set: shared subscriptions, Subscription
 // Identifiers, topic aliases (in and out), session expiry and
@@ -77,8 +79,8 @@
 // The connection callbacks ([WithOnConnectionUp], [WithOnConnectionDown],
 // [WithOnConnectError], [WithOnReconnectAttempt],
 // [WithOnServerDisconnect], [WithOnServerRedirect],
-// [WithOnResubscribeError], [WithOnReauthenticated] and
-// [WithOnStoreFailure]) run one at a time, in the order of the events
+// [WithOnResubscribeError], [WithOnReauthenticated],
+// [WithOnStoreFailure] and [WithOnReconnectLimit]) run one at a time, in the order of the events
 // they report, on a goroutine of the client's own. They may call
 // [Client.Disconnect], [Client.Connect] and [Client.SetBrokers]. Before
 // each reconnect attempt, and before Connect tries the next broker, the
