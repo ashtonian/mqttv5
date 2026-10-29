@@ -910,7 +910,7 @@ func TestReconnectBackoffGrowsWhileConnectionsDieAtOnce(t *testing.T) {
 	var attempts []int
 	reconnected := make(chan struct{}, 8)
 	cli, err := New(WithBroker(b.URL()), WithClientID("backoff"), WithLogger(quietLogger()), WithoutKeepAlive(),
-		withClock(clk), WithReconnectBackoff(ExponentialBackoff(time.Second, 30*time.Second, 0)),
+		withClock(clk), WithReconnectBackoff(ExponentialBackoff{Initial: time.Second, Max: 30 * time.Second}),
 		WithOnReconnectAttempt(func(n int, _ string) {
 			mu.Lock()
 			attempts = append(attempts, n)

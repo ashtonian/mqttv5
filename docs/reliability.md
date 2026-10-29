@@ -21,7 +21,10 @@ until then `Publish` returns `ErrNotConnected` (with
 by its ctx), `Subscribe` waits for the connection, and a
 `QueuePublisher` keeps queuing.
 
-**Reconnect.** `ExponentialBackoff(1s, 30s, 200ms)` by default. With
+**Reconnect.** `ExponentialBackoff{Initial: 1s, Max: 30s, Jitter: 0.5}`
+by default: 1 s doubling to 30 s, each delay drawn from its upper half
+so that a fleet that lost its broker together does not return together
+([Backoff policies](reference.md#backoff-policies)). With
 `WithBrokers`, URLs rotate per attempt and a successful connect sticks;
 `WithFailoverOrder(FailoverPriority)` makes each attempt a pass over the
 list from the first URL instead.

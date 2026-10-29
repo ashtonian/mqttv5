@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/url"
 	"time"
@@ -76,12 +75,6 @@ const (
 	// [SubMaxQueueSize], removes the queue cap. A consumer that falls
 	// behind then grows memory without limit.
 	UnboundedQueue = -1
-)
-
-// DefaultReconnectBackoff is used when WithReconnectBackoff is not
-// called: 1s -> 2s -> 4s -> ... up to 30s with 200ms jitter.
-var DefaultReconnectBackoff = ExponentialBackoff(
-	time.Second, 30*time.Second, 200*time.Millisecond,
 )
 
 // Config carries the resolved configuration for a [Client]. Construct
@@ -291,8 +284,8 @@ type Config struct {
 	// supervisor retries after backoff and fires OnConnectError.
 	ConnectPacketBuilder func(ctx context.Context, opts *ConnectOptions) error
 
-	// ReconnectBackoff returns the delay before retry attempt N.
-	// Defaults to [DefaultReconnectBackoff].
+	// ReconnectBackoff is the delay before each reconnect attempt.
+	// Default [DefaultReconnectBackoff].
 	ReconnectBackoff Backoff
 
 	Logger *slog.Logger
@@ -855,15 +848,23 @@ func WithConnectPacketBuilder(fn func(ctx context.Context, opts *ConnectOptions)
 	}
 }
 
-// WithReconnectBackoff sets the supervisor's reconnect backoff: the
-// delay before each reconnect attempt, by attempt number. The count
-// starts over only once a connection has outlived the delay before it,
-// so a broker that drops connections right after accepting them is
-// retried at the growing interval rather than at the first one. See
-// [ConstantBackoff] and [ExponentialBackoff]; default
-// [DefaultReconnectBackoff].
+// WithReconnectBackoff sets the delay before each reconnect attempt, by
+// attempt number:
+//
+//	mqttv5.WithReconnectBackoff(mqttv5.ExponentialBackoff{
+//	    Initial: 500 * time.Millisecond, Max: time.Minute, Multiplier: 1.6, Jitter: 1,
+//	})
+//
+// The count starts over only once a connection has outlived the delay
+// before it, so a broker that drops connections right after accepting
+// them is retried at the growing interval rather than at the first one.
+// [New] rejects an invalid [ExponentialBackoff] or [ConstantBackoff].
+// Default [DefaultReconnectBackoff].
 func WithReconnectBackoff(b Backoff) Option {
 	return func(c *Config) error {
+		if err := validateBackoff(b); err != nil {
+			return fmt.Errorf("mqttv5: WithReconnectBackoff: %w", err)
+		}
 		c.ReconnectBackoff = b
 		return nil
 	}
@@ -1350,51 +1351,4 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mqttv5: CONNECT from these options: %w", err)
 	}
 	return nil
-}
-
-// Backoff returns the delay before retry attempt N. The first retry
-// after a failed connect is attempt 0 (the initial connect itself
-// runs immediately, no backoff). Implementations must be safe for
-// concurrent use.
-type Backoff func(attempt int) time.Duration
-
-// ConstantBackoff returns the same delay for every attempt.
-// Predictable but vulnerable to thundering-herd reconnect storms;
-// ExponentialBackoff is usually preferable.
-func ConstantBackoff(d time.Duration) Backoff {
-	return func(int) time.Duration { return d }
-}
-
-// ExponentialBackoff doubles min each attempt up to max with
-// ±jitter added (range [computed-jitter, computed+jitter]).
-func ExponentialBackoff(min, max, jitter time.Duration) Backoff {
-	if min <= 0 {
-		min = time.Second
-	}
-	if max < min {
-		max = min
-	}
-	return func(attempt int) time.Duration {
-		if attempt < 0 {
-			attempt = 0
-		}
-		// Cap shift at 30 to keep the math sane on absurd attempt counts.
-		shift := attempt
-		if shift > 30 {
-			shift = 30
-		}
-		d := min << shift
-		if d > max || d < min { // overflow guard
-			d = max
-		}
-		if jitter > 0 {
-			// Symmetric jitter in the range [-jitter, +jitter].
-			j := time.Duration(rand.Int64N(int64(jitter*2)+1)) - jitter
-			d += j
-		}
-		if d < 0 {
-			return 0
-		}
-		return d
-	}
 }
