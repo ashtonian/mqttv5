@@ -3,9 +3,9 @@ module github.com/ashtonian/mqttv5/queue/file
 go 1.27.2
 
 require (
-	github.com/ashtonian/mqttv5 v0.14.0
-	github.com/ashtonian/mqttv5/internal/filedb v0.14.0
-	github.com/ashtonian/mqttv5/store/file v0.14.0
+	github.com/ashtonian/mqttv5 v0.15.0
+	github.com/ashtonian/mqttv5/internal/filedb v0.15.0
+	github.com/ashtonian/mqttv5/store/file v0.15.0
 	go.etcd.io/bbolt v1.5.0
 )
 
