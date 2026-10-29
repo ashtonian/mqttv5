@@ -35,6 +35,9 @@ jobs:
   models:
     name: model-based tests
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    permissions:
+      contents: read
+      id-token: write
     runs-on: arc-mqttv5
     timeout-minutes: 90
     steps:
@@ -42,7 +45,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@470279e1ff775269324ca13b0aaaf7211951215e # v1.0.1
+      - uses: ashtonian/go-ci-actions@78710c0215622d4dd362f4c565de788934051488 # v1.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -63,6 +66,9 @@ jobs:
   conformance:
     name: conformance (${{ matrix.broker.name }})
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    permissions:
+      contents: read
+      id-token: write
     runs-on: arc-mqttv5
     timeout-minutes: 60
     strategy:
@@ -77,7 +83,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@470279e1ff775269324ca13b0aaaf7211951215e # v1.0.1
+      - uses: ashtonian/go-ci-actions@78710c0215622d4dd362f4c565de788934051488 # v1.1.0
         with:
           workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
