@@ -42,7 +42,7 @@ fmt.Printf("sent=%d acked=%d inflight=%d connects=%d failures=%d\n",
 | `PublishesAcked` | counter | PUBACK and PUBCOMP packets received, refusals included, and those for publishes whose caller stopped waiting |
 | `PublishesReplayed` | counter | QoS 1/2 publishes resent after a reconnect |
 | `PublishesInflight` | gauge | QoS 1/2 publishes waiting for their acknowledgement |
-| `SendQuota` | gauge | QoS 1/2 publishes the broker's Receive Maximum still allows in flight |
+| `SendQuota` | gauge | QoS 1/2 publishes the send quota still allows in flight: the broker's Receive Maximum, or `WithMaxInflight` when lower |
 | `InboundPublishes` | counter | PUBLISH packets received |
 | `InboundDropped` | counter | Received messages dropped because a subscription's buffer or queue was full |
 | `InboundUnrouted` | counter | Received messages no subscription matched: acked and dropped |
@@ -80,8 +80,9 @@ Worth alerting on:
 - `PoolConnected` below the pool size, or `PoolFallbacks` rising: pool
   members cannot connect.
 - `StoreErrors` or `ProtocolErrors` above zero.
-- `PublishesInflight` at the broker's Receive Maximum (`SendQuota` 0)
-  for long: the broker is not acknowledging.
+- `PublishesInflight` at the send quota (the broker's Receive Maximum,
+  or `WithMaxInflight`; `SendQuota` 0) for long: the broker is not
+  acknowledging.
 
 ## Logs
 
@@ -101,7 +102,7 @@ Normal message traffic logs nothing.
 |---|---|---|
 | `Connect` returns `ErrConnectRefused` | `errors.As(err, &rce)` for the CONNACK reason code | 0x86/0x87: credentials or authorization; 0x9C/0x9D: the broker redirects, see `WithFollowServerRedirects` |
 | Repeated reconnects | `Stats().Connects`, `ProtocolErrors`; Error logs | Protocol errors name the violation; a broker that sends harmless non-minimal lengths needs `WithLenientDecoding()` |
-| `Publish` blocks | `Stats().PublishesInflight` at the broker's Receive Maximum | The broker is not acknowledging; the call returns when it does or ctx ends |
+| `Publish` blocks | `Stats().PublishesInflight` at the send quota (`SendQuota` 0): the broker's Receive Maximum, or `WithMaxInflight` | The broker is not acknowledging, or acknowledges slower than the client publishes; the call returns when it does or ctx ends. A low `WithMaxInflight` throttles on purpose |
 | QoS 1/2 `Publish` slow while subscriptions are busy | how long `SubscribeCallback` handlers and `SubOnDrop` hooks take | They run on the read loop that also reads this client's publish acknowledgements: move slow work to a channel or queue subscription, or publish through a [publish pool](publisher-pool.md#publish-pool-withpublisherpool) |
 | `ErrWriteQueueFull` | `WithWriteOverflowPolicy(WriteDropNewest)` is set and the writer is behind | Raise `WithWriteQueueSize`, or use the default blocking policy |
 | Typed messages missing; Warn log `payload decode failed` | `Stats().DecodeFailures`; the topic in the log; `SubOnDecodeError` | The publisher sends another format or shape than the subscription's `Encoding` and type expect: fix the publisher, or use `SubEncoding` / another type for that topic |

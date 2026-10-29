@@ -147,6 +147,11 @@ type Config struct {
 	SessionExpiry  uint32
 	ReceiveMaximum uint16
 
+	// MaxInflight caps the QoS 1/2 PUBLISHes the client has sent and not
+	// had acknowledged, per connection, below the broker's Receive
+	// Maximum. Zero (the default) leaves the broker's limit alone.
+	MaxInflight uint16
+
 	// MaximumPacketSize caps the largest packet the broker may send
 	// to this client (§3.1.2.11.4). Zero advertises no limit. A larger
 	// packet closes the connection with DISCONNECT 0x95.
@@ -623,10 +628,29 @@ func WithSessionExpiry(s uint32) Option {
 // subscription whose consumer falls behind can hold beyond its buffer,
 // and what that costs in memory (see [Client.Subscribe]). A broker that
 // sends more is disconnected with reason 0x93. Default
-// [DefaultReceiveMaximum]; 0 keeps the default.
+// [DefaultReceiveMaximum]; 0 keeps the default. It does not limit what
+// the client sends: see [WithMaxInflight].
 func WithReceiveMaximum(n uint16) Option {
 	return func(c *Config) error {
 		c.ReceiveMaximum = n
+		return nil
+	}
+}
+
+// WithMaxInflight caps how many QoS 1/2 messages the client has sent
+// and not had acknowledged at n, when n is below the broker's Receive
+// Maximum (CONNACK, §3.2.2.3.3), which caps them otherwise; a send
+// quota may be lower than the Receive Maximum but never higher
+// [MQTT-4.9.0-1], so a larger n changes nothing. Publishes beyond it
+// wait for an acknowledgement, bounded by their ctx. It bounds what an
+// unacknowledged burst costs the broker and the time a message waits
+// behind it on the wire. Each connection has its own quota, so a
+// publisher pool member also sends up to n. [WithReceiveMaximum] is the
+// limit in the other direction, on what the broker sends. 0, the
+// default, leaves the broker's limit alone.
+func WithMaxInflight(n uint16) Option {
+	return func(c *Config) error {
+		c.MaxInflight = n
 		return nil
 	}
 }

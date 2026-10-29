@@ -38,7 +38,7 @@
 | `WithSessionExpiry(seconds)` | 300 (5 min) | Session Expiry Interval ([§3.1.2.11.2]). Pass 0 to end the session with the connection. A broker override in CONNACK is honoured. |
 | `WithSessionLossPolicy(p)` | `SessionLossRepublish` | What happens to unacknowledged QoS 1/2 publishes when a connection starts without the session (Session Present = 0): `SessionLossRepublish` sends them again as new messages in their original order; `SessionLossFail` completes them with `ErrSessionLost`. |
 | `WithStore(s)` | none (in memory) | `session.Store` that persists session state across restarts (use `store/file`). Without it, state survives reconnects only. A failed write of a new message's record fails that `Publish`; any other failed write stops the client (see [Store failures](operations.md#store-failures)). |
-| `WithReceiveMaximum(n)` | 256 (`DefaultReceiveMaximum`) | QoS 1/2 messages the broker may send unacknowledged, and so how many a subscription whose consumer falls behind holds beyond its buffer. A broker that exceeds it is disconnected with reason 0x93. |
+| `WithReceiveMaximum(n)` | 256 (`DefaultReceiveMaximum`) | QoS 1/2 messages the broker may send unacknowledged, and so how many a subscription whose consumer falls behind holds beyond its buffer. A broker that exceeds it is disconnected with reason 0x93. Limits the broker, not the client's own publishes (`WithMaxInflight`). |
 | `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property [§3.1.2.11.4] — caps the largest packet the broker may send. See note below. |
 | `WithInboundTopicAliasMaximum(n)` | 0 (no inbound aliases) | CONNECT property [§3.1.2.11.5] — opt into wire compression on inbound PUBLISHes. An alias the broker sends outside 1..n closes the connection (`0x94`). |
 | `WithOutboundTopicAliases()` | off | Replace repeated QoS 0 topics with topic aliases within the broker's Topic Alias Maximum. |
@@ -141,6 +141,7 @@ the main connection stands and stop with it.
 | `WithPublisherPoolRouting(p)` | `PoolRoutingRoundRobin` | `PoolRoutingHashByTopic` preserves per-topic ordering. |
 | `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"`; empty (broker-assigned) when the parent ClientID is | Each member's ClientID from the parent's and a 1-based index, e.g. to fit a broker ACL pattern. IDs must be unique across every client of the broker. |
 | `WithEncoding(e)` | none | The `Encoding` of the typed calls (`PublishValue`, `SubscribeAs` and their variants), e.g. `jsoncodec.Encoding{}`; without one they return `ErrNoEncoding` ([Typed publish / subscribe](typed-payloads.md#typed-publish--subscribe)). |
+| `WithMaxInflight(n)` | 0 (the broker's Receive Maximum) | QoS 1/2 publishes in flight at once, per connection: the lower of n and the broker's Receive Maximum. The spec lets a client send fewer than the Receive Maximum, never more ([MQTT-4.9.0-1]), so an n above it changes nothing. Further publishes wait, bounded by their ctx. Publisher pool members inherit it. |
 | `WithQoSDowngrade()` | off | Send a publish whose QoS exceeds the broker's Maximum QoS at that maximum instead of failing it with `ErrQoSNotSupported`. Weakens the guarantee (QoS 2 becomes at-least-once). |
 
 > **Broker limits.** Checked before a packet is written; see
@@ -228,7 +229,7 @@ after five seconds.
 
 | Option | Type | Default | Effect |
 |---|---|---|---|
-| `WithQueueWindow(n)` | `int` | 32 (`DefaultQueueWindow`) | Messages in flight at once; the broker's Receive Maximum still applies. Must be ≥ 1. |
+| `WithQueueWindow(n)` | `int` | 32 (`DefaultQueueWindow`) | Messages in flight at once; the broker's Receive Maximum and `WithMaxInflight` still apply. Must be ≥ 1. |
 | `WithQueueMaxSize(n)` | `int` | 0 (unbounded) | Bound on queued messages, enforced atomically by the queue. |
 | `WithQueueDropPolicy(p)` | `DropPolicy` | `DropNewest` | At the bound: `DropNewest` returns `ErrQueueFull`; `DropOldest` evicts the oldest messages not in flight and dead-letters them. |
 | `WithQueueTTL(d)` | `time.Duration` | 0 (none) | Longest a message may wait, from `Publish`; the remaining lifetime is sent as Message Expiry Interval. |
@@ -364,3 +365,4 @@ mqttv5 is pre-1.0: any minor release may change the API.
 [§3.2.2.3.14]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901094 "3.2.2.3.14 Server Keep Alive"
 [§4.12]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901256 "4.12 Enhanced authentication"
 [MQTT-3.14.2-2]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901211 "3.14.2.2.2 Session Expiry Interval"
+[MQTT-4.9.0-1]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901251 "4.9 Flow Control"

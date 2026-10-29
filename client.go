@@ -661,7 +661,7 @@ type Stats struct {
 	PublishesSent     uint64 // Publish calls that returned nil (QoS 1/2 once acknowledged), and QueuePublisher messages the broker accepted
 	PublishesAcked    uint64 // PUBACK and PUBCOMP packets received, refusals included
 	PublishesInflight uint64 // QoS 1/2 outbound entries awaiting ack
-	SendQuota         uint64 // QoS 1/2 PUBLISHes the broker's Receive Maximum still allows in flight
+	SendQuota         uint64 // QoS 1/2 PUBLISHes the send quota (the broker's Receive Maximum, or MaxInflight) still allows in flight
 	PublishesReplayed uint64 // QoS 1/2 replays issued after reconnect
 
 	InboundPublishes uint64 // PUBLISHes received from the broker

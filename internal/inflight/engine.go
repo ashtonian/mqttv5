@@ -121,7 +121,9 @@ type Config struct {
 // ConnInfo describes a connection that has just completed CONNACK.
 type ConnInfo struct {
 	SessionPresent bool
-	// ReceiveMaximum is the server's limit from CONNACK; 0 means 65,535.
+	// ReceiveMaximum caps the QoS 1/2 PUBLISHes sent and not yet
+	// acknowledged on the connection: the server's limit from CONNACK, or
+	// a lower one of the client's own; 0 means 65,535.
 	ReceiveMaximum uint16
 	// Limits, when non-nil, are the broker's packet limits. Unsent
 	// messages that break them are failed rather than sent.

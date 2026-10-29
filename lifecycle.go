@@ -528,9 +528,13 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		_ = r.conn.Close()
 		return err
 	}
+	sendMax := r.info.ReceiveMaximum
+	if m := c.cfg.MaxInflight; m > 0 && m < sendMax {
+		sendMax = m
+	}
 	gen, held, err := c.engine.Connected(inflight.ConnInfo{
 		SessionPresent: r.info.SessionPresent,
-		ReceiveMaximum: r.info.ReceiveMaximum,
+		ReceiveMaximum: sendMax,
 		Limits: &inflight.Limits{
 			MaximumQoS:        r.info.MaximumQoS,
 			RetainAvailable:   r.info.RetainAvailable,

@@ -56,8 +56,12 @@ before anything is written:
 - retain with Retain Available = 0 → `ErrRetainNotSupported`;
 - a packet above Maximum Packet Size → `ErrPacketTooLarge`.
 
-At most Receive Maximum QoS 1/2 publishes are in flight; further ones
-wait, bounded by ctx (`Stats().SendQuota` shows the headroom). Stored
+At most Receive Maximum QoS 1/2 publishes are in flight, or fewer with
+`WithMaxInflight(n)`; further ones wait, bounded by ctx
+(`Stats().SendQuota` shows the headroom). The client may send fewer
+than the broker's Receive Maximum, never more ([MQTT-4.9.0-1]). Stored
 messages that a reconnect to a stricter broker rules out complete with
 the same errors. `Client.ServerInfo()` returns everything the broker
 granted.
+
+[MQTT-4.9.0-1]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901251 "4.9 Flow Control"
