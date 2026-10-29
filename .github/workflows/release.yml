@@ -63,15 +63,21 @@ jobs:
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: arc-mqttv5
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
+      # The runner image has no gh CLI; github-script runs on the
+      # runner's own Node.
       - name: create release with auto-generated notes
+        uses: actions/github-script@v9
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            --verify-tag
+          TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            // createRelease would make a missing tag from the default
+            // branch; the release must be of the tag that was gated.
+            await github.rest.git.getRef({ ...context.repo, ref: `tags/${tag}` });
+            await github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: tag,
+              name: tag,
+              generate_release_notes: true,
+            });
