@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package testbroker is a scripted MQTT v5 peer for tests. Each accepted
 // connection runs the next Script in order; connections beyond the scripted
 // ones run the fallback (by default an auto-responder that accepts CONNECT and

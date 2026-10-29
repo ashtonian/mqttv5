@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Failover example: one client over several interchangeable brokers.
 // It connects to whichever accepts it, subscribes, and publishes once a
 // second; stop the broker it reports and watch it move to the next.

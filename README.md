@@ -143,5 +143,5 @@ disconnecting, optional modules and dependencies.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Independent,
-clean-room implementation of the [MQTT v5.0 specification](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).
+Apache 2.0 — see [LICENSE](LICENSE). Independent, clean-room implementation of
+the [MQTT v5.0 specification](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).

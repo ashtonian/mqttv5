@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package file is a file-backed [session.Store]: the in-flight QoS 1/2
 // state of an mqttv5 client survives process crashes and, depending on
 // the [SyncPolicy], power loss.

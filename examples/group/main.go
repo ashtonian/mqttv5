@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Group example: a central service for devices split across independent
 // clusters, acknowledged in the application as a device shadow or a
 // command RPC is. Each device connects to one cluster; the service keeps

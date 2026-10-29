@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package soak sizes the randomized tests. By default a test runs its
 // own number of seeds starting at 0; the nightly soak workflow sets
 // MQTTV5_SEEDS and MQTTV5_SEED_BASE to run many more, starting

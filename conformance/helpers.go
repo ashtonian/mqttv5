@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 //go:build conformance
 
 // Package conformance houses tests that run mqttv5 against a real

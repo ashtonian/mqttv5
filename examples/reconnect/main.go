@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Reconnect example: shows the supervisor surviving a broker restart.
 // Connects, subscribes, then publishes once per second. The full
 // operator-hook set (OnConnectionUp / OnConnectionDown /

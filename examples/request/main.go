@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Request example: MQTT 5 request/response. A responder serves
 // requests/price on a shared subscription, so several can share the
 // load; a requester sends each request with a Response Topic of its own

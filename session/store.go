@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package session defines how an MQTT v5 client persists its session
 // state: the [Store] contract, the [Record]s it holds, and [MemoryStore],
 // an in-memory reference implementation.

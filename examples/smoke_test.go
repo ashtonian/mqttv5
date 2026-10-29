@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 //go:build smoke
 
 // Package examples_test runs every example program against the brokers

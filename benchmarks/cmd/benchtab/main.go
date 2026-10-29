@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Command benchtab renders the benchmark tables in Markdown files from
 // raw `go test -bench` output recorded by scripts/run.sh, so every
 // published number comes from a recording; each table's footnote names

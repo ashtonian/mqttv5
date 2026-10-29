@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package wire implements the MQTT v5 wire-format codec. It is the
 // foundation layer of the mqttv5 client and is the only package that
 // touches packet bytes directly.

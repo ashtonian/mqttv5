@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package file is a file-backed [mqttv5.PublisherQueue]: messages a
 // [mqttv5.QueuePublisher] accepted survive process crashes and,
 // depending on the [SyncPolicy], power loss.

@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // Package transport abstracts the network layer underneath the MQTT v5
 // client. The Conn interface is io.ReadWriteCloser + the three deadline
 // methods that net.Conn exposes, which is everything the client needs

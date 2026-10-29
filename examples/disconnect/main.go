@@ -1,5 +1,3 @@
-// Copyright 2026 Ashton Kinslow. SPDX-License-Identifier: Apache-2.0
-
 // DisconnectWith example: send a custom DISCONNECT with a reason
 // code, ReasonString, and a SessionExpiryInterval override.
 //
