@@ -145,3 +145,7 @@ disconnecting, optional modules and dependencies.
 
 Apache 2.0 — see [LICENSE](LICENSE). Independent, clean-room implementation of
 the [MQTT v5.0 specification](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).
+
+## CI artifact storage
+
+Benchmark and nightly reports use the shared [SeaweedFS artifact actions](https://github.com/ashtonian/go-ci-actions/blob/v1.3.0/docs/artifacts.md). Configure the repository variable `CI_ARTIFACT_ENDPOINT`; jobs authenticate using GitHub OIDC without long-lived storage keys. Existing artifact names and explicit retention are preserved. Job summaries record S3 URIs and SHA-256 digests; retrieve new reports with the shared download action or authenticated operator S3 access. Historical GitHub artifacts remain available through `gh run download` until their expiry. The `Artifact storage` check verifies runner access and exact byte/layout round trips when CI configuration changes.
