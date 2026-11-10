@@ -47,7 +47,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@78710c0215622d4dd362f4c565de788934051488 # v1.1.0
+      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -85,7 +85,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@78710c0215622d4dd362f4c565de788934051488 # v1.1.0
+      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
         with:
           workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
@@ -134,7 +134,7 @@ jobs:
             | xargs docker inspect --format '{{.Name}} {{.State.Status}} exit={{.State.ExitCode}} oom-killed={{.State.OOMKilled}}'
           docker compose -f conformance/docker-compose.yml --profile hivemq logs --no-color
 
-      - uses: ashtonian/go-ci-actions/upload-artifact@07fbac1477e5c6befebba17cb7326daff639ff25 # v1.3.0
+      - uses: ashtonian/go-ci-actions/upload-artifact@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
         if: always()
         with:
           name: broker-memory-${{ matrix.broker.name }}
