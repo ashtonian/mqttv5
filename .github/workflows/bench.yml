@@ -44,7 +44,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@78710c0215622d4dd362f4c565de788934051488 # v1.1.0
+      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -69,7 +69,7 @@ jobs:
             -bench '^BenchmarkE2E_SlowConsumer$' -benchtime 200000x -timeout 1h
         working-directory: benchmarks
 
-      - uses: ashtonian/go-ci-actions/upload-artifact@07fbac1477e5c6befebba17cb7326daff639ff25 # v1.3.0
+      - uses: ashtonian/go-ci-actions/upload-artifact@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
         if: always()
         with:
           name: e2e-bench-${{ github.run_id }}

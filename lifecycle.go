@@ -919,10 +919,20 @@ func (c *Client) sendDisconnectWith(ctx context.Context, opts wire.DisconnectOpt
 		return
 	}
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			c.logDisconnectNotWritten(opts, err)
+		}
 	case <-ctx.Done():
 	case <-cs.dying:
 	}
+}
+
+// logDisconnectNotWritten records a best-effort DISCONNECT the writer
+// failed to send; the connection goes down either way.
+func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
+	c.cfg.Logger.Debug("mqttv5: DISCONNECT not written",
+		slog.Int("reason", int(opts.ReasonCode)), slog.Any("error", err))
 }
 
 // writeConnect emits the CONNECT packet directly against w (used during
