@@ -95,7 +95,10 @@ func (c *Client) writeDisconnectAndClose(cs *connState, opts wire.DisconnectOpts
 			slog.Int("reason", int(opts.ReasonCode)), slog.Any("error", err))
 	} else {
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				c.logDisconnectNotWritten(opts, err)
+			}
 		case <-c.cfg.clock.After(c.cfg.DisconnectFlushTimeout):
 		case <-cs.dying:
 		}
