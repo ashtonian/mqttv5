@@ -18,6 +18,7 @@ import (
 	"github.com/gobwas/ws/wsutil"
 
 	"github.com/ashtonian/mqttv5/internal/testpki"
+	"github.com/ashtonian/mqttv5/transport"
 )
 
 // startEchoWS spins up an HTTP server that upgrades each connection
@@ -144,6 +145,39 @@ func TestWssVerification(t *testing.T) {
 			}
 			conn.Close()
 		})
+	}
+}
+
+// A wss:// connection reports its TLS handshake; a ws:// one reports
+// none.
+func TestConnectionState(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+	conn, err := Dial(context.Background(), u, DialOpts{TLSConfig: &tls.Config{RootCAs: certPool(srv.Certificate())}})
+	if err != nil {
+		t.Fatalf("wss:// dial: %v", err)
+	}
+	defer conn.Close()
+	state, ok := transport.TLSState(conn)
+	if !ok || len(state.PeerCertificates) == 0 || !state.PeerCertificates[0].Equal(srv.Certificate()) {
+		t.Fatalf("wss:// TLSState = %v; want the server's certificate", ok)
+	}
+
+	base, cleanup := startEchoWS(t)
+	defer cleanup()
+	plain, err := Dial(context.Background(), base, DialOpts{})
+	if err != nil {
+		t.Fatalf("ws:// dial: %v", err)
+	}
+	defer plain.Close()
+	if _, ok := transport.TLSState(plain); ok {
+		t.Fatal("ws:// reports TLS state")
 	}
 }
 

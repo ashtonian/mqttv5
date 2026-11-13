@@ -75,7 +75,7 @@ control queue that survives reconnects.
 
 | Path | What |
 |---|---|
-| `client.go` | `Client`, `New`, `ServerInfo` (what CONNACK granted), `Stats` counters |
+| `client.go` | `Client`, `New`, `ServerInfo` (the broker reached, the TLS handshake, what CONNACK granted), `Stats` counters |
 | `options.go` | `Config`, every `With…` option |
 | `backoff.go` | `Backoff` and the policies: `ExponentialBackoff`, `ConstantBackoff`, `BackoffFunc` |
 | `lifecycle.go` | `Connect`/`Disconnect`, the supervisor and its reconnect limits, lifecycle callbacks and their queue, server redirects |

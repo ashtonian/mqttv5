@@ -74,3 +74,25 @@ dial path that builds its config per dial: `WithDialFunc` around
 
 **Protocol version.** Go's client accepts TLS 1.2 and later by default.
 Set `MinVersion: tls.VersionTLS13` when every broker supports it.
+
+**Inspecting the connection.** `ConnackInfo.TLS`, in
+`WithOnConnectionUp` and `ServerInfo()`, is the handshake's
+`tls.ConnectionState`: the broker's certificate chain as presented
+(`PeerCertificates`) and as verified (`VerifiedChains`), the negotiated
+version, cipher suite and ALPN protocol, and any stapled OCSP response.
+It is nil without TLS. Use it to record which certificate a broker
+presented, or to warn before it expires:
+
+```go
+mqttv5.WithOnConnectionUp(func(info mqttv5.ConnackInfo) {
+    if info.TLS == nil {
+        return
+    }
+    leaf := info.TLS.PeerCertificates[0]
+    slog.Info("broker certificate", "broker", info.Broker,
+        "subject", leaf.Subject.String(), "not_after", leaf.NotAfter)
+})
+```
+
+A custom `WithDialFunc` transport reports its TLS state by implementing
+`transport.ConnectionStater` on the connection it returns.

@@ -1282,6 +1282,9 @@ func WithDialer(d *net.Dialer) Option {
 // returns a value directly usable here:
 //
 //	mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg}))
+//
+// A connection that implements [transport.ConnectionStater] reports its
+// TLS handshake in [ConnackInfo].TLS; transport/ws connections do.
 func WithDialFunc(fn transport.DialFunc) Option {
 	return func(c *Config) error {
 		if fn == nil {
