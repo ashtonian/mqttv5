@@ -51,6 +51,12 @@ var _ Conn = (net.Conn)(nil)
 // caller writing the signature out longhand.
 type DialFunc func(ctx context.Context, brokerURL *url.URL) (Conn, error)
 
+// TLSConfigFunc returns the TLS config for one dial of brokerURL. It
+// runs before the TCP dial, bounded by ctx, so it may load certificates
+// from disk or a secret store. A nil config with a nil error is
+// [ErrNilTLSConfig]. The config must not be modified once returned.
+type TLSConfigFunc func(ctx context.Context, brokerURL *url.URL) (*tls.Config, error)
+
 // DialOpts customises a Dial call. Zero value is valid (uses system
 // defaults).
 type DialOpts struct {
@@ -74,7 +80,27 @@ var (
 	// ErrMissingHost is returned when the URL parses but lacks a host
 	// component.
 	ErrMissingHost = errors.New("mqttv5/transport: URL has no host")
+
+	// ErrNilTLSConfig is returned when a [TLSConfigFunc] returns
+	// neither a config nor an error.
+	ErrNilTLSConfig = errors.New("mqttv5/transport: TLSConfigFunc returned a nil config")
 )
+
+// IsTLSScheme reports whether [Dial] negotiates TLS for scheme: mqtts,
+// tls or ssl.
+func IsTLSScheme(scheme string) bool {
+	switch scheme {
+	case "mqtts", "tls", "ssl":
+		return true
+	}
+	return false
+}
+
+// IsTCPScheme reports whether [Dial] opens a plain TCP connection for
+// scheme: mqtt or tcp. Dial also treats an empty scheme as TCP.
+func IsTCPScheme(scheme string) bool {
+	return scheme == "mqtt" || scheme == "tcp"
+}
 
 // Dial parses rawURL and dispatches to the matching transport. ctx
 // controls the dial deadline.
@@ -89,10 +115,10 @@ func Dial(ctx context.Context, rawURL string, opts DialOpts) (Conn, error) {
 
 	addr := defaultPort(u)
 
-	switch u.Scheme {
-	case "mqtt", "tcp", "":
+	switch {
+	case IsTCPScheme(u.Scheme) || u.Scheme == "":
 		return DialTCP(ctx, addr, opts)
-	case "mqtts", "tls", "ssl":
+	case IsTLSScheme(u.Scheme):
 		return DialTLS(ctx, addr, hostname(u), opts)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownScheme, u.Scheme)
@@ -105,12 +131,10 @@ func defaultPort(u *url.URL) string {
 	if u.Port() != "" {
 		return u.Host
 	}
-	switch u.Scheme {
-	case "mqtts", "tls", "ssl":
+	if IsTLSScheme(u.Scheme) {
 		return net.JoinHostPort(u.Hostname(), "8883")
-	default:
-		return net.JoinHostPort(u.Hostname(), "1883")
 	}
+	return net.JoinHostPort(u.Hostname(), "1883")
 }
 
 // hostname returns the host without any port, suitable for use as the

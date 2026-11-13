@@ -2,6 +2,7 @@ package mqttv5
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -304,20 +305,35 @@ type connectResult struct {
 	connectExpiry uint32
 }
 
-// dial resolves the broker URL to a live transport.Conn. If a custom
-// DialFunc is configured it takes precedence and is given a parsed
-// *url.URL so the implementation doesn't re-parse. Otherwise the
-// built-in transport.Dial handles TCP and TLS schemes.
+// dial resolves the broker URL to a live transport.Conn. A custom
+// DialFunc is given a parsed *url.URL so the implementation doesn't
+// re-parse. Otherwise the built-in transport.Dial handles TCP and TLS
+// schemes, with the TLS config from TLSConfigFunc when one is set.
 func (c *Client) dial(ctx context.Context, brokerURL string) (transport.Conn, error) {
+	if c.cfg.DialFunc == nil && c.cfg.TLSConfigFunc == nil {
+		return transport.Dial(ctx, brokerURL, transport.DialOpts{
+			TLSConfig: c.cfg.TLSConfig,
+			Dialer:    c.cfg.Dialer,
+		})
+	}
+	u, err := url.Parse(brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse broker URL: %w", err)
+	}
 	if c.cfg.DialFunc != nil {
-		u, err := url.Parse(brokerURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse broker URL: %w", err)
-		}
 		return c.cfg.DialFunc(ctx, u)
 	}
+	var tlsCfg *tls.Config
+	if transport.IsTLSScheme(u.Scheme) {
+		if tlsCfg, err = c.cfg.TLSConfigFunc(ctx, u); err != nil {
+			return nil, fmt.Errorf("TLS config: %w", err)
+		}
+		if tlsCfg == nil {
+			return nil, fmt.Errorf("TLS config: %w", transport.ErrNilTLSConfig)
+		}
+	}
 	return transport.Dial(ctx, brokerURL, transport.DialOpts{
-		TLSConfig: c.cfg.TLSConfig,
+		TLSConfig: tlsCfg,
 		Dialer:    c.cfg.Dialer,
 	})
 }

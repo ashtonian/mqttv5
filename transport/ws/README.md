@@ -40,6 +40,9 @@ the MQTT byte stream in WebSocket binary frames:
 - **TLS.** `wss://` verifies the broker against the system roots unless
   `DialOpts.TLSConfig` says otherwise, like `mqtts://`; the URL's host is
   the server name when `TLSConfig.ServerName` is empty.
+  `DialOpts.TLSConfigFunc` instead supplies the config on each `wss://`
+  dial, so a long-lived `DialFunc` can rotate trusted roots or client
+  certificates.
 
 `mqttv5.New` rejects `ws://` and `wss://` broker URLs unless
 `WithDialFunc` is set.
@@ -50,7 +53,8 @@ the MQTT byte stream in WebSocket binary frames:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `TLSConfig` | `*tls.Config` | system roots, server name from the URL | TLS for `wss://`; ignored for `ws://`. |
+| `TLSConfig` | `*tls.Config` | system roots, server name from the URL | TLS for `wss://`; ignored for `ws://`. Excludes `TLSConfigFunc`. |
+| `TLSConfigFunc` | `transport.TLSConfigFunc` | none | Called on each `wss://` dial, before the TCP dial and bounded by the dial's `ctx`, for the config `TLSConfig` would give. An error fails the dial wrapped; a nil config fails it with `transport.ErrNilTLSConfig`. Not called for `ws://`. Setting both it and `TLSConfig` fails `Dial` with `ErrConflictingTLSConfig`. |
 | `HTTPHeaders` | `http.Header` | none | Added to the upgrade request: auth tokens, routing headers. |
 | `Subprotocols` | `[]string` | `["mqtt"]` | `Sec-WebSocket-Protocol` values offered. |
 | `HandshakeTimeout` | `time.Duration` | `DefaultHandshakeTimeout` (10 s) | Bound on the upgrade handshake. The client's connect timeout (`mqttv5.WithConnectTimeout`) bounds the whole attempt as well. |
@@ -77,6 +81,7 @@ The URL's path and query go into the upgrade request
 | `DefaultHandshakeTimeout` | 10 s. |
 | `DefaultCloseFrameTimeout` | 1 s. |
 | `ErrTextFrame` | The broker sent a text frame. |
+| `ErrConflictingTLSConfig` | `DialOpts` sets both `TLSConfig` and `TLSConfigFunc`. |
 | `Conn` | The `transport.Conn` that `Dial` returns; treat it as opaque. |
 
 ## Build, run, test
@@ -87,7 +92,7 @@ go -C transport/ws test -race ./...
 
 The tests run against an in-process WebSocket server: round trips,
 byte-at-a-time reads, ping/pong under concurrent writes, broker Close,
-text frames, closing during a stalled write, and TLS verification. [`examples/ws`](../../examples/ws)
+text frames, closing during a stalled write, TLS verification and the per-dial `TLSConfigFunc`. [`examples/ws`](../../examples/ws)
 connects to a real broker.
 
 ## Operations
@@ -95,7 +100,8 @@ connects to a real broker.
 | Symptom | Check | Then |
 |---|---|---|
 | `dial … : unexpected HTTP response status` | the URL path and the broker's WebSocket listener | Most brokers serve MQTT on a path such as `/mqtt`. |
-| `x509: certificate signed by unknown authority` | the broker's certificate chain | Add its CA to `DialOpts.TLSConfig.RootCAs`. |
+| `x509: certificate signed by unknown authority` | the broker's certificate chain | Add its CA to `DialOpts.TLSConfig.RootCAs`, or to the roots `TLSConfigFunc` returns. |
+| `mqttv5/transport/ws: DialOpts sets both TLSConfig and TLSConfigFunc` | `DialOpts` | Set one: `TLSConfigFunc` for a config per dial, `TLSConfig` for a fixed one. |
 | Connections drop every few minutes behind a proxy | the proxy's idle timeout and whether it pings | Pings are answered; lower `mqttv5.WithKeepAlive` below the proxy's idle timeout. |
 | The broker logs connections ending without a Close frame | whether the client was writing when it closed | Expected when a write was in progress or the broker stopped reading: `Close` does not wait for a write, and sends the Close frame for at most `CloseFrameTimeout`. |
 | `ErrTextFrame` | the broker or a proxy injecting text frames | MQTT over WebSocket allows binary frames only; fix the peer. |

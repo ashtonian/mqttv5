@@ -1,8 +1,13 @@
-package readme
+// Package security holds the Go snippets of docs/security.md. It is its
+// own package because they import net/url, whose name the readme
+// package uses for a variable.
+package security
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"net/url"
 	"sync/atomic"
 )
 
@@ -25,5 +30,12 @@ func rotatingClientCertificate(pool *x509.CertPool) {
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return current.Load(), nil
 		},
+	})
+}
+
+func rotatingRoots() {
+	var roots atomic.Pointer[x509.CertPool] // replaced when the CA bundle changes
+	mqttv5.WithTLSConfigFunc(func(ctx context.Context, broker *url.URL) (*tls.Config, error) {
+		return &tls.Config{RootCAs: roots.Load(), MinVersion: tls.VersionTLS13}, nil
 	})
 }

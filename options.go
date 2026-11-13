@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/ashtonian/mqttv5/internal/clock"
@@ -317,11 +318,18 @@ type Config struct {
 	// has stopped because of it (see [WithStore]). Runs with the other lifecycle callbacks (see the package documentation).
 	OnStoreFailure func(err error)
 
+	// TLSConfig is the TLS config for every mqtts:// / tls:// / ssl://
+	// dial. At most one of TLSConfig and TLSConfigFunc is set.
 	TLSConfig *tls.Config
-	Dialer    *net.Dialer
 
-	// DialFunc replaces the built-in TCP/TLS dial path. Takes
-	// precedence over TLSConfig and Dialer. Use for SOCKS / mTLS /
+	// TLSConfigFunc returns the TLS config for each TLS dial (see
+	// [WithTLSConfigFunc]).
+	TLSConfigFunc transport.TLSConfigFunc
+
+	Dialer *net.Dialer
+
+	// DialFunc replaces the built-in TCP/TLS dial path, so it excludes
+	// TLSConfig, TLSConfigFunc and Dialer. Use for SOCKS / mTLS /
 	// WebSocket (see transport/ws) / in-memory test transports.
 	// When set, broker URL scheme validation is skipped.
 	DialFunc transport.DialFunc
@@ -1254,11 +1262,30 @@ func WithOnStoreFailure(fn func(err error)) Option {
 	}
 }
 
-// WithTLSConfig supplies a [*tls.Config] for mqtts:// / tls:// dials.
-// Ignored for plain TCP schemes.
+// WithTLSConfig supplies a [*tls.Config] for mqtts:// / tls:// / ssl://
+// dials, used for every dial of every broker. Ignored for plain TCP
+// schemes. New rejects it beside [WithTLSConfigFunc] or [WithDialFunc].
 func WithTLSConfig(t *tls.Config) Option {
 	return func(c *Config) error {
 		c.TLSConfig = t
+		return nil
+	}
+}
+
+// WithTLSConfigFunc calls fn for the TLS config of each mqtts:// /
+// tls:// / ssl:// dial, before the TCP dial and under the attempt's
+// ConnectTimeout. Use it to rotate trusted roots without a new client,
+// or to trust each broker of [WithBrokers] differently. An error from
+// fn, or a nil config ([transport.ErrNilTLSConfig]), fails the attempt,
+// which is retried like a dial failure. fn is not called for plain TCP
+// schemes. New rejects it beside [WithTLSConfig] or [WithDialFunc]; nil
+// is rejected.
+func WithTLSConfigFunc(fn transport.TLSConfigFunc) Option {
+	return func(c *Config) error {
+		if fn == nil {
+			return errors.New("mqttv5: WithTLSConfigFunc(nil) is invalid")
+		}
+		c.TLSConfigFunc = fn
 		return nil
 	}
 }
@@ -1271,11 +1298,12 @@ func WithDialer(d *net.Dialer) Option {
 	}
 }
 
-// WithDialFunc replaces the built-in TCP/TLS dial path. Takes
-// precedence over [WithDialer] / [WithTLSConfig]. Use for SOCKS /
-// HTTP proxies, per-dial mTLS, WebSocket (transport/ws), or
-// in-memory test transports. ctx is bounded by ConnectTimeout.
-// When set, broker URL scheme validation is skipped. Nil rejected.
+// WithDialFunc replaces the built-in TCP/TLS dial path. The dial is
+// then entirely fn's, so New rejects it beside [WithDialer],
+// [WithTLSConfig] or [WithTLSConfigFunc]: configure TLS inside fn. Use
+// for SOCKS / HTTP proxies, WebSocket (transport/ws), or in-memory test
+// transports. ctx is bounded by ConnectTimeout. When set, broker URL
+// scheme validation is skipped. Nil rejected.
 //
 // The transport/ws sibling submodule exposes a [ws.DialFunc] helper
 // that bakes in DialOpts (TLS config, custom headers, etc.) and
@@ -1348,14 +1376,10 @@ var ErrMissingBroker = errors.New("mqttv5: missing broker URL (use WithBroker)")
 // has an unsupported scheme. WithDialFunc relaxes scheme validation.
 var ErrInvalidBrokerURL = errors.New("mqttv5: invalid broker URL")
 
-// builtinSchemes is the set of URL schemes handled by transport.Dial.
+// builtinScheme reports whether transport.Dial handles scheme.
 // ws:// and wss:// need WithDialFunc(ws.DialFunc(...)).
-var builtinSchemes = map[string]bool{
-	"mqtt":  true,
-	"tcp":   true,
-	"mqtts": true,
-	"tls":   true,
-	"ssl":   true,
+func builtinScheme(scheme string) bool {
+	return transport.IsTCPScheme(scheme) || transport.IsTLSScheme(scheme)
 }
 
 // validateBrokerURLs sanity-checks urls. When dialFuncSet is true the
@@ -1384,7 +1408,7 @@ func validateBrokerURLs(urls []string, dialFuncSet bool) error {
 			return fmt.Errorf("%w: urls[%d] = %q: WebSocket needs WithDialFunc (see the transport/ws submodule)",
 				ErrInvalidBrokerURL, i, raw)
 		}
-		if !builtinSchemes[u.Scheme] {
+		if !builtinScheme(u.Scheme) {
 			return fmt.Errorf("%w: urls[%d] = %q: unsupported scheme %q",
 				ErrInvalidBrokerURL, i, raw, u.Scheme)
 		}
@@ -1392,9 +1416,39 @@ func validateBrokerURLs(urls []string, dialFuncSet bool) error {
 	return nil
 }
 
+// validateDial rejects dial options that another would silently
+// override: one TLS config source, and none beside a DialFunc, which
+// owns the whole dial.
+func (c *Config) validateDial() error {
+	if c.TLSConfig != nil && c.TLSConfigFunc != nil {
+		return errors.New("mqttv5: WithTLSConfig and WithTLSConfigFunc are mutually exclusive")
+	}
+	if c.DialFunc == nil {
+		return nil
+	}
+	var ignored []string
+	if c.TLSConfig != nil {
+		ignored = append(ignored, "WithTLSConfig")
+	}
+	if c.TLSConfigFunc != nil {
+		ignored = append(ignored, "WithTLSConfigFunc")
+	}
+	if c.Dialer != nil {
+		ignored = append(ignored, "WithDialer")
+	}
+	if len(ignored) > 0 {
+		return fmt.Errorf("mqttv5: WithDialFunc replaces the built-in dial, so %s would be ignored; configure the dial inside the DialFunc",
+			strings.Join(ignored, " and "))
+	}
+	return nil
+}
+
 // validate sanity-checks the config after defaults are applied.
 func (c *Config) validate() error {
 	if err := validateBrokerURLs(c.BrokerURLs, c.DialFunc != nil); err != nil {
+		return err
+	}
+	if err := c.validateDial(); err != nil {
 		return err
 	}
 	if !c.DropPolicy.valid() {
