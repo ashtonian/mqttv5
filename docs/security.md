@@ -5,7 +5,8 @@
 - **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
   broker against the system roots by default; `WithTLSConfig` supplies
   CAs, client certificates or a server name. Never set
-  `InsecureSkipVerify` outside tests.
+  `InsecureSkipVerify` outside tests. See
+  [Certificate management](#certificate-management).
 - **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
   (per-attempt rotation) keep secrets in memory only; the client never
   logs them. Enhanced authentication (`WithAuthenticator`) supports
@@ -24,3 +25,52 @@
   directory; encrypt the volume if payloads are sensitive.
 - **Reporting.** Report vulnerabilities privately through GitHub
   security advisories on this repository.
+
+## Certificate management
+
+**What verification checks.** The handshake fails unless the broker's
+certificate chains to a trusted root (`RootCAs`, or the system roots
+when it is nil), names the host being dialed (its DNS or IP subject
+alternative names match `ServerName`, or the URL host when
+`ServerName` is empty), is within its validity window, and allows
+server authentication. A broker that fails any of these never receives
+CONNECT, so credentials are not sent to it; `Connect` and
+`WithOnConnectError` return the `crypto/x509` error, which
+`errors.As` resolves (`x509.UnknownAuthorityError`,
+`x509.HostnameError`, `x509.CertificateInvalidError`).
+
+**What it does not check.** Revocation. Go's `crypto/x509` consults
+neither CRLs nor OCSP, and the client adds no check of its own.
+
+**Private CA.** Put the CA in `RootCAs`. Setting `RootCAs` replaces the
+system roots rather than adding to them.
+
+```go
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(caPEM)
+mqttv5.WithTLSConfig(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13})
+```
+
+**Client certificates (mutual TLS).** `Certificates` presents a fixed
+certificate. `GetClientCertificate` is called on every handshake in
+which the broker asks for a client certificate, and each reconnect is
+a new handshake, so returning the current certificate from it rotates
+the client's certificate without restarting the client:
+
+```go
+var current atomic.Pointer[tls.Certificate] // replaced on renewal
+mqttv5.WithTLSConfig(&tls.Config{
+    RootCAs: pool,
+    GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+        return current.Load(), nil
+    },
+})
+```
+
+**Rotating trusted roots.** `RootCAs` is read from the config given to
+`WithTLSConfig` at `New` and used for every dial. Replacing it needs a
+dial path that builds its config per dial: `WithDialFunc` around
+`transport.DialTLS`.
+
+**Protocol version.** Go's client accepts TLS 1.2 and later by default.
+Set `MinVersion: tls.VersionTLS13` when every broker supports it.

@@ -91,7 +91,7 @@ control queue that survives reconnects.
 | `*_test.go` | a test file per source file, plus `helpers_test.go`, `session_test.go` (sessions and stores across connections), `bench_test.go`, `example_test.go` and `readme_test.go` |
 | `internal/inflight` | session engine: packet identifiers, QoS 1/2 state, quota, replay, store writes |
 | `internal/trie` | topic trie |
-| `internal/clock`, `internal/testbroker` | injectable clock; scripted and raw brokers for tests |
+| `internal/clock`, `internal/testbroker`, `internal/testpki` | injectable clock; scripted and raw brokers (plain or TLS) for tests; in-memory certificate authorities and the TLS verification matrix every transport runs |
 | `internal/filedb` | bbolt wrapper with group commit, shared by `store/file` and `queue/file` |
 | `session`, `session/storetest` | `Store` interface, memory store, conformance tests for stores |
 | `queue/queuetest` | conformance tests for `PublisherQueue` implementations |

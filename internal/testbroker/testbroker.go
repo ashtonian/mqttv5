@@ -15,6 +15,7 @@ package testbroker
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -48,6 +49,7 @@ type Script func(c *Conn)
 type Broker struct {
 	t        testing.TB
 	ln       net.Listener
+	scheme   string
 	scripts  []Script
 	raw      func(*Broker, net.Conn)
 	fallback atomic.Pointer[Script]
@@ -64,11 +66,31 @@ type Broker struct {
 // and the fallback for every later one. The broker closes on test cleanup.
 func New(t testing.TB, scripts ...Script) *Broker {
 	t.Helper()
+	return start(t, listen(t), scripts)
+}
+
+// NewTLS is [New] over TLS: every accepted connection performs a server
+// handshake with cfg, and [Broker.URL] is an mqtts:// URL. A connection
+// whose handshake fails records the failure as its read error and no
+// packets.
+func NewTLS(t testing.TB, cfg *tls.Config, scripts ...Script) *Broker {
+	t.Helper()
+	b := start(t, tls.NewListener(listen(t), cfg), scripts)
+	b.scheme = "mqtts"
+	return b
+}
+
+func listen(t testing.TB) net.Listener {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("testbroker: listen: %v", err)
 	}
-	b := &Broker{t: t, ln: ln, scripts: scripts, done: make(chan struct{})}
+	return ln
+}
+
+func start(t testing.TB, ln net.Listener, scripts []Script) *Broker {
+	b := &Broker{t: t, ln: ln, scheme: "mqtt", scripts: scripts, done: make(chan struct{})}
 	auto := Script(func(c *Conn) { c.AcceptResume(wire.ConnackOpts{}); c.ServeAuto() })
 	b.fallback.Store(&auto)
 	b.wg.Add(1)
@@ -85,11 +107,7 @@ func New(t testing.TB, scripts ...Script) *Broker {
 // handlers.
 func NewRaw(t testing.TB, handle func(b *Broker, nc net.Conn)) *Broker {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("testbroker: listen: %v", err)
-	}
-	b := &Broker{t: t, ln: ln, raw: handle, done: make(chan struct{})}
+	b := &Broker{t: t, ln: listen(t), scheme: "mqtt", raw: handle, done: make(chan struct{})}
 	b.wg.Add(1)
 	go b.serve()
 	t.Cleanup(b.Close)
@@ -102,8 +120,8 @@ func (b *Broker) Addr() string { return b.ln.Addr().String() }
 // SetFallback replaces the script used once the scripted connections run out.
 func (b *Broker) SetFallback(s Script) { b.fallback.Store(&s) }
 
-// URL is the mqtt:// URL clients dial.
-func (b *Broker) URL() string { return "mqtt://" + b.ln.Addr().String() }
+// URL is the URL clients dial: mqtt://, or mqtts:// for [NewTLS].
+func (b *Broker) URL() string { return b.scheme + "://" + b.ln.Addr().String() }
 
 // Done is closed when the broker shuts down; long-running scripts select on it.
 func (b *Broker) Done() <-chan struct{} { return b.done }
@@ -274,6 +292,17 @@ func (c *Conn) Log() []Packet {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]Packet(nil), c.log...)
+}
+
+// TLS returns the connection's TLS state, and false for a plain TCP
+// connection. The handshake completes before the first packet is
+// recorded, so the state is final once CONNECT has arrived.
+func (c *Conn) TLS() (tls.ConnectionState, bool) {
+	tc, ok := c.net.(*tls.Conn)
+	if !ok {
+		return tls.ConnectionState{}, false
+	}
+	return tc.ConnectionState(), true
 }
 
 // Gone is closed once the connection has stopped reading: the client

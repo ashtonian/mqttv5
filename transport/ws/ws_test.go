@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +16,8 @@ import (
 
 	gws "github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
+
+	"github.com/ashtonian/mqttv5/internal/testpki"
 )
 
 // startEchoWS spins up an HTTP server that upgrades each connection
@@ -100,6 +104,47 @@ func TestWssVerifiesByDefault(t *testing.T) {
 		t.Fatalf("wss:// with the certificate trusted: %v", err)
 	}
 	conn.Close()
+}
+
+// wss:// verifies the broker's chain, name and validity window against
+// the caller's roots, the same matrix mqtts:// runs.
+func TestWssVerification(t *testing.T) {
+	root, cases := testpki.VerificationCases(t)
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, _, _, err := gws.UpgradeHTTP(r, w)
+				if err == nil {
+					conn.Close()
+				}
+			}))
+			srv.TLS = &tls.Config{Certificates: []tls.Certificate{tt.Cert}}
+			srv.Config.ErrorLog = log.New(io.Discard, "", 0) // refused handshakes are the point
+			srv.StartTLS()
+			defer srv.Close()
+			u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+
+			conn, err := Dial(context.Background(), u, DialOpts{TLSConfig: &tls.Config{
+				RootCAs:    root.Pool(),
+				ServerName: tt.ServerName,
+				Time:       testpki.Clock,
+			}})
+			if tt.WantErr != nil {
+				if err == nil {
+					conn.Close()
+					t.Fatal("dial succeeded, want a verification error")
+				}
+				if !tt.WantErr(err) {
+					t.Fatalf("dial error = %v, not the expected verification error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			conn.Close()
+		})
+	}
 }
 
 func certPool(c *x509.Certificate) *x509.CertPool {
