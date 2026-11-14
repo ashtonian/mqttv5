@@ -320,6 +320,11 @@ type Config struct {
 	TLSConfig *tls.Config
 	Dialer    *net.Dialer
 
+	// TLSVerifier checks each connection's TLS handshake before CONNECT
+	// is sent (see [WithTLSVerifier]). Nil (the default) runs no check
+	// beyond crypto/tls's own verification.
+	TLSVerifier TLSVerifier
+
 	// DialFunc replaces the built-in TCP/TLS dial path. Takes
 	// precedence over TLSConfig and Dialer. Use for SOCKS / mTLS /
 	// WebSocket (see transport/ws) / in-memory test transports.
@@ -1262,6 +1267,40 @@ func WithTLSConfig(t *tls.Config) Option {
 		return nil
 	}
 }
+
+// TLSVerifier checks a connection's completed TLS handshake before the
+// client sends CONNECT on it. brokerURL is the broker being connected
+// to; ctx is bounded by the connect timeout and ends when the attempt is
+// abandoned. A non-nil error fails the attempt.
+type TLSVerifier func(ctx context.Context, brokerURL *url.URL, state tls.ConnectionState) error
+
+// WithTLSVerifier runs v on every connection, after the TLS handshake
+// and before CONNECT, so credentials in CONNECT never reach a broker v
+// refuses. Use it for checks crypto/tls does not make, such as
+// certificate revocation (the tlsrevocation submodule) or pinning;
+// unlike [tls.Config.VerifyConnection], v gets the attempt's context,
+// so a network lookup in it is bounded by [WithConnectTimeout] and
+// cancelled by [Client.Disconnect].
+//
+// A refused connection is closed and reported like a dial failure: the
+// error, wrapped, reaches [WithOnConnectError] and Connect, and the
+// supervisor retries with backoff. A connection whose transport reports
+// no TLS state (plain TCP, ws://, or a [WithDialFunc] connection that
+// does not implement [transport.ConnectionStater]) fails with
+// [ErrNotTLS]. Nil rejected.
+func WithTLSVerifier(v TLSVerifier) Option {
+	return func(c *Config) error {
+		if v == nil {
+			return errors.New("mqttv5: WithTLSVerifier(nil) is invalid")
+		}
+		c.TLSVerifier = v
+		return nil
+	}
+}
+
+// ErrNotTLS is returned when [WithTLSVerifier] is set and a connection
+// reports no TLS handshake to verify.
+var ErrNotTLS = errors.New("mqttv5: the connection is not TLS; the TLS verifier cannot check it")
 
 // WithDialer overrides the default [*net.Dialer].
 func WithDialer(d *net.Dialer) Option {
