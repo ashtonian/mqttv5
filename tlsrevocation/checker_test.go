@@ -107,6 +107,35 @@ func TestVerify(t *testing.T) {
 			},
 		},
 		{
+			// A broker can staple the issuer's genuine response about
+			// another of its certificates; EMQX 6.3.1 does when two
+			// stapling listeners' certificates share a signature
+			// algorithm.
+			name: "staple about another certificate falls through",
+			setup: func(t *testing.T, f *fixture) []byte {
+				f.ocsp.set(f.leaf.Leaf, ocsp.Good)
+				other := f.intermediate.Leaf(t, "another broker")
+				return ocspResponse(t, f.intermediate, nil, other.Leaf.SerialNumber, ocsp.Revoked)
+			},
+			opts: []Option{WithScope(LeafOnly)},
+			check: func(t *testing.T, f *fixture, c *Checker) {
+				if s := c.Stats(); s.FromOCSP != 1 || s.FromStaple != 0 {
+					t.Errorf("stats = %+v, want the responder's answer", s)
+				}
+			},
+		},
+		{
+			name:     "must-staple leaf with a staple about another certificate",
+			leafOpts: []testpki.Option{testpki.WithMustStaple()},
+			setup: func(t *testing.T, f *fixture) []byte {
+				f.ocsp.set(f.leaf.Leaf, ocsp.Good)
+				other := f.intermediate.Leaf(t, "another broker")
+				return ocspResponse(t, f.intermediate, nil, other.Leaf.SerialNumber, ocsp.Good)
+			},
+			opts:    []Option{WithScope(LeafOnly)},
+			wantErr: ErrStapleRequired,
+		},
+		{
 			name: "staple from a delegated responder without id-kp-OCSPSigning falls through",
 			setup: func(t *testing.T, f *fixture) []byte {
 				f.ocsp.set(f.leaf.Leaf, ocsp.Good)

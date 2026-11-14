@@ -62,6 +62,7 @@ their doc comments, and prints the block to paste.
 | `TestWill_DeliveredOnUngracefulDisconnect` | `features_test.go` | Verifies the broker publishes the configured will (payload + will properties) when the will client's TCP connection drops without a DISCONNECT. |
 | `TestWill_SuppressedOnGracefulDisconnect` | `features_test.go` | Verifies a normal DISCONNECT clears the will: the broker must NOT publish it. |
 | `TestWill_DelayInterval` | `features_test.go` | Verifies WillDelayInterval defers publication: after an ungraceful drop the will must not arrive before the delay elapses, but must arrive once it does. |
+| `TestOCSP_StaplingAndResponders` | `ocsp_test.go` | Checks tlsrevocation, through WithTLSVerifier, against EMQX's OCSP stapling and OpenSSL's OCSP responder: a stapled good response satisfies a must-staple certificate, a stapled revocation is refused, good and revoked answers fetched from the responder (signed by a delegated responder, and the CA's own by the root) decide, and a must-staple certificate served without a staple is refused. |
 | `TestReauthenticate_SCRAM_EMQX` | `reauth_test.go` | Exercises client-initiated MQTT 5 re-authentication ([§4.12]) end-to-end against a real broker. |
 | `TestStrict_MaximumQoS` | `strict_test.go` | A QoS above the broker's Maximum QoS fails before anything is sent, or is downgraded with WithQoSDowngrade; the connection survives. |
 | `TestStrict_MaximumPacketSize` | `strict_test.go` | A packet above the broker's Maximum Packet Size fails before it is sent; the connection survives and smaller packets go through. |
@@ -80,19 +81,22 @@ malformed packets, each rejected with the reason code the spec assigns.
 
 ## Brokers
 
-[`docker-compose.yml`](docker-compose.yml) starts three by default, and
-two more with `--profile hivemq`:
+[`docker-compose.yml`](docker-compose.yml) starts four brokers and an
+OCSP responder by default, and two more brokers with `--profile hivemq`:
 
 | Service | Port on 127.0.0.1 | Used for |
 |---|---|---|
 | `mosquitto` (eclipse-mosquitto 2.1.2) | 1883 | the default broker; [`mosquitto.conf`](mosquitto.conf) allows anonymous clients |
 | `emqx` (EMQX 6.3.1, anonymous) | 1884, WebSocket 8083 | the second broker of the ClientGroup test; the whole suite can also run against it; the examples' smoke test uses its WebSocket listener |
 | `emqx-scram` (EMQX 6.3.1) | 1885, REST 18084 | enhanced authentication: `TestReauthenticate_SCRAM_EMQX` provisions a SCRAM-SHA-256 authenticator and user through the REST API with the key in [`emqx/api_key.bootstrap`](emqx/api_key.bootstrap) |
+| `ocsp-responder` (OpenSSL 3.5, from the EMQX 6.3.1 image) | 2560, 2561 | on first start, builds a PKI with OpenSSL into `ocsp/pki` (gitignored): a root, a CA, a delegated OCSP responder, and good, revoked and must-staple broker certificates; then serves OCSP for it, the CA's on 2560 through the delegated responder and the root's on 2561 ([`ocsp/responder.sh`](ocsp/responder.sh)) |
+| `emqx-ocsp` (EMQX 6.3.1) | 8883–8887 | `TestOCSP_StaplingAndResponders`: one TLS listener per case, two with EMQX's native OCSP stapling (see the compose file for the port map) |
 | `hivemq` (HiveMQ CE 2026.5, profile `hivemq`) | 1886 | the whole suite against HiveMQ's defaults (Receive Maximum 10, five topic aliases) ([`hivemq/default.xml`](hivemq/default.xml)) |
 | `hivemq-strict` (HiveMQ CE 2026.5, profile `hivemq`) | 1887 | `strict_test.go`: Maximum QoS 1, 2 KiB packets, Server Keep Alive 4 s, Receive Maximum 4, two topic aliases, no retain, wildcards, shared subscriptions or Subscription Identifiers ([`hivemq/strict.xml`](hivemq/strict.xml)) |
 
 Each broker has a memory limit in the compose file (HiveMQ 3 GiB with
-half of it for the JVM heap, EMQX 1.5 GiB, mosquitto 256 MiB), so a
+half of it for the JVM heap, EMQX 1.5 GiB, mosquitto 256 MiB, the OCSP
+responder 64 MiB), so a
 broker that outgrows it is killed on its own. Both HiveMQ instances keep
 their persistence in memory: HiveMQ's file persistence preallocates a
 write-ahead log for each of its RocksDB buckets, and on the CI runners,
@@ -142,7 +146,8 @@ model-based tests with a million new seeds.
 ## External dependencies
 
 Docker with Compose, and the images above. Go dependencies: the mqttv5
-modules (through `replace` directives) and `codec/json`.
+modules (through `replace` directives), `codec/json` and
+`tlsrevocation` (with its `golang.org/x/crypto`).
 
 ## Operations and troubleshooting
 
@@ -153,6 +158,8 @@ modules (through `replace` directives) and `codec/json`.
 | `TestReauthenticate_SCRAM_EMQX` skips or fails provisioning | `curl -u conformancekey:conformanceSecret0123456789 http://127.0.0.1:18084/api/v5/authentication` | EMQX takes several seconds to start its API; wait for it. |
 | A test fails on one broker only | the broker's logs (`docker compose … logs`) | Brokers differ in defaults (Receive Maximum, topic alias limits, shared-subscription strategy); a difference the spec allows belongs in the test as a skip or a per-broker expectation, not in the client. |
 | A broker stops mid-run, or the nightly runner vanishes | `docker inspect --format '{{.Name}} oom-killed={{.State.OOMKilled}}' $(docker compose -f conformance/docker-compose.yml --profile hivemq ps -aq)`; in the nightly, the `broker-memory-*` artifact and the "broker logs" step | `oom-killed=true`: the broker outgrew its `mem_limit`; read its growth in the artifact before raising the limit. A runner that vanishes has hit its Docker daemon's own limit: compare the sum of the brokers' memory with the runner's dind limit. |
+| `TestOCSP_StaplingAndResponders` skips: `no OCSP PKI` | `ls conformance/ocsp/pki`; `docker compose -f conformance/docker-compose.yml ps ocsp-responder emqx-ocsp` | Start the services; `ocsp-responder` writes the PKI on its first start, and `emqx-ocsp` waits for it. |
+| `TestOCSP_StaplingAndResponders` fails with `x509: certificate signed by unknown authority` or a staple about another serial | whether `ocsp/pki` was rebuilt while `emqx-ocsp` kept the old certificates | Recreate both: `docker compose -f conformance/docker-compose.yml up -d --force-recreate --wait ocsp-responder emqx-ocsp`. To build a fresh PKI, delete the files in `ocsp/pki` first. |
 | `TestREADMEListsEveryTest` fails | the block it prints | Paste it into this README between the `tests` markers. |
 
 ## Broker notes
@@ -180,6 +187,16 @@ modules (through `replace` directives) and `codec/json`.
   specification requires. With `MQTTV5_SOAK_TRACE` set the test checks
   the client's packets and logs these as broker faults instead of
   failing; mosquitto and HiveMQ show neither.
+- **EMQX 6.3.1 staples one listener's OCSP response on another.** Its
+  OCSP cache is keyed by the certificate's signature algorithm
+  (`emqx_ocsp_cache:cache_key/1` reads `tbsCertificate`'s
+  AlgorithmIdentifier, not the signature value), so two stapling
+  listeners whose certificates are signed with the same algorithm staple
+  whichever response was fetched first. tlsrevocation rejects a staple
+  about another certificate: it falls through to the responder, or fails
+  a must-staple certificate with `ErrStapleRequired`. The rig signs the
+  revoked broker certificate with SHA-384 so the two stapling listeners
+  stay apart.
 - **Shared subscriptions:** EMQX distributes randomly by default, so
   the round-robin assertion runs against mosquitto only.
 
@@ -204,6 +221,9 @@ the block it prints.
 The brokers are test fixtures. mosquitto, EMQX and HiveMQ accept
 anonymous connections, and `emqx-scram`'s REST API key and SCRAM user
 are fixed values committed in `emqx/api_key.bootstrap` and the tests.
+The OCSP PKI's private keys are generated per checkout into `ocsp/pki`,
+world-readable so the EMQX container can load them, and never
+committed; they sign nothing but the rig.
 Every port is published on 127.0.0.1 only, so other machines cannot
 reach them; never expose them or reuse those credentials elsewhere, and
 stop the brokers after a run (`docker compose -f
@@ -220,8 +240,10 @@ synthetic payloads only.
 | `faults_test.go` | session loss, QoS 2 resumption, refused filters, QoS 1 replay across a dropped connection, the connection-cut soak |
 | `reauth_test.go` | SCRAM-SHA-256 re-authentication against EMQX |
 | `strict_test.go` | a broker announcing tight limits |
+| `ocsp_test.go` | tlsrevocation against EMQX's OCSP stapling and OpenSSL's OCSP responder |
 | `readme_test.go` | generates and checks the test list above |
 | `docker-compose.yml`, `mosquitto.conf`, `emqx/`, `hivemq/` | the brokers |
+| `ocsp/responder.sh`, `ocsp/pki/` | the OCSP rig's PKI and responders; the generated PKI |
 
 <!-- MQTT v5.0 citations -->
 

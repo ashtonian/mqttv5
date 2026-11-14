@@ -74,6 +74,74 @@ services:
       - ./emqx/api_key.bootstrap:/opt/emqx/etc/api_key.bootstrap:ro
     healthcheck: *emqx-healthcheck
 
+  # ocsp-responder and emqx-ocsp check tlsrevocation (ocsp_test.go)
+  # against implementations independent of the x/crypto/ocsp its own
+  # tests use. ocsp-responder builds a PKI with OpenSSL into ./ocsp/pki
+  # (gitignored) on first start and serves OCSP for it with OpenSSL's
+  # responder; it runs the EMQX image only for that image's OpenSSL.
+  # emqx-ocsp serves the broker certificates on five listeners, stapling
+  # OCSP responses on two of them with EMQX's native stapling:
+  #   8883  must-staple certificate, stapled
+  #   8884  revoked certificate, stapled
+  #   8885  good certificate, not stapled (the client fetches)
+  #   8886  revoked certificate, not stapled
+  #   8887  must-staple certificate, not stapled
+  ocsp-responder:
+    image: emqx/emqx:6.3.1
+    container_name: mqttv5-conformance-ocsp-responder
+    mem_limit: 64m
+    # Root, to write the bind-mounted ./ocsp/pki; responder.sh hands the
+    # files to the directory's owner.
+    user: "0:0"
+    entrypoint: ["sh", "/ocsp/responder.sh"]
+    ports:
+      - "127.0.0.1:2560:2560" # the CA's responder, named in the broker certificates
+      - "127.0.0.1:2561:2561" # the root's responder, named in the CA certificate
+    volumes:
+      - ./ocsp/responder.sh:/ocsp/responder.sh:ro
+      - ./ocsp/pki:/pki
+    healthcheck:
+      test: ["CMD-SHELL", "openssl ocsp -issuer /pki/ca.pem -serial 0x1001 -url http://127.0.0.1:2560 -CAfile /pki/root.pem >/dev/null 2>&1 && openssl ocsp -issuer /pki/root.pem -serial 0x10 -url http://127.0.0.1:2561 -CAfile /pki/root.pem >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  emqx-ocsp:
+    image: emqx/emqx:6.3.1
+    container_name: mqttv5-conformance-emqx-ocsp
+    mem_limit: 1536m
+    depends_on:
+      ocsp-responder:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8883-8887:8883-8887"
+    volumes:
+      - ./ocsp/pki:/pki:ro
+    environment:
+      EMQX_ALLOW_ANONYMOUS: "true"
+      EMQX_LISTENERS__SSL__DEFAULT__BIND: "0.0.0.0:8883"
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: /pki/must-staple-chain.pem
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE: /pki/must-staple.key
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__OCSP__ENABLE_OCSP_STAPLING: "true"
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__OCSP__RESPONDER_URL: http://ocsp-responder:2560
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__OCSP__ISSUER_PEM: /pki/ca.pem
+      EMQX_LISTENERS__SSL__REVOKED__BIND: "0.0.0.0:8884"
+      EMQX_LISTENERS__SSL__REVOKED__SSL_OPTIONS__CERTFILE: /pki/revoked-chain.pem
+      EMQX_LISTENERS__SSL__REVOKED__SSL_OPTIONS__KEYFILE: /pki/revoked.key
+      EMQX_LISTENERS__SSL__REVOKED__SSL_OPTIONS__OCSP__ENABLE_OCSP_STAPLING: "true"
+      EMQX_LISTENERS__SSL__REVOKED__SSL_OPTIONS__OCSP__RESPONDER_URL: http://ocsp-responder:2560
+      EMQX_LISTENERS__SSL__REVOKED__SSL_OPTIONS__OCSP__ISSUER_PEM: /pki/ca.pem
+      EMQX_LISTENERS__SSL__FETCHED__BIND: "0.0.0.0:8885"
+      EMQX_LISTENERS__SSL__FETCHED__SSL_OPTIONS__CERTFILE: /pki/good-chain.pem
+      EMQX_LISTENERS__SSL__FETCHED__SSL_OPTIONS__KEYFILE: /pki/good.key
+      EMQX_LISTENERS__SSL__FETCHEDREVOKED__BIND: "0.0.0.0:8886"
+      EMQX_LISTENERS__SSL__FETCHEDREVOKED__SSL_OPTIONS__CERTFILE: /pki/revoked-chain.pem
+      EMQX_LISTENERS__SSL__FETCHEDREVOKED__SSL_OPTIONS__KEYFILE: /pki/revoked.key
+      EMQX_LISTENERS__SSL__UNSTAPLED__BIND: "0.0.0.0:8887"
+      EMQX_LISTENERS__SSL__UNSTAPLED__SSL_OPTIONS__CERTFILE: /pki/must-staple-chain.pem
+      EMQX_LISTENERS__SSL__UNSTAPLED__SSL_OPTIONS__KEYFILE: /pki/must-staple.key
+    healthcheck: *emqx-healthcheck
+
   # HiveMQ CE runs in the nightly conformance job, not on every
   # push: start it with `docker compose --profile hivemq up -d`.
   # `hivemq` keeps the defaults (Receive Maximum 10, five topic aliases)
