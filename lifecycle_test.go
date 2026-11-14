@@ -979,7 +979,7 @@ func TestConnectPacketBuilderMutates(t *testing.T) {
 	cli, err := New(
 		WithBroker(fb.URL()),
 		WithClientID("from-config"),
-		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
+		WithConnectPacketBuilder(func(ctx context.Context, _ *url.URL, opts *ConnectOptions) error {
 			opts.Username = "from-builder"
 			opts.Password = []byte("rotated-token")
 			return nil
@@ -1011,7 +1011,7 @@ func TestConnectPacketBuilderErrorFailsAttempt(t *testing.T) {
 	wantErr := errors.New("builder rejected the attempt")
 	cli, err := New(
 		WithBroker(fb.URL()),
-		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
+		WithConnectPacketBuilder(func(ctx context.Context, _ *url.URL, opts *ConnectOptions) error {
 			return wantErr
 		}),
 	)
@@ -1060,7 +1060,7 @@ func TestConnectPacketBuilderRotatesCredentialsAcrossAttempts(t *testing.T) {
 		WithBroker(fb.URL()),
 		WithReconnectBackoff(ConstantBackoff(20*time.Millisecond)),
 		WithConnectTimeout(200*time.Millisecond),
-		WithConnectPacketBuilder(func(ctx context.Context, opts *ConnectOptions) error {
+		WithConnectPacketBuilder(func(ctx context.Context, _ *url.URL, opts *ConnectOptions) error {
 			n := counter.Add(1)
 			opts.Username = fmt.Sprintf("token-%d", n)
 			return nil
@@ -1091,6 +1091,59 @@ func TestConnectPacketBuilderRotatesCredentialsAcrossAttempts(t *testing.T) {
 			keys = append(keys, fmt.Sprintf("%q", k))
 		}
 		t.Errorf("first attempt didn't carry token-1; keys=%v", keys)
+	}
+}
+
+// With several brokers, the builder learns which broker each attempt
+// reaches, so a credential bound to that broker's host reaches it.
+func TestConnectPacketBuilderSeesEachAttemptsBroker(t *testing.T) {
+	refused := make(chan *wire.Connect, 1)
+	accepted := make(chan *wire.Connect, 1)
+	refusing := testbroker.NewRaw(t, connectInspector(t, refused, wire.ConnackOpts{ReasonCode: wire.ReasonNotAuthorized}))
+	accepting := testbroker.NewRaw(t, connectInspector(t, accepted, wire.ConnackOpts{ReasonCode: wire.ReasonSuccess}))
+
+	var mu sync.Mutex
+	var attempts []string
+	cli, err := New(
+		WithBrokers(refusing.URL(), accepting.URL()),
+		WithLogger(quietLogger()),
+		WithConnectPacketBuilder(func(_ context.Context, brokerURL *url.URL, opts *ConnectOptions) error {
+			mu.Lock()
+			attempts = append(attempts, brokerURL.String())
+			mu.Unlock()
+			opts.Password = []byte("token-for-" + brokerURL.Host)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cli.brokerIdx.Store(0)
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cli.Disconnect(context.Background())
+
+	mu.Lock()
+	got := slices.Clone(attempts)
+	mu.Unlock()
+	if want := []string{refusing.URL(), accepting.URL()}; !slices.Equal(got, want) {
+		t.Fatalf("builder saw brokers %v, want %v", got, want)
+	}
+	for _, tt := range []struct {
+		broker *testbroker.Broker
+		sink   chan *wire.Connect
+	}{{refusing, refused}, {accepting, accepted}} {
+		conn := <-tt.sink
+		password := string(conn.Password)
+		conn.Release()
+		u, err := url.Parse(tt.broker.URL())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "token-for-" + u.Host; password != want {
+			t.Errorf("CONNECT to %s carried password %q, want %q", tt.broker.URL(), password, want)
+		}
 	}
 }
 

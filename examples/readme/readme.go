@@ -159,26 +159,6 @@ func gracefulDisconnect() {
 	})
 }
 
-type tokenSource struct{}
-
-func (tokenSource) FetchToken(context.Context) (string, error) { return "", nil }
-
-var oauth tokenSource
-
-func credentialRotation() {
-	_, _ = mqttv5.New(
-		mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOptions) error {
-			tok, err := oauth.FetchToken(ctx)
-			if err != nil {
-				return err // fails this attempt; supervisor retries after backoff
-			}
-			opts.Username = "service-account"
-			opts.Password = []byte(tok)
-			return nil
-		}),
-	)
-}
-
 func reauthenticate() {
 	// e.g. 30s before the JWT `exp`:
 	if err := cli.Reauthenticate(ctx); err != nil {

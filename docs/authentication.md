@@ -16,11 +16,15 @@ enhanced authentication (challenge/response such as SCRAM).
 `WithConnectPacketBuilder(fn)` runs immediately before each CONNECT is
 serialised. Use it to refresh an OAuth token, fetch a SigV4-signed
 CONNECT credential, or rotate any other per-attempt secret. The context
-is bounded by `ConnectTimeout`.
+is bounded by `ConnectTimeout`. `brokerURL` is the broker the attempt
+has dialled, which changes between attempts under `WithBrokers` or after
+a server redirect, so a credential scoped to one broker's host (a JWT
+audience, a token for one IoT hub) can be built for the broker that will
+receive it.
 
 ```go
-mqttv5.WithConnectPacketBuilder(func(ctx context.Context, opts *mqttv5.ConnectOptions) error {
-    tok, err := oauth.FetchToken(ctx)
+mqttv5.WithConnectPacketBuilder(func(ctx context.Context, brokerURL *url.URL, opts *mqttv5.ConnectOptions) error {
+    tok, err := oauth.FetchToken(ctx, brokerURL.Hostname()) // a token for this broker
     if err != nil {
         return err // fails this attempt; supervisor retries after backoff
     }

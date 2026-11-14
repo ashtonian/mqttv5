@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -60,7 +61,7 @@ func run(ctx context.Context) error {
 		mqttv5.WithBroker(broker),
 		mqttv5.WithClientID("mqttv5-oauth"),
 		mqttv5.WithLogger(logger),
-		mqttv5.WithConnectPacketBuilder(func(_ context.Context, opts *mqttv5.ConnectOptions) error {
+		mqttv5.WithConnectPacketBuilder(func(_ context.Context, _ *url.URL, opts *mqttv5.ConnectOptions) error {
 			opts.Username = "service-account"
 			opts.Password = []byte(tokens.Token())
 			return nil

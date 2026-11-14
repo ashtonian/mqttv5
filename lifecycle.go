@@ -305,18 +305,13 @@ type connectResult struct {
 }
 
 // dial resolves the broker URL to a live transport.Conn. If a custom
-// DialFunc is configured it takes precedence and is given a parsed
-// *url.URL so the implementation doesn't re-parse. Otherwise the
-// built-in transport.Dial handles TCP and TLS schemes.
-func (c *Client) dial(ctx context.Context, brokerURL string) (transport.Conn, error) {
+// DialFunc is configured it takes precedence. Otherwise the built-in
+// transport.Dial handles TCP and TLS schemes.
+func (c *Client) dial(ctx context.Context, brokerURL *url.URL) (transport.Conn, error) {
 	if c.cfg.DialFunc != nil {
-		u, err := url.Parse(brokerURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse broker URL: %w", err)
-		}
-		return c.cfg.DialFunc(ctx, u)
+		return c.cfg.DialFunc(ctx, brokerURL)
 	}
-	return transport.Dial(ctx, brokerURL, transport.DialOpts{
+	return transport.Dial(ctx, brokerURL.String(), transport.DialOpts{
 		TLSConfig: c.cfg.TLSConfig,
 		Dialer:    c.cfg.Dialer,
 	})
@@ -353,10 +348,15 @@ func (c *Client) newDecoder(conn transport.Conn) *wire.Decoder {
 // for a CleanStart=1 CONNECT violates [MQTT-3.2.2-2]; the attempt fails
 // with a [*ProtocolError] after DISCONNECT 0x82.
 func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart bool) (*connectResult, error) {
+	u, err := url.Parse(brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5: parse broker URL: %w", err)
+	}
+
 	dialCtx, cancel := context.WithTimeout(ctx, c.cfg.ConnectTimeout)
 	defer cancel()
 
-	conn, err := c.dial(dialCtx, brokerURL)
+	conn, err := c.dial(dialCtx, u)
 	if err != nil {
 		return nil, fmt.Errorf("mqttv5: dial: %w", err)
 	}
@@ -377,7 +377,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 		return err
 	}
 
-	sent, err := c.writeConnect(dialCtx, conn, cleanStart)
+	sent, err := c.writeConnect(dialCtx, conn, u, cleanStart)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mqttv5: write CONNECT: %w", ioErr(err))
@@ -947,10 +947,9 @@ func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
 // Authenticator.Begin(ctx). connectOnce then drives the AUTH loop.
 //
 // If cfg.ConnectPacketBuilder is set, it runs after this method has
-// populated opts and may mutate any field — useful for per-attempt
-// credential rotation. A non-nil error from the builder fails the
-// attempt.
-func (c *Client) writeConnect(ctx context.Context, w io.Writer, cleanStart bool) (wire.ConnectOpts, error) {
+// populated opts, is told brokerURL, and may change the credentials and
+// user properties. A non-nil error from the builder fails the attempt.
+func (c *Client) writeConnect(ctx context.Context, w io.Writer, brokerURL *url.URL, cleanStart bool) (wire.ConnectOpts, error) {
 	cfg := c.cfg
 	opts := wire.ConnectOpts{
 		ClientID:          c.ClientID(),
@@ -991,7 +990,7 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, cleanStart bool)
 	}
 	if cfg.ConnectPacketBuilder != nil {
 		co := ConnectOptions{Username: opts.Username, Password: opts.Password, UserProperties: opts.UserProperties}
-		if err := cfg.ConnectPacketBuilder(ctx, &co); err != nil {
+		if err := cfg.ConnectPacketBuilder(ctx, brokerURL, &co); err != nil {
 			return opts, fmt.Errorf("mqttv5: ConnectPacketBuilder: %w", err)
 		}
 		opts.Username, opts.Password, opts.UserProperties = co.Username, co.Password, co.UserProperties

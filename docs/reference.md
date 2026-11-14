@@ -26,7 +26,7 @@
 |---|---|---|
 | `WithClientID(s)` | broker-assigned | MQTT ClientID. Empty = ask the broker to assign one via `AssignedClientIdentifier`; `cli.ClientID()` then returns the assigned value after CONNACK. |
 | `WithCredentials(user, pass)` | — | CONNECT username + password. Static. For per-attempt rotation use `WithConnectPacketBuilder`. |
-| `WithConnectPacketBuilder(fn)` | — | `func(ctx, *ConnectOptions) error`. Change the CONNECT's username, password and user properties before each attempt; canonical OAuth-token-rotation hook. |
+| `WithConnectPacketBuilder(fn)` | — | `func(ctx, brokerURL *url.URL, *ConnectOptions) error`. Change the CONNECT's username, password and user properties before each attempt, knowing which broker it goes to; canonical OAuth-token-rotation hook. |
 | `WithAuthenticator(a)` | — | MQTT v5 enhanced auth (CONNECT + re-auth [§4.12]). `Begin(ctx)` resolves the credential; client-initiated refresh via `Client.Reauthenticate`. |
 
 #### Session and CONNECT properties

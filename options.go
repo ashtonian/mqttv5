@@ -287,11 +287,8 @@ type Config struct {
 
 	// ConnectPacketBuilder is invoked immediately before each CONNECT
 	// is serialised and may change its credentials and user
-	// properties — typically rotating Username/Password per attempt
-	// for OAuth refresh. ctx is the per-attempt context bounded by
-	// ConnectTimeout. A non-nil error fails the attempt; the
-	// supervisor retries after backoff and fires OnConnectError.
-	ConnectPacketBuilder func(ctx context.Context, opts *ConnectOptions) error
+	// properties (see [WithConnectPacketBuilder]).
+	ConnectPacketBuilder func(ctx context.Context, brokerURL *url.URL, opts *ConnectOptions) error
 
 	// ReconnectBackoff is the delay before each reconnect attempt.
 	// Default [DefaultReconnectBackoff].
@@ -878,10 +875,14 @@ func WithOnReauthenticated(fn func()) Option {
 
 // WithConnectPacketBuilder lets fn change the CONNECT's credentials
 // and user properties immediately before each attempt — canonical
-// OAuth token-refresh hook. ctx is the per-attempt context bounded by
-// ConnectTimeout. A non-nil error fails the attempt; the supervisor
-// retries after backoff and fires OnConnectError.
-func WithConnectPacketBuilder(fn func(ctx context.Context, opts *ConnectOptions) error) Option {
+// OAuth token-refresh hook. brokerURL is the broker the attempt has
+// connected to, which differs between attempts under [WithBrokers] or
+// after a server redirect: build credentials bound to a broker's host
+// (a token scoped to a hub hostname, a JWT audience) from it. ctx is
+// the per-attempt context bounded by ConnectTimeout. A non-nil error
+// fails the attempt; the supervisor retries after backoff and fires
+// OnConnectError.
+func WithConnectPacketBuilder(fn func(ctx context.Context, brokerURL *url.URL, opts *ConnectOptions) error) Option {
 	return func(c *Config) error {
 		c.ConnectPacketBuilder = fn
 		return nil
