@@ -439,7 +439,7 @@ const poolClosing = 1 << 62
 
 // newPublisherPool constructs the pool but does not connect it. Pool
 // members inherit the parent's broker URL + credentials + TLS config
-// + keepalive. Their ClientID is suffixed (-pub-1, -pub-2, ...) for
+// (or TLS config function) + keepalive. Their ClientID is suffixed (-pub-1, -pub-2, ...) for
 // per-member uniqueness.
 func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisherPool, error) {
 	clientIDFn := parent.PublisherPoolClientIDFn
@@ -483,6 +483,9 @@ func newPublisherPool(parent *Config, size int, logger *slog.Logger) (*publisher
 		}
 		if parent.TLSConfig != nil {
 			opts = append(opts, WithTLSConfig(parent.TLSConfig))
+		}
+		if parent.TLSConfigFunc != nil {
+			opts = append(opts, WithTLSConfigFunc(parent.TLSConfigFunc))
 		}
 		if parent.Dialer != nil {
 			opts = append(opts, WithDialer(parent.Dialer))

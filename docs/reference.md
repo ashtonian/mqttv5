@@ -16,8 +16,9 @@
 |---|---|---|
 | `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. Several URLs fail over in the `WithFailoverOrder` order ([Failover](multi-broker.md#failover-withbrokers)). |
 | `WithFailoverOrder(o)` | `FailoverRotate` | How several brokers are tried. `FailoverRotate`: each client starts at a random entry and each reconnect attempt moves on one. `FailoverPriority`: the list is a preference order; `Connect` and each reconnect start at the first entry, and one reconnect attempt is a pass over the list with no backoff between entries ([Primary and standby](multi-broker.md#primary-and-standby-failoverpriority)). |
-| `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial. Takes precedence over `WithDialer`/`WithTLSConfig`. Nil rejected. |
-| `WithTLSConfig(*tls.Config)` | — | TLS for `mqtts://`. |
+| `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial; configure TLS inside `fn`. `New` rejects it beside `WithDialer`, `WithTLSConfig` or `WithTLSConfigFunc`. Nil rejected. |
+| `WithTLSConfig(*tls.Config)` | system roots, server name from the URL | TLS for `mqtts://`/`tls://`/`ssl://`, the same config for every dial. `New` rejects it beside `WithTLSConfigFunc`. |
+| `WithTLSConfigFunc(fn)` | — | `fn(ctx, brokerURL) (*tls.Config, error)` supplies the TLS config of each `mqtts://`/`tls://`/`ssl://` dial, before the TCP dial and within `ConnectTimeout`: rotate trusted roots, or trust each broker of `WithBrokers` differently ([Certificate management](security.md#certificate-management)). An error, or a nil config (`transport.ErrNilTLSConfig`), fails the attempt like a dial failure. Not called for `mqtt://`/`tcp://`. Publisher pool members inherit it. Nil rejected. |
 | `WithDialer(*net.Dialer)` | default | Override transport `net.Dialer`. |
 | `WithTLSVerifier(v)` | — | `func(ctx, *url.URL, tls.ConnectionState) error` run on every connection after the TLS handshake and before CONNECT, under the attempt's context. An error fails the attempt like a dial error; a connection without TLS fails with `ErrNotTLS`. `tlsrevocation.Checker.Verify` checks revocation ([Revocation](security.md#revocation)). Nil rejected. |
 
@@ -277,6 +278,7 @@ them with `errors.As`.
 | `ErrUnexpectedPacket` | various | Broker sent an unexpected packet for the current state. Treat as protocol bug. |
 | `ErrMissingBroker` | `New` | No URLs supplied. |
 | `ErrInvalidBrokerURL` | `New`, `SetBrokers` | URL failed to parse or has unsupported scheme. `WithDialFunc` relaxes scheme validation. |
+| `transport.ErrNilTLSConfig` | `Connect`, `WithOnConnectError` | The `WithTLSConfigFunc` function returned neither a config nor an error. Errors it returns are wrapped as they are, for `errors.Is`. |
 
 ### Re-authentication
 

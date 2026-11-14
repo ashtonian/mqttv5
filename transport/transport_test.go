@@ -264,3 +264,29 @@ func TestTLSState(t *testing.T) {
 		t.Fatal("TLSState reports TLS for a state with no completed handshake")
 	}
 }
+
+func TestSchemes(t *testing.T) {
+	tests := []struct {
+		scheme   string
+		tls, tcp bool
+	}{
+		{"mqtts", true, false},
+		{"tls", true, false},
+		{"ssl", true, false},
+		{"mqtt", false, true},
+		{"tcp", false, true},
+		{"wss", false, false},
+		{"ws", false, false},
+		{"MQTTS", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.scheme, func(t *testing.T) {
+			if got := IsTLSScheme(tt.scheme); got != tt.tls {
+				t.Errorf("IsTLSScheme(%q) = %v, want %v", tt.scheme, got, tt.tls)
+			}
+			if got := IsTCPScheme(tt.scheme); got != tt.tcp {
+				t.Errorf("IsTCPScheme(%q) = %v, want %v", tt.scheme, got, tt.tcp)
+			}
+		})
+	}
+}

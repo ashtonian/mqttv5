@@ -2,6 +2,7 @@ package mqttv5
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/ashtonian/mqttv5/internal/clock"
 	"github.com/ashtonian/mqttv5/internal/testbroker"
+	"github.com/ashtonian/mqttv5/internal/testpki"
 	"github.com/ashtonian/mqttv5/transport"
 	"github.com/ashtonian/mqttv5/wire"
 )
@@ -934,6 +936,28 @@ func TestPoolMemberInheritsDialFunc(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("DialFunc invoked %d times, want >= 3 (parent + 2 members)", dialCount.Load())
+}
+
+// Pool members dial through the parent's TLS config function, so a
+// rotated root reaches every member.
+func TestPoolMemberInheritsTLSConfigFunc(t *testing.T) {
+	ca := testpki.NewRoot(t, "CA")
+	b := testbroker.NewTLS(t, &tls.Config{Certificates: []tls.Certificate{ca.Server(t)}})
+	var calls atomic.Int32
+	tbClient(t, b,
+		WithPublisherPool(2),
+		WithTLSConfigFunc(func(context.Context, *url.URL) (*tls.Config, error) {
+			calls.Add(1)
+			return &tls.Config{RootCAs: ca.Pool(), Time: testpki.Clock}, nil
+		}),
+	)
+	deadline := time.Now().Add(3 * time.Second)
+	for calls.Load() < 3 && time.Now().Before(deadline) { // 1 parent + 2 members
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := calls.Load(); n < 3 {
+		t.Fatalf("TLSConfigFunc called %d times, want >= 3 (parent + 2 members)", n)
+	}
 }
 
 // countingBroker answers every connection, refusing PUBLISHes with

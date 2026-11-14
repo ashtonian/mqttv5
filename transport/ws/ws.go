@@ -50,8 +50,15 @@ const DefaultCloseFrameTimeout = time.Second
 type DialOpts struct {
 	// TLSConfig configures TLS for wss:// URLs and is ignored for
 	// ws://. Nil verifies against the system roots; an empty ServerName
-	// is filled in from the URL's host.
+	// is filled in from the URL's host. At most one of TLSConfig and
+	// TLSConfigFunc is set.
 	TLSConfig *tls.Config
+
+	// TLSConfigFunc returns the TLS config for each wss:// dial, before
+	// the TCP dial and under the dial's ctx: rotate trusted roots or
+	// client certificates without rebuilding the DialFunc. Its result
+	// is used as TLSConfig would be. Not called for ws://.
+	TLSConfigFunc transport.TLSConfigFunc
 
 	// HTTPHeaders are added to the HTTP upgrade request — useful for
 	// auth tokens, custom routing headers, etc.
@@ -104,6 +111,11 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 		return nil, fmt.Errorf("mqttv5/transport/ws: unsupported scheme %q", brokerURL.Scheme)
 	}
 
+	tlsCfg, err := tlsConfig(ctx, brokerURL, opts)
+	if err != nil {
+		return nil, err
+	}
+
 	subprotocols := opts.Subprotocols
 	if len(subprotocols) == 0 {
 		subprotocols = []string{"mqtt"}
@@ -116,7 +128,7 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 	dialer := gws.Dialer{
 		Protocols: subprotocols,
 		Timeout:   timeout,
-		TLSConfig: opts.TLSConfig,
+		TLSConfig: tlsCfg,
 		NetDial:   opts.NetDial,
 	}
 	if len(opts.HTTPHeaders) > 0 {
@@ -133,6 +145,31 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 	}
 	return newConn(conn, buffered, closeTimeout), nil
 }
+
+// tlsConfig resolves the TLS config for one dial of brokerURL.
+func tlsConfig(ctx context.Context, brokerURL *url.URL, opts DialOpts) (*tls.Config, error) {
+	if opts.TLSConfigFunc == nil {
+		return opts.TLSConfig, nil
+	}
+	if opts.TLSConfig != nil {
+		return nil, ErrConflictingTLSConfig
+	}
+	if brokerURL.Scheme != "wss" {
+		return nil, nil
+	}
+	cfg, err := opts.TLSConfigFunc(ctx, brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5/transport/ws: TLS config: %w", err)
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("mqttv5/transport/ws: %w", transport.ErrNilTLSConfig)
+	}
+	return cfg, nil
+}
+
+// ErrConflictingTLSConfig is returned by [Dial] when DialOpts sets both
+// TLSConfig and TLSConfigFunc.
+var ErrConflictingTLSConfig = errors.New("mqttv5/transport/ws: DialOpts sets both TLSConfig and TLSConfigFunc")
 
 // ErrTextFrame reports a WebSocket text frame from the broker. MQTT
 // travels only in binary frames; any other data frame must close the

@@ -73,10 +73,25 @@ mqttv5.WithTLSConfig(&tls.Config{
 })
 ```
 
-**Rotating trusted roots.** `RootCAs` is read from the config given to
-`WithTLSConfig` at `New` and used for every dial. Replacing it needs a
-dial path that builds its config per dial: `WithDialFunc` around
-`transport.DialTLS`.
+**Rotating trusted roots, per-broker trust.** `WithTLSConfig` gives
+every dial the same config. `WithTLSConfigFunc` instead asks for the
+config on each TLS dial, before the TCP dial and within the connect
+timeout, with the broker's URL: return the current roots to rotate
+them without a new client, or a different config per broker of
+`WithBrokers`. An error from it fails that attempt, which is retried
+with backoff.
+
+```go
+var roots atomic.Pointer[x509.CertPool] // replaced when the CA bundle changes
+mqttv5.WithTLSConfigFunc(func(ctx context.Context, broker *url.URL) (*tls.Config, error) {
+    return &tls.Config{RootCAs: roots.Load(), MinVersion: tls.VersionTLS13}, nil
+})
+```
+
+`WithTLSConfig`, `WithTLSConfigFunc` and `WithDialer` configure the
+built-in dial, so `New` rejects them beside `WithDialFunc`; a custom
+dial configures its own TLS (`ws.DialOpts` has `TLSConfig` and
+`TLSConfigFunc` of its own).
 
 **Protocol version.** Go's client accepts TLS 1.2 and later by default.
 Set `MinVersion: tls.VersionTLS13` when every broker supports it.
