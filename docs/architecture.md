@@ -75,7 +75,7 @@ control queue that survives reconnects.
 
 | Path | What |
 |---|---|
-| `client.go` | `Client`, `New`, `ServerInfo` (what CONNACK granted), `Stats` counters |
+| `client.go` | `Client`, `New`, `ServerInfo` (the broker reached, the TLS handshake, what CONNACK granted), `Stats` counters |
 | `options.go` | `Config`, every `With…` option |
 | `backoff.go` | `Backoff` and the policies: `ExponentialBackoff`, `ConstantBackoff`, `BackoffFunc` |
 | `lifecycle.go` | `Connect`/`Disconnect`, the supervisor and its reconnect limits, lifecycle callbacks and their queue, server redirects |
@@ -97,6 +97,7 @@ control queue that survives reconnects.
 | `queue/queuetest` | conformance tests for `PublisherQueue` implementations |
 | `wire` | MQTT v5 codec (unstable API) |
 | `transport`, `transport/ws` | TCP/TLS dialing and the TLS config each dial uses (server name, session resumption); WebSocket |
+| `tlsrevocation`, `tlsrevocation/storetest` | OCSP and CRL revocation checks of the broker's chain, for `WithTLSVerifier`; conformance tests for its `Store` |
 | `store/file`, `queue/file` | durable session store and publish queue |
 | `codec/json`, `codec/msgpack` | `Encoding` implementations |
 | `conformance` | tests against real brokers (`-tags conformance`) |

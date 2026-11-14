@@ -10,8 +10,9 @@
 ## Health and metrics
 
 `Client.Connected()` reports a live connection, and
-`Client.ServerInfo()` which broker it reached (`Broker`) and what that
-broker granted. The
+`Client.ServerInfo()` which broker it reached (`Broker`), the TLS
+handshake (`TLS`: the broker's certificate chain, version, cipher suite)
+and what that broker granted. The
 [lifecycle callbacks](reference.md#lifecycle-callbacks) report connection events as
 they happen.
 

@@ -67,6 +67,7 @@ SUBMODULES=(
     store/file
     queue/file
     transport/ws
+    tlsrevocation
 )
 
 # Modules whose requirements on this repository are pinned at release.
