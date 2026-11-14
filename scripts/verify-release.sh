@@ -14,7 +14,7 @@
 set -euo pipefail
 
 VERSION=${1:?usage: scripts/verify-release.sh vX.Y.Z}
-read -r -a MODULES <<<"${VERIFY_MODULES:-github.com/ashtonian/mqttv5 github.com/ashtonian/mqttv5/codec/json github.com/ashtonian/mqttv5/codec/msgpack github.com/ashtonian/mqttv5/store/file github.com/ashtonian/mqttv5/queue/file github.com/ashtonian/mqttv5/transport/ws}"
+read -r -a MODULES <<<"${VERIFY_MODULES:-github.com/ashtonian/mqttv5 github.com/ashtonian/mqttv5/codec/json github.com/ashtonian/mqttv5/codec/msgpack github.com/ashtonian/mqttv5/store/file github.com/ashtonian/mqttv5/queue/file github.com/ashtonian/mqttv5/transport/ws github.com/ashtonian/mqttv5/tlsrevocation}"
 
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT

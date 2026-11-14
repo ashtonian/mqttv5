@@ -39,8 +39,14 @@ CONNECT, so credentials are not sent to it; `Connect` and
 `errors.As` resolves (`x509.UnknownAuthorityError`,
 `x509.HostnameError`, `x509.CertificateInvalidError`).
 
-**What it does not check.** Revocation. Go's `crypto/x509` consults
-neither CRLs nor OCSP, and the client adds no check of its own.
+**What it does not check.** Revocation, unless `WithTLSVerifier` adds
+the check (see [Revocation](#revocation)): Go's own verifier consults
+neither CRLs nor OCSP. One exception is outside the client's control:
+on macOS and iOS with the system roots (`RootCAs` nil or
+`x509.SystemCertPool()`), Go hands verification to the platform, whose
+trust evaluation rejects some revoked public certificates by Apple's own
+policy. On Windows Go asks the platform for no revocation check, and a
+private CA in `RootCAs` always gets Go's own verifier.
 
 **Private CA.** Put the CA in `RootCAs`. Setting `RootCAs` replaces the
 system roots rather than adding to them.
@@ -89,3 +95,57 @@ dial configures its own TLS (`ws.DialOpts` has `TLSConfig` and
 
 **Protocol version.** Go's client accepts TLS 1.2 and later by default.
 Set `MinVersion: tls.VersionTLS13` when every broker supports it.
+
+**Inspecting the connection.** `ConnackInfo.TLS`, in
+`WithOnConnectionUp` and `ServerInfo()`, is the handshake's
+`tls.ConnectionState`: the broker's certificate chain as presented
+(`PeerCertificates`) and as verified (`VerifiedChains`), the negotiated
+version, cipher suite and ALPN protocol, and any stapled OCSP response.
+It is nil without TLS. Use it to record which certificate a broker
+presented, or to warn before it expires:
+
+```go
+mqttv5.WithOnConnectionUp(func(info mqttv5.ConnackInfo) {
+    if info.TLS == nil {
+        return
+    }
+    leaf := info.TLS.PeerCertificates[0]
+    slog.Info("broker certificate", "broker", info.Broker,
+        "subject", leaf.Subject.String(), "not_after", leaf.NotAfter)
+})
+```
+
+A custom `WithDialFunc` transport reports its TLS state by implementing
+`transport.ConnectionStater` on the connection it returns.
+
+## Revocation
+
+`WithTLSVerifier` runs a check of your own on every connection, after
+the TLS handshake and before CONNECT, under the attempt's context, so a
+lookup in it is bounded by the connect timeout and credentials never
+reach a broker it refuses. The `tlsrevocation` submodule supplies one:
+it checks the broker's chain against the stapled OCSP response, the CRL
+provider, the OCSP responders and the CRL distribution points, and fails
+the connection when a certificate is revoked or, by default, when its
+status cannot be established.
+
+```go
+checker, err := tlsrevocation.New()
+if err != nil {
+    return err
+}
+cli, err := mqttv5.New(
+    mqttv5.WithBroker("mqtts://broker.example.com:8883"),
+    mqttv5.WithTLSVerifier(checker.Verify),
+)
+```
+
+A private CA without distribution points supplies its CRL through
+`tlsrevocation.WithCRLProvider`. Against a broker that staples OCSP
+responses, `tlsrevocation.WithScope(tlsrevocation.LeafOnly)` checks
+without any network access. `tlsrevocation.WithStore` keeps fetched
+responses and CRLs beyond the process, so a client that restarts while
+the responders are unreachable can still check the broker; the checker
+re-verifies everything it reads back, so the store is not trusted. The
+[tlsrevocation README](../tlsrevocation/README.md) covers the policies,
+caching and troubleshooting.

@@ -10,5 +10,6 @@ use (
 	./internal/filedb
 	./queue/file
 	./store/file
+	./tlsrevocation
 	./transport/ws
 )

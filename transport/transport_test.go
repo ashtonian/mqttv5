@@ -237,6 +237,34 @@ func TestDialTLSClientCertificate(t *testing.T) {
 	})
 }
 
+// zeroStater reports a TLS state with no completed handshake, as a
+// wrapper around a plain connection does.
+type zeroStater struct{ net.Conn }
+
+func (zeroStater) ConnectionState() tls.ConnectionState { return tls.ConnectionState{} }
+
+func TestTLSState(t *testing.T) {
+	root := testpki.NewRoot(t, "root")
+	addr, _ := serveTLSOnce(t, &tls.Config{Certificates: []tls.Certificate{root.Server(t)}})
+	tlsConn, err := dialTLS(t, addr, &tls.Config{RootCAs: root.Pool(), Time: testpki.Clock})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tlsConn.Close()
+	if state, ok := TLSState(tlsConn); !ok || !state.HandshakeComplete || len(state.PeerCertificates) == 0 {
+		t.Fatalf("TLSState(*tls.Conn) = %v, %v; want the completed handshake", state.HandshakeComplete, ok)
+	}
+
+	plain, _ := net.Pipe()
+	defer plain.Close()
+	if _, ok := TLSState(plain); ok {
+		t.Fatal("TLSState reports TLS for a plain connection")
+	}
+	if _, ok := TLSState(zeroStater{plain}); ok {
+		t.Fatal("TLSState reports TLS for a state with no completed handshake")
+	}
+}
+
 func TestSchemes(t *testing.T) {
 	tests := []struct {
 		scheme   string

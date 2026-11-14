@@ -20,6 +20,7 @@
 | `WithTLSConfig(*tls.Config)` | system roots, server name from the URL | TLS for `mqtts://`/`tls://`/`ssl://`, the same config for every dial. `New` rejects it beside `WithTLSConfigFunc`. |
 | `WithTLSConfigFunc(fn)` | — | `fn(ctx, brokerURL) (*tls.Config, error)` supplies the TLS config of each `mqtts://`/`tls://`/`ssl://` dial, before the TCP dial and within `ConnectTimeout`: rotate trusted roots, or trust each broker of `WithBrokers` differently ([Certificate management](security.md#certificate-management)). An error, or a nil config (`transport.ErrNilTLSConfig`), fails the attempt like a dial failure. Not called for `mqtt://`/`tcp://`. Publisher pool members inherit it. Nil rejected. |
 | `WithDialer(*net.Dialer)` | default | Override transport `net.Dialer`. |
+| `WithTLSVerifier(v)` | — | `func(ctx, *url.URL, tls.ConnectionState) error` run on every connection after the TLS handshake and before CONNECT, under the attempt's context. An error fails the attempt like a dial error; a connection without TLS fails with `ErrNotTLS`. `tlsrevocation.Checker.Verify` checks revocation ([Revocation](security.md#revocation)). Nil rejected. |
 
 #### Identity and authentication
 
@@ -185,7 +186,7 @@ after five seconds.
 
 | Option | Signature / when | Effect |
 |---|---|---|
-| `WithOnConnectionUp(fn)` | `func(ConnackInfo)` — after every successful CONNACK | The broker reached (`Broker`, with `WithBrokers` the one failed over to) and what it granted: session present, limits, assigned ClientID, effective keep-alive, server reference, ... |
+| `WithOnConnectionUp(fn)` | `func(ConnackInfo)` — after every successful CONNACK | The broker reached (`Broker`, with `WithBrokers` the one failed over to), the TLS handshake (`TLS`, nil without TLS) and what it granted: session present, limits, assigned ClientID, effective keep-alive, server reference, ... |
 | `WithOnConnectionDown(fn)` | `func() bool` — on unexpected disconnect (not user Disconnect) | Return false to terminate the supervisor. |
 | `WithOnConnectError(fn)` | per failed CONNECT attempt (dial err, CONNACK refusal, AUTH-loop err) | Observability only. |
 | `WithOnReconnectAttempt(fn)` | immediately before each reconnect dial | Receives `(attempt, brokerURL)`. |

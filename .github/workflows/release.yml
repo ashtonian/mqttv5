@@ -35,7 +35,7 @@ jobs:
 
       - name: go vet and go test -race (every module)
         run: |
-          for m in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws examples benchmarks; do
+          for m in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws tlsrevocation examples benchmarks; do
             echo "::group::$m"
             (cd "$m" && go vet ./... && go test -race -timeout 5m -count=1 ./...) || exit 1
             echo "::endgroup::"
