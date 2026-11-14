@@ -75,7 +75,7 @@ control queue that survives reconnects.
 
 | Path | What |
 |---|---|
-| `client.go` | `Client`, `New`, `ServerInfo` (what CONNACK granted), `Stats` counters |
+| `client.go` | `Client`, `New`, `ServerInfo` (the broker reached, the TLS handshake, what CONNACK granted), `Stats` counters |
 | `options.go` | `Config`, every `With…` option |
 | `backoff.go` | `Backoff` and the policies: `ExponentialBackoff`, `ConstantBackoff`, `BackoffFunc` |
 | `lifecycle.go` | `Connect`/`Disconnect`, the supervisor and its reconnect limits, lifecycle callbacks and their queue, server redirects |
@@ -91,12 +91,13 @@ control queue that survives reconnects.
 | `*_test.go` | a test file per source file, plus `helpers_test.go`, `session_test.go` (sessions and stores across connections), `bench_test.go`, `example_test.go` and `readme_test.go` |
 | `internal/inflight` | session engine: packet identifiers, QoS 1/2 state, quota, replay, store writes |
 | `internal/trie` | topic trie |
-| `internal/clock`, `internal/testbroker` | injectable clock; scripted and raw brokers for tests |
+| `internal/clock`, `internal/testbroker`, `internal/testpki` | injectable clock; scripted and raw brokers (plain or TLS) for tests; in-memory certificate authorities and the TLS verification matrix every transport runs |
 | `internal/filedb` | bbolt wrapper with group commit, shared by `store/file` and `queue/file` |
 | `session`, `session/storetest` | `Store` interface, memory store, conformance tests for stores |
 | `queue/queuetest` | conformance tests for `PublisherQueue` implementations |
 | `wire` | MQTT v5 codec (unstable API) |
-| `transport`, `transport/ws` | TCP/TLS dialing; WebSocket |
+| `transport`, `transport/ws` | TCP/TLS dialing and the TLS config each dial uses (server name, session resumption); WebSocket |
+| `tlsrevocation`, `tlsrevocation/storetest` | OCSP and CRL revocation checks of the broker's chain, for `WithTLSVerifier`; conformance tests for its `Store` |
 | `store/file`, `queue/file` | durable session store and publish queue |
 | `codec/json`, `codec/msgpack` | `Encoding` implementations |
 | `conformance` | tests against real brokers (`-tags conformance`) |

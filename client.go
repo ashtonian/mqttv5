@@ -3,6 +3,8 @@ package mqttv5
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	mathrand "math/rand/v2"
 	"slices"
 	"strings"
@@ -50,6 +52,10 @@ type Client struct {
 	// redirectOnce, when set, is the URL the next attempt dials instead
 	// of the list (a temporary server redirect).
 	redirectOnce atomic.Pointer[string]
+
+	// tlsSessions lets reconnects of the built-in dial resume the TLS
+	// session (see transport.TLSClientConfig).
+	tlsSessions tls.ClientSessionCache
 
 	router *trie.Tree
 
@@ -142,6 +148,8 @@ func New(opts ...Option) (*Client, error) {
 		brokerSubs: make(map[string]*brokerSub),
 		identRefs:  make(map[uint32]int),
 		curChanged: make(chan struct{}),
+		// Zero capacity: the standard library's default.
+		tlsSessions: tls.NewLRUClientSessionCache(0),
 	}
 	if cfg.StatsEnabled {
 		c.stats = &clientStats{}
@@ -343,7 +351,8 @@ func (c *Client) ClientID() string {
 	return c.engine.Meta().ClientID
 }
 
-// ConnackInfo is what the broker granted in CONNACK (§3.2.2.3), with the
+// ConnackInfo describes one connection: the broker it reached, its TLS
+// handshake, and what the broker granted in CONNACK (§3.2.2.3), with the
 // spec's defaults applied to properties it did not send. The client
 // enforces these limits on everything it sends: a publish that exceeds
 // them fails before it reaches the wire.
@@ -351,6 +360,14 @@ type ConnackInfo struct {
 	// Broker is the URL of the broker the connection reached: with
 	// [WithBrokers], the one the client failed over to.
 	Broker string
+
+	// TLS is the connection's TLS handshake: the broker's certificate
+	// chain as presented and as verified, the negotiated version, cipher
+	// suite and ALPN protocol, and any stapled OCSP response. Nil when
+	// the connection is not TLS, or when a [WithDialFunc] transport's
+	// connection does not implement
+	// [github.com/ashtonian/mqttv5/transport.ConnectionStater].
+	TLS *tls.ConnectionState
 
 	// SessionPresent reports whether the broker resumed an existing
 	// session.
@@ -479,9 +496,36 @@ func (c *Client) ServerInfo() (ConnackInfo, bool) {
 // clone deep-copies the slices so a caller cannot modify the client's
 // copy.
 func (i ConnackInfo) clone() ConnackInfo {
+	i.TLS = cloneTLSState(i.TLS)
 	i.UserProperties = slices.Clone(i.UserProperties)
 	i.AuthenticationData = bytes.Clone(i.AuthenticationData)
 	return i
+}
+
+// cloneTLSState copies s and its slices. The certificates themselves are
+// shared: crypto/tls hands out the same *x509.Certificate values from
+// every ConnectionState call and never modifies them.
+func cloneTLSState(s *tls.ConnectionState) *tls.ConnectionState {
+	if s == nil {
+		return nil
+	}
+	c := *s
+	c.PeerCertificates = slices.Clone(s.PeerCertificates)
+	if s.VerifiedChains != nil {
+		c.VerifiedChains = make([][]*x509.Certificate, len(s.VerifiedChains))
+		for i, chain := range s.VerifiedChains {
+			c.VerifiedChains[i] = slices.Clone(chain)
+		}
+	}
+	if s.SignedCertificateTimestamps != nil {
+		c.SignedCertificateTimestamps = make([][]byte, len(s.SignedCertificateTimestamps))
+		for i, sct := range s.SignedCertificateTimestamps {
+			c.SignedCertificateTimestamps[i] = bytes.Clone(sct)
+		}
+	}
+	c.OCSPResponse = bytes.Clone(s.OCSPResponse)
+	c.TLSUnique = bytes.Clone(s.TLSUnique)
+	return &c
 }
 
 // clientStats holds the atomic counters backing Client.Stats. Kept

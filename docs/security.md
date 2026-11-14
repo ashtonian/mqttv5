@@ -5,7 +5,8 @@
 - **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
   broker against the system roots by default; `WithTLSConfig` supplies
   CAs, client certificates or a server name. Never set
-  `InsecureSkipVerify` outside tests.
+  `InsecureSkipVerify` outside tests. See
+  [Certificate management](#certificate-management).
 - **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
   (per-attempt rotation) keep secrets in memory only; the client never
   logs them. Enhanced authentication (`WithAuthenticator`) supports
@@ -24,3 +25,163 @@
   directory; encrypt the volume if payloads are sensitive.
 - **Reporting.** Report vulnerabilities privately through GitHub
   security advisories on this repository.
+
+## Certificate management
+
+**What verification checks.** The handshake fails unless the broker's
+certificate chains to a trusted root (`RootCAs`, or the system roots
+when it is nil), names the host being dialed (its DNS or IP subject
+alternative names match `ServerName`, or the URL host when
+`ServerName` is empty), is within its validity window, and allows
+server authentication. A broker that fails any of these never receives
+CONNECT, so credentials are not sent to it; `Connect` and
+`WithOnConnectError` return the `crypto/x509` error, which
+`errors.As` resolves (`x509.UnknownAuthorityError`,
+`x509.HostnameError`, `x509.CertificateInvalidError`).
+
+**What it does not check.** Revocation, unless `WithTLSVerifier` adds
+the check (see [Revocation](#revocation)): Go's own verifier consults
+neither CRLs nor OCSP. One exception is outside the client's control:
+on macOS and iOS with the system roots (`RootCAs` nil or
+`x509.SystemCertPool()`), Go hands verification to the platform, whose
+trust evaluation rejects some revoked public certificates by Apple's own
+policy. On Windows Go asks the platform for no revocation check, and a
+private CA in `RootCAs` always gets Go's own verifier.
+
+**Private CA.** Put the CA in `RootCAs`. Setting `RootCAs` replaces the
+system roots rather than adding to them.
+
+```go
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(caPEM)
+mqttv5.WithTLSConfig(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13})
+```
+
+**Client certificates (mutual TLS).** `Certificates` presents a fixed
+certificate. `GetClientCertificate` is called on every handshake in
+which the broker asks for a client certificate, and each reconnect is
+a new handshake, so returning the current certificate from it rotates
+the client's certificate without restarting the client:
+
+```go
+var current atomic.Pointer[tls.Certificate] // replaced on renewal
+mqttv5.WithTLSConfig(&tls.Config{
+    RootCAs: pool,
+    GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+        return current.Load(), nil
+    },
+})
+```
+
+**Rotating trusted roots, per-broker trust.** `WithTLSConfig` gives
+every dial the same config. `WithTLSConfigFunc` instead asks for the
+config on each TLS dial, before the TCP dial and within the connect
+timeout, with the broker's URL: return the current roots to rotate
+them without a new client, or a different config per broker of
+`WithBrokers`. An error from it fails that attempt, which is retried
+with backoff.
+
+```go
+var roots atomic.Pointer[x509.CertPool] // replaced when the CA bundle changes
+mqttv5.WithTLSConfigFunc(func(ctx context.Context, broker *url.URL) (*tls.Config, error) {
+    return &tls.Config{RootCAs: roots.Load(), MinVersion: tls.VersionTLS13}, nil
+})
+```
+
+`WithTLSConfig`, `WithTLSConfigFunc` and `WithDialer` configure the
+built-in dial, so `New` rejects them beside `WithDialFunc`; a custom
+dial configures its own TLS (`ws.DialOpts` has `TLSConfig` and
+`TLSConfigFunc` of its own).
+
+**Session resumption.** The client keeps TLS sessions in an in-memory
+cache of its own, so a reconnect to the same broker resumes the session
+instead of repeating the full handshake: the broker sends no
+certificate chain and signs nothing, which saves bandwidth and CPU on
+both ends during reconnect storms. It applies to the config of
+`WithTLSConfig` or `WithTLSConfigFunc` when that config sets no
+`ClientSessionCache` and presents no client certificate; a config
+returned fresh on each dial resumes too. `ws.DialFunc` does the same
+for `wss://`.
+
+- **Client certificates.** A resumed session does not present the
+  client certificate again ([RFC 8446, section
+  4.3.2](https://www.rfc-editor.org/rfc/rfc8446#section-4.3.2)), so a
+  certificate rotated through `GetClientCertificate` would not reach the
+  broker until it stopped honouring the session ticket, up to seven days
+  in TLS 1.3. A config presenting a client certificate therefore gets no
+  cache from the client; set `ClientSessionCache` on it to resume anyway.
+- **Verification.** Before resuming, Go checks the cached certificate's
+  validity window and host name and verifies its chain against the
+  `RootCAs` of the config at hand, so removing a root ends resumption
+  with it: the next connection is a full handshake and is refused.
+  `tls.Config.VerifyConnection` runs on resumed connections too, given
+  the chain and stapled OCSP response of the handshake that created the
+  session.
+- **Your own cache.** Set `ClientSessionCache`, for example to resume
+  across restarts (`tls.ClientSessionState.ResumptionState` and
+  `tls.NewResumptionState` convert a session to and from
+  `tls.SessionState`, whose `Bytes` and `tls.ParseSessionState`
+  serialise it). A persistent cache must be confidential and
+  integrity-protected: a stored session holds its resumption secret, and
+  a resumed TLS 1.3 broker proves itself with that secret rather than
+  its certificate, so whoever can read or write the store can
+  impersonate the broker.
+- **Turning it off.** `SessionTicketsDisabled: true` makes every
+  connection a full handshake.
+
+**Protocol version.** Go's client accepts TLS 1.2 and later by default.
+Set `MinVersion: tls.VersionTLS13` when every broker supports it.
+
+**Inspecting the connection.** `ConnackInfo.TLS`, in
+`WithOnConnectionUp` and `ServerInfo()`, is the handshake's
+`tls.ConnectionState`: the broker's certificate chain as presented
+(`PeerCertificates`) and as verified (`VerifiedChains`), the negotiated
+version, cipher suite and ALPN protocol, and any stapled OCSP response.
+It is nil without TLS. Use it to record which certificate a broker
+presented, or to warn before it expires:
+
+```go
+mqttv5.WithOnConnectionUp(func(info mqttv5.ConnackInfo) {
+    if info.TLS == nil {
+        return
+    }
+    leaf := info.TLS.PeerCertificates[0]
+    slog.Info("broker certificate", "broker", info.Broker,
+        "subject", leaf.Subject.String(), "not_after", leaf.NotAfter)
+})
+```
+
+A custom `WithDialFunc` transport reports its TLS state by implementing
+`transport.ConnectionStater` on the connection it returns.
+
+## Revocation
+
+`WithTLSVerifier` runs a check of your own on every connection, after
+the TLS handshake and before CONNECT, under the attempt's context, so a
+lookup in it is bounded by the connect timeout and credentials never
+reach a broker it refuses. The `tlsrevocation` submodule supplies one:
+it checks the broker's chain against the stapled OCSP response, the CRL
+provider, the OCSP responders and the CRL distribution points, and fails
+the connection when a certificate is revoked or, by default, when its
+status cannot be established.
+
+```go
+checker, err := tlsrevocation.New()
+if err != nil {
+    return err
+}
+cli, err := mqttv5.New(
+    mqttv5.WithBroker("mqtts://broker.example.com:8883"),
+    mqttv5.WithTLSVerifier(checker.Verify),
+)
+```
+
+A private CA without distribution points supplies its CRL through
+`tlsrevocation.WithCRLProvider`. Against a broker that staples OCSP
+responses, `tlsrevocation.WithScope(tlsrevocation.LeafOnly)` checks
+without any network access. `tlsrevocation.WithStore` keeps fetched
+responses and CRLs beyond the process, so a client that restarts while
+the responders are unreachable can still check the broker; the checker
+re-verifies everything it reads back, so the store is not trusted. The
+[tlsrevocation README](../tlsrevocation/README.md) covers the policies,
+caching and troubleshooting.

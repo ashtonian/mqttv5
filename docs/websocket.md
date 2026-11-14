@@ -16,5 +16,8 @@ cli, _ := mqttv5.New(
 
 Without `TLSConfig`, `wss://` verifies the broker against the system
 roots with the URL's host as server name, the same default as
-`mqtts://`. `ws://` and `wss://` URLs need `WithDialFunc`; `New` rejects
+`mqtts://`. `ws.DialOpts.TLSConfigFunc` supplies the config per dial
+instead, as `WithTLSConfigFunc` does for `mqtts://`; the client's own
+TLS options do not apply beside `WithDialFunc`, and `New` rejects them
+there. `ws://` and `wss://` URLs need `WithDialFunc`; `New` rejects
 them otherwise.

@@ -13,6 +13,7 @@ its own `go.mod`, so the core never pulls in its dependencies.
 | File session store | `github.com/ashtonian/mqttv5/store/file` | Crash-safe in-flight QoS 1/2 state |
 | File publish queue | `github.com/ashtonian/mqttv5/queue/file` | Crash-safe outbound publish queue for `QueuePublisher` |
 | WebSocket transport | `github.com/ashtonian/mqttv5/transport/ws` | ws:// and wss:// — `WithDialFunc(ws.DialFunc(ws.DialOpts{...}))` |
+| Revocation checking | `github.com/ashtonian/mqttv5/tlsrevocation` | OCSP (stapled and fetched) and CRL checks of the broker's chain — `WithTLSVerifier(checker.Verify)` |
 
 Every module is released with the same version tag (`store/file/vX.Y.Z`
 alongside `vX.Y.Z`); install a submodule at the version of the core you
@@ -32,6 +33,7 @@ they share, at the same version.
 | `github.com/ashtonian/mqttv5` (core) | Go standard library only, tests included |
 | `store/file`, `queue/file` | [`go.etcd.io/bbolt`](https://github.com/etcd-io/bbolt) through `internal/filedb` |
 | `transport/ws` | [`github.com/gobwas/ws`](https://github.com/gobwas/ws) |
+| `tlsrevocation` | [`golang.org/x/crypto`](https://pkg.go.dev/golang.org/x/crypto/ocsp) (`ocsp`) |
 | `codec/json` | standard library |
 | `codec/msgpack` | [`github.com/vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack) |
 | `benchmarks` | eclipse/paho.golang, eclipse/paho.mqtt.golang, golang.org/x/perf (not a dependency of anything else) |

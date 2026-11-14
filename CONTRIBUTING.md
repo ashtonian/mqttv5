@@ -18,7 +18,7 @@ map. Run the commands below from the repository root.
 go test -race ./...
 
 # Every module (each has its own go.mod).
-for m in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws examples benchmarks; do
+for m in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws tlsrevocation examples benchmarks; do
     (cd $m && go vet ./... && go test -race ./...)
 done
 

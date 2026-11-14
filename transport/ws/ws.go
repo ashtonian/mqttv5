@@ -50,8 +50,15 @@ const DefaultCloseFrameTimeout = time.Second
 type DialOpts struct {
 	// TLSConfig configures TLS for wss:// URLs and is ignored for
 	// ws://. Nil verifies against the system roots; an empty ServerName
-	// is filled in from the URL's host.
+	// is filled in from the URL's host. At most one of TLSConfig and
+	// TLSConfigFunc is set.
 	TLSConfig *tls.Config
+
+	// TLSConfigFunc returns the TLS config for each wss:// dial, before
+	// the TCP dial and under the dial's ctx: rotate trusted roots or
+	// client certificates without rebuilding the DialFunc. Its result
+	// is used as TLSConfig would be. Not called for ws://.
+	TLSConfigFunc transport.TLSConfigFunc
 
 	// HTTPHeaders are added to the HTTP upgrade request — useful for
 	// auth tokens, custom routing headers, etc.
@@ -79,12 +86,15 @@ type DialOpts struct {
 //
 //	mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg}))
 //
-// Equivalent to writing the closure by hand around [Dial]; provided
-// because the closure form reads poorly when several broker options
-// are stacked together.
+// Its wss:// dials share one in-memory TLS session cache, so the
+// client's reconnects resume the TLS session, for configs without a
+// ClientSessionCache of their own that present no client certificate
+// (see [transport.TLSClientConfig]). Otherwise it is [Dial].
 func DialFunc(opts DialOpts) transport.DialFunc {
+	// Zero capacity: the standard library's default.
+	sessions := tls.NewLRUClientSessionCache(0)
 	return func(ctx context.Context, brokerURL *url.URL) (transport.Conn, error) {
-		return Dial(ctx, brokerURL, opts)
+		return dial(ctx, brokerURL, opts, sessions)
 	}
 }
 
@@ -93,8 +103,15 @@ func DialFunc(opts DialOpts) transport.DialFunc {
 // control packet (per MQTT-over-WS §6 — "single WebSocket data
 // frame"). Prefer [DialFunc] when wiring into mqttv5.WithDialFunc;
 // call Dial directly when you need a one-shot upgrade outside the
-// client.
+// client. Dial resumes a TLS session only through the config's own
+// ClientSessionCache.
 func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Conn, error) {
+	return dial(ctx, brokerURL, opts, nil)
+}
+
+// dial is Dial with sessions as the TLS session cache for configs that
+// have none (see transport.TLSClientConfig).
+func dial(ctx context.Context, brokerURL *url.URL, opts DialOpts, sessions tls.ClientSessionCache) (transport.Conn, error) {
 	if brokerURL == nil {
 		return nil, errors.New("mqttv5/transport/ws: nil URL")
 	}
@@ -102,6 +119,14 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 	case "ws", "wss":
 	default:
 		return nil, fmt.Errorf("mqttv5/transport/ws: unsupported scheme %q", brokerURL.Scheme)
+	}
+
+	tlsCfg, err := tlsConfig(ctx, brokerURL, opts)
+	if err != nil {
+		return nil, err
+	}
+	if brokerURL.Scheme == "wss" {
+		tlsCfg = transport.TLSClientConfig(tlsCfg, brokerURL.Hostname(), sessions)
 	}
 
 	subprotocols := opts.Subprotocols
@@ -116,7 +141,7 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 	dialer := gws.Dialer{
 		Protocols: subprotocols,
 		Timeout:   timeout,
-		TLSConfig: opts.TLSConfig,
+		TLSConfig: tlsCfg,
 		NetDial:   opts.NetDial,
 	}
 	if len(opts.HTTPHeaders) > 0 {
@@ -133,6 +158,31 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 	}
 	return newConn(conn, buffered, closeTimeout), nil
 }
+
+// tlsConfig resolves the TLS config for one dial of brokerURL.
+func tlsConfig(ctx context.Context, brokerURL *url.URL, opts DialOpts) (*tls.Config, error) {
+	if opts.TLSConfigFunc == nil {
+		return opts.TLSConfig, nil
+	}
+	if opts.TLSConfig != nil {
+		return nil, ErrConflictingTLSConfig
+	}
+	if brokerURL.Scheme != "wss" {
+		return nil, nil
+	}
+	cfg, err := opts.TLSConfigFunc(ctx, brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5/transport/ws: TLS config: %w", err)
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("mqttv5/transport/ws: %w", transport.ErrNilTLSConfig)
+	}
+	return cfg, nil
+}
+
+// ErrConflictingTLSConfig is returned by [Dial] when DialOpts sets both
+// TLSConfig and TLSConfigFunc.
+var ErrConflictingTLSConfig = errors.New("mqttv5/transport/ws: DialOpts sets both TLSConfig and TLSConfigFunc")
 
 // ErrTextFrame reports a WebSocket text frame from the broker. MQTT
 // travels only in binary frames; any other data frame must close the
@@ -152,6 +202,18 @@ type Conn struct {
 	wmu sync.Mutex
 
 	closeTimeout time.Duration
+}
+
+var _ transport.ConnectionStater = (*Conn)(nil)
+
+// ConnectionState returns the TLS state of a wss:// connection. For
+// ws:// it returns the zero state, which [transport.TLSState] reports as
+// no TLS.
+func (c *Conn) ConnectionState() tls.ConnectionState {
+	if tc, ok := c.raw.(*tls.Conn); ok {
+		return tc.ConnectionState()
+	}
+	return tls.ConnectionState{}
 }
 
 // newConn wraps raw. buffered, when not nil, holds frames the server

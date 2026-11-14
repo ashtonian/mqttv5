@@ -306,15 +306,41 @@ type connectResult struct {
 
 // dial resolves the broker URL to a live transport.Conn. If a custom
 // DialFunc is configured it takes precedence. Otherwise the built-in
-// transport.Dial handles TCP and TLS schemes.
+// transport.Dial handles TCP and TLS schemes, with the TLS config from
+// TLSConfigFunc when one is set and the client's session cache, so
+// reconnects resume the TLS session.
 func (c *Client) dial(ctx context.Context, brokerURL *url.URL) (transport.Conn, error) {
 	if c.cfg.DialFunc != nil {
 		return c.cfg.DialFunc(ctx, brokerURL)
 	}
-	return transport.Dial(ctx, brokerURL.String(), transport.DialOpts{
-		TLSConfig: c.cfg.TLSConfig,
-		Dialer:    c.cfg.Dialer,
-	})
+	opts := transport.DialOpts{
+		TLSConfig:    c.cfg.TLSConfig,
+		Dialer:       c.cfg.Dialer,
+		SessionCache: c.tlsSessions,
+	}
+	if c.cfg.TLSConfigFunc != nil && transport.IsTLSScheme(brokerURL.Scheme) {
+		cfg, err := c.cfg.TLSConfigFunc(ctx, brokerURL)
+		if err != nil {
+			return nil, fmt.Errorf("TLS config: %w", err)
+		}
+		if cfg == nil {
+			return nil, fmt.Errorf("TLS config: %w", transport.ErrNilTLSConfig)
+		}
+		opts.TLSConfig = cfg
+	}
+	return transport.Dial(ctx, brokerURL.String(), opts)
+}
+
+// verifyTLS runs the configured TLSVerifier on conn's TLS handshake.
+func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL *url.URL) error {
+	state, ok := transport.TLSState(conn)
+	if !ok {
+		return fmt.Errorf("mqttv5: verify TLS for %s: %w", brokerURL, ErrNotTLS)
+	}
+	if err := c.cfg.TLSVerifier(ctx, brokerURL, state); err != nil {
+		return fmt.Errorf("mqttv5: verify TLS for %s: %w", brokerURL, err)
+	}
+	return nil
 }
 
 // handshakeViolation answers a broker protocol violation during the
@@ -359,6 +385,12 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 	conn, err := c.dial(dialCtx, u)
 	if err != nil {
 		return nil, fmt.Errorf("mqttv5: dial: %w", err)
+	}
+	if c.cfg.TLSVerifier != nil {
+		if err = c.verifyTLS(dialCtx, conn, u); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 	}
 
 	if dl, ok := dialCtx.Deadline(); ok {
@@ -456,6 +488,9 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 			}
 			info := parseConnack(p, sent)
 			info.Broker = brokerURL
+			if state, ok := transport.TLSState(conn); ok {
+				info.TLS = &state
+			}
 			p.Release()
 			if !interrupt() {
 				// ctx ended as the CONNACK arrived.

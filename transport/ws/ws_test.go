@@ -5,6 +5,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +17,9 @@ import (
 
 	gws "github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
+
+	"github.com/ashtonian/mqttv5/internal/testpki"
+	"github.com/ashtonian/mqttv5/transport"
 )
 
 // startEchoWS spins up an HTTP server that upgrades each connection
@@ -102,6 +108,176 @@ func TestWssVerifiesByDefault(t *testing.T) {
 	conn.Close()
 }
 
+// wss:// verifies the broker's chain, name and validity window against
+// the caller's roots, the same matrix mqtts:// runs.
+func TestWssVerification(t *testing.T) {
+	root, cases := testpki.VerificationCases(t)
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, _, _, err := gws.UpgradeHTTP(r, w)
+				if err == nil {
+					conn.Close()
+				}
+			}))
+			srv.TLS = &tls.Config{Certificates: []tls.Certificate{tt.Cert}}
+			srv.Config.ErrorLog = log.New(io.Discard, "", 0) // refused handshakes are the point
+			srv.StartTLS()
+			defer srv.Close()
+			u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+
+			conn, err := Dial(context.Background(), u, DialOpts{TLSConfig: &tls.Config{
+				RootCAs:    root.Pool(),
+				ServerName: tt.ServerName,
+				Time:       testpki.Clock,
+			}})
+			if tt.WantErr != nil {
+				if err == nil {
+					conn.Close()
+					t.Fatal("dial succeeded, want a verification error")
+				}
+				if !tt.WantErr(err) {
+					t.Fatalf("dial error = %v, not the expected verification error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			conn.Close()
+		})
+	}
+}
+
+// A wss:// connection reports its TLS handshake; a ws:// one reports
+// none.
+func TestConnectionState(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+	conn, err := Dial(context.Background(), u, DialOpts{TLSConfig: &tls.Config{RootCAs: certPool(srv.Certificate())}})
+	if err != nil {
+		t.Fatalf("wss:// dial: %v", err)
+	}
+	defer conn.Close()
+	state, ok := transport.TLSState(conn)
+	if !ok || len(state.PeerCertificates) == 0 || !state.PeerCertificates[0].Equal(srv.Certificate()) {
+		t.Fatalf("wss:// TLSState = %v; want the server's certificate", ok)
+	}
+
+	base, cleanup := startEchoWS(t)
+	defer cleanup()
+	plain, err := Dial(context.Background(), base, DialOpts{})
+	if err != nil {
+		t.Fatalf("ws:// dial: %v", err)
+	}
+	defer plain.Close()
+	if _, ok := transport.TLSState(plain); ok {
+		t.Fatal("ws:// reports TLS state")
+	}
+}
+
+// startWSS serves WebSocket upgrades over TLS with cert and returns
+// its wss:// URL.
+func startWSS(t *testing.T, cert tls.Certificate) *url.URL {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+	return u
+}
+
+var errNoCredentials = errors.New("no credentials yet")
+
+// TLSConfigFunc supplies the wss:// config per dial, with the dial's
+// context and URL; its failures end the dial before the upgrade.
+func TestTLSConfigFunc(t *testing.T) {
+	root := testpki.NewRoot(t, "root")
+	u := startWSS(t, root.Server(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	t.Run("config per dial", func(t *testing.T) {
+		var gotURL string
+		var hadDeadline bool
+		conn, err := Dial(ctx, u, DialOpts{TLSConfigFunc: func(ctx context.Context, u *url.URL) (*tls.Config, error) {
+			gotURL = u.String()
+			_, hadDeadline = ctx.Deadline()
+			return &tls.Config{RootCAs: root.Pool(), Time: testpki.Clock}, nil
+		}})
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		conn.Close()
+		if gotURL != u.String() {
+			t.Fatalf("provider got URL %q, want %q", gotURL, u.String())
+		}
+		if !hadDeadline {
+			t.Fatal("provider ran without the dial's deadline")
+		}
+	})
+
+	tests := []struct {
+		name    string
+		config  *tls.Config
+		err     error
+		wantErr error
+	}{
+		{name: "provider error", err: errNoCredentials, wantErr: errNoCredentials},
+		{name: "nil config and no error", wantErr: transport.ErrNilTLSConfig},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Dial(ctx, u, DialOpts{TLSConfigFunc: func(context.Context, *url.URL) (*tls.Config, error) {
+				return tt.config, tt.err
+			}})
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Dial error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("with TLSConfig", func(t *testing.T) {
+		_, err := Dial(ctx, u, DialOpts{
+			TLSConfig:     &tls.Config{},
+			TLSConfigFunc: func(context.Context, *url.URL) (*tls.Config, error) { return &tls.Config{}, nil },
+		})
+		if !errors.Is(err, ErrConflictingTLSConfig) {
+			t.Fatalf("Dial error = %v, want ErrConflictingTLSConfig", err)
+		}
+	})
+
+	t.Run("not consulted for ws://", func(t *testing.T) {
+		base, cleanup := startEchoWS(t)
+		defer cleanup()
+		called := false
+		conn, err := Dial(ctx, base, DialOpts{TLSConfigFunc: func(context.Context, *url.URL) (*tls.Config, error) {
+			called = true
+			return nil, errNoCredentials
+		}})
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		conn.Close()
+		if called {
+			t.Fatal("provider called for ws://")
+		}
+	})
+}
+
 func certPool(c *x509.Certificate) *x509.CertPool {
 	p := x509.NewCertPool()
 	p.AddCert(c)
@@ -149,5 +325,51 @@ func TestMultipleSmallReads(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("byte-by-byte read mismatch")
+	}
+}
+
+// A DialFunc's wss:// dials resume the TLS session, so a client's
+// reconnects do; Dial alone resumes only through the config's own cache.
+func TestWssResumesSession(t *testing.T) {
+	root := testpki.NewRoot(t, "root")
+	resumed := make(chan bool, 8)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resumed <- r.TLS.DidResume
+		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{root.Server(t)}}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+	opts := DialOpts{TLSConfig: &tls.Config{RootCAs: root.Pool(), Time: testpki.Clock}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	dials := func(dial transport.DialFunc) []bool {
+		t.Helper()
+		var got []bool
+		for range 2 {
+			conn, err := dial(ctx, u)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			conn.Close()
+			got = append(got, <-resumed)
+		}
+		return got
+	}
+	if got := dials(DialFunc(opts)); got[0] || !got[1] {
+		t.Fatalf("DialFunc resumed = %v, want [false true]", got)
+	}
+	oneShot := func(ctx context.Context, u *url.URL) (transport.Conn, error) { return Dial(ctx, u, opts) }
+	if got := dials(oneShot); got[0] || got[1] {
+		t.Fatalf("Dial resumed = %v, want [false false]", got)
+	}
+	if opts.TLSConfig.ClientSessionCache != nil || opts.TLSConfig.ServerName != "" {
+		t.Fatal("dialing modified the caller's TLS config")
 	}
 }
