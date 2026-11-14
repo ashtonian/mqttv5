@@ -44,6 +44,32 @@ type Conn interface {
 // Compile-time assurance that net.Conn is a superset of our Conn.
 var _ Conn = (net.Conn)(nil)
 
+// ConnectionStater is implemented by connections that report a TLS
+// handshake: *tls.Conn, and transports that wrap one, such as
+// transport/ws. A wrapper may implement it unconditionally and return
+// the zero state, whose HandshakeComplete is false, when its connection
+// is not TLS.
+type ConnectionStater interface {
+	ConnectionState() tls.ConnectionState
+}
+
+var _ ConnectionStater = (*tls.Conn)(nil)
+
+// TLSState returns the TLS state conn negotiated, and false when conn
+// did not negotiate TLS: it does not implement [ConnectionStater], or
+// reports no completed handshake.
+func TLSState(conn Conn) (tls.ConnectionState, bool) {
+	stater, ok := conn.(ConnectionStater)
+	if !ok {
+		return tls.ConnectionState{}, false
+	}
+	state := stater.ConnectionState()
+	if !state.HandshakeComplete {
+		return tls.ConnectionState{}, false
+	}
+	return state, true
+}
+
 // DialFunc is the signature the mqttv5 client uses to open a new
 // broker connection. Named here so extension transports (e.g.
 // transport/ws) can return a value of this type from a helper

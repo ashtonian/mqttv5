@@ -6,12 +6,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"math/big"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ashtonian/mqttv5/internal/testbroker"
 	"github.com/ashtonian/mqttv5/internal/testpki"
+	"github.com/ashtonian/mqttv5/transport"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -116,4 +118,111 @@ func TestTLSUntrustedBrokerReceivesNoConnect(t *testing.T) {
 	if log := conn.Log(); len(log) != 0 {
 		t.Fatalf("broker received %d packets from a client that does not trust it", len(log))
 	}
+}
+
+// ServerInfo and OnConnectionUp report the TLS handshake of a TLS
+// connection: the broker's chain and what was negotiated.
+func TestConnackInfoReportsTLSState(t *testing.T) {
+	brokerCA := testpki.NewRoot(t, "broker CA")
+	serverCert := brokerCA.Server(t)
+	b := testbroker.NewTLS(t, &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		NextProtos:   []string{"mqtt"},
+	})
+	ups := make(chan ConnackInfo, 1)
+	cli := tbClient(t, b,
+		WithTLSConfig(&tls.Config{RootCAs: brokerCA.Pool(), NextProtos: []string{"mqtt"}, Time: testpki.Clock}),
+		WithOnConnectionUp(func(info ConnackInfo) { ups <- info }),
+	)
+
+	info, ok := cli.ServerInfo()
+	if !ok {
+		t.Fatal("ServerInfo: not connected")
+	}
+	assertTLSState(t, "ServerInfo", info.TLS, serverCert)
+	select {
+	case up := <-ups:
+		assertTLSState(t, "OnConnectionUp", up.TLS, serverCert)
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnConnectionUp did not fire")
+	}
+
+	// The caller gets a copy.
+	info.TLS.PeerCertificates[0] = nil
+	again, _ := cli.ServerInfo()
+	if again.TLS.PeerCertificates[0] == nil {
+		t.Fatal("modifying ServerInfo().TLS changed the client's copy")
+	}
+}
+
+func assertTLSState(t *testing.T, from string, state *tls.ConnectionState, serverCert tls.Certificate) {
+	t.Helper()
+	if state == nil {
+		t.Fatalf("%s: TLS is nil on a TLS connection", from)
+	}
+	if !state.HandshakeComplete {
+		t.Fatalf("%s: HandshakeComplete is false", from)
+	}
+	if len(state.PeerCertificates) == 0 || state.PeerCertificates[0].SerialNumber.Cmp(serverCert.Leaf.SerialNumber) != 0 {
+		t.Fatalf("%s: PeerCertificates does not start with the broker's leaf", from)
+	}
+	if len(state.VerifiedChains) == 0 {
+		t.Fatalf("%s: no verified chain", from)
+	}
+	if state.NegotiatedProtocol != "mqtt" {
+		t.Fatalf("%s: NegotiatedProtocol = %q, want mqtt", from, state.NegotiatedProtocol)
+	}
+}
+
+func TestConnackInfoTLSNilOnPlainTCP(t *testing.T) {
+	cli := tbClient(t, testbroker.New(t))
+	info, ok := cli.ServerInfo()
+	if !ok {
+		t.Fatal("ServerInfo: not connected")
+	}
+	if info.TLS != nil {
+		t.Fatalf("TLS = %+v on a plain TCP connection, want nil", info.TLS)
+	}
+}
+
+// statefulConn is a custom transport's connection that wraps a TLS
+// connection and reports its state.
+type statefulConn struct {
+	transport.Conn
+	tls *tls.Conn
+}
+
+func (c statefulConn) ConnectionState() tls.ConnectionState { return c.tls.ConnectionState() }
+
+// opaqueConn wraps a TLS connection without reporting its state.
+type opaqueConn struct{ transport.Conn }
+
+// A custom WithDialFunc transport reports TLS state by implementing
+// transport.ConnectionStater; one that does not reports none.
+func TestConnackInfoTLSFromCustomDialFunc(t *testing.T) {
+	brokerCA := testpki.NewRoot(t, "broker CA")
+	b := testbroker.NewTLS(t, &tls.Config{Certificates: []tls.Certificate{brokerCA.Server(t)}})
+	cfg := &tls.Config{RootCAs: brokerCA.Pool(), Time: testpki.Clock}
+	dialWrapped := func(wrap func(*tls.Conn) transport.Conn) transport.DialFunc {
+		return func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+			c, err := transport.DialTLS(ctx, u.Host, u.Hostname(), transport.DialOpts{TLSConfig: cfg})
+			if err != nil {
+				return nil, err
+			}
+			return wrap(c.(*tls.Conn)), nil
+		}
+	}
+
+	t.Run("implements ConnectionStater", func(t *testing.T) {
+		cli := tbClient(t, b, WithDialFunc(dialWrapped(func(c *tls.Conn) transport.Conn { return statefulConn{c, c} })))
+		if info, _ := cli.ServerInfo(); info.TLS == nil || !info.TLS.HandshakeComplete {
+			t.Fatalf("TLS = %+v, want the wrapped connection's state", info.TLS)
+		}
+	})
+	t.Run("does not", func(t *testing.T) {
+		cli := tbClient(t, b, WithDialFunc(dialWrapped(func(c *tls.Conn) transport.Conn { return opaqueConn{c} })))
+		if info, _ := cli.ServerInfo(); info.TLS != nil {
+			t.Fatalf("TLS = %+v, want nil for a connection that reports no state", info.TLS)
+		}
+	})
 }

@@ -78,6 +78,7 @@ The URL's path and query go into the upgrade request
 | `DefaultCloseFrameTimeout` | 1 s. |
 | `ErrTextFrame` | The broker sent a text frame. |
 | `Conn` | The `transport.Conn` that `Dial` returns; treat it as opaque. |
+| `(*Conn).ConnectionState() tls.ConnectionState` | The TLS handshake of a `wss://` connection; the zero state for `ws://`. Implements `transport.ConnectionStater`, so the client reports it in `ConnackInfo.TLS`. |
 
 ## Build, run, test
 
@@ -87,7 +88,8 @@ go -C transport/ws test -race ./...
 
 The tests run against an in-process WebSocket server: round trips,
 byte-at-a-time reads, ping/pong under concurrent writes, broker Close,
-text frames, closing during a stalled write, and TLS verification. [`examples/ws`](../../examples/ws)
+text frames, closing during a stalled write, TLS verification and TLS
+state. [`examples/ws`](../../examples/ws)
 connects to a real broker.
 
 ## Operations

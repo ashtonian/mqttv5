@@ -184,7 +184,7 @@ after five seconds.
 
 | Option | Signature / when | Effect |
 |---|---|---|
-| `WithOnConnectionUp(fn)` | `func(ConnackInfo)` — after every successful CONNACK | The broker reached (`Broker`, with `WithBrokers` the one failed over to) and what it granted: session present, limits, assigned ClientID, effective keep-alive, server reference, ... |
+| `WithOnConnectionUp(fn)` | `func(ConnackInfo)` — after every successful CONNACK | The broker reached (`Broker`, with `WithBrokers` the one failed over to), the TLS handshake (`TLS`, nil without TLS) and what it granted: session present, limits, assigned ClientID, effective keep-alive, server reference, ... |
 | `WithOnConnectionDown(fn)` | `func() bool` — on unexpected disconnect (not user Disconnect) | Return false to terminate the supervisor. |
 | `WithOnConnectError(fn)` | per failed CONNECT attempt (dial err, CONNACK refusal, AUTH-loop err) | Observability only. |
 | `WithOnReconnectAttempt(fn)` | immediately before each reconnect dial | Receives `(attempt, brokerURL)`. |

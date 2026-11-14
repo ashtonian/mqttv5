@@ -154,6 +154,18 @@ type Conn struct {
 	closeTimeout time.Duration
 }
 
+var _ transport.ConnectionStater = (*Conn)(nil)
+
+// ConnectionState returns the TLS state of a wss:// connection. For
+// ws:// it returns the zero state, which [transport.TLSState] reports as
+// no TLS.
+func (c *Conn) ConnectionState() tls.ConnectionState {
+	if tc, ok := c.raw.(*tls.Conn); ok {
+		return tc.ConnectionState()
+	}
+	return tls.ConnectionState{}
+}
+
 // newConn wraps raw. buffered, when not nil, holds frames the server
 // sent right behind its handshake response, read along with it; they
 // come first.
