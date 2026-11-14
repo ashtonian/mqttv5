@@ -1,6 +1,7 @@
 package mqttv5
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -672,6 +673,52 @@ func TestTLSReconnectResumesSession(t *testing.T) {
 				t.Fatal("the client modified the caller's TLS config")
 			}
 		})
+	}
+}
+
+// A resumed connection reports the chain and OCSP staple of the session
+// it resumes, so a TLS verifier, such as tlsrevocation's, checks a
+// reconnect on which the broker sends no certificate as it checked the
+// first connection.
+func TestTLSVerifierSeesResumedSession(t *testing.T) {
+	brokerCA := testpki.NewRoot(t, "broker CA")
+	serverCert := brokerCA.Server(t)
+	serverCert.OCSPStaple = []byte("staple")
+	b := testbroker.NewTLS(t, &tls.Config{Certificates: []tls.Certificate{serverCert}})
+	states := make(chan tls.ConnectionState, 4)
+	tbClient(t, b,
+		WithTLSConfig(tlsConfigTrusting(brokerCA)),
+		WithTLSVerifier(func(_ context.Context, _ *url.URL, state tls.ConnectionState) error {
+			states <- state
+			return nil
+		}),
+	)
+	first := <-states
+	b.DropAll()
+	if b.Conn(1, 3*time.Second) == nil {
+		t.Fatal("client did not reconnect")
+	}
+	var reconnect tls.ConnectionState
+	select {
+	case reconnect = <-states:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the verifier did not run on the reconnect")
+	}
+
+	for _, c := range []struct {
+		name    string
+		state   tls.ConnectionState
+		resumed bool
+	}{{"first connection", first, false}, {"reconnect", reconnect, true}} {
+		if c.state.DidResume != c.resumed {
+			t.Fatalf("%s: DidResume = %v, want %v", c.name, c.state.DidResume, c.resumed)
+		}
+		if len(c.state.VerifiedChains) == 0 || c.state.VerifiedChains[0][0].SerialNumber.Cmp(serverCert.Leaf.SerialNumber) != 0 {
+			t.Fatalf("%s: VerifiedChains does not hold the broker's chain", c.name)
+		}
+		if !bytes.Equal(c.state.OCSPResponse, serverCert.OCSPStaple) {
+			t.Fatalf("%s: OCSPResponse = %q, want the broker's staple", c.name, c.state.OCSPResponse)
+		}
 	}
 }
 
