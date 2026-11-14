@@ -503,6 +503,7 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 		"ocsp bytes":    WithMaxOCSPResponseBytes(0),
 		"crl bytes":     WithMaxCRLBytes(-1),
 		"cache":         WithCacheEntries(-1, 0),
+		"store":         WithStore(nil),
 		"clock":         WithClock(nil),
 		"logger":        WithLogger(nil),
 	} {

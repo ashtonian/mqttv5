@@ -176,44 +176,75 @@ func (c *Checker) providerCRL(ctx context.Context, cert, issuer *x509.Certificat
 	return entry.lookup(cert, "", SourceCRLProvider)
 }
 
-// fetchedCRL answers cert's status from the CRL at point, through the
-// cache.
+// fetchedCRL answers cert's status from the CRL issuer publishes at
+// point.
 func (c *Checker) fetchedCRL(ctx context.Context, log *slog.Logger, point string, cert, issuer *x509.Certificate) (answer, error) {
-	key := issuerKey(issuer) + " " + point
-	entry, ok := c.crls.get(key, c.cfg.now())
-	if ok {
-		c.stats.cacheHits.Add(1)
-	} else {
-		c.stats.cacheMisses.Add(1)
-		var err error
-		if entry, err = c.fetchCRL(ctx, log, key, point, issuer); err != nil {
-			return answer{}, err
-		}
+	entry, err := c.crlAt(ctx, log, crlKey(issuer, point), point, issuer)
+	if err != nil {
+		return answer{}, err
 	}
 	return entry.lookup(cert, point, SourceCRL)
 }
 
-// fetchCRL downloads and validates the CRL at point, sharing the fetch
-// with concurrent callers, and caches it.
-func (c *Checker) fetchCRL(ctx context.Context, log *slog.Logger, key, point string, issuer *x509.Certificate) (*crlEntry, error) {
+// crlAt returns the validated CRL at point from the cache, the Store or
+// a download, in that order. A download is shared with concurrent
+// callers and kept in the cache and the Store under key.
+func (c *Checker) crlAt(ctx context.Context, log *slog.Logger, key, point string, issuer *x509.Certificate) (*crlEntry, error) {
+	if entry, ok := c.crls.get(key, c.cfg.now()); ok {
+		c.stats.cacheHits.Add(1)
+		return entry, nil
+	}
+	c.stats.cacheMisses.Add(1)
 	if err := checkURL(point); err != nil {
 		return nil, err
+	}
+	if entry, ok := c.storedCRL(ctx, log, key, issuer); ok {
+		return entry, nil
 	}
 	if err := c.backingOff(point); err != nil {
 		return nil, err
 	}
 	return c.crlFetches.do(ctx, key, c.cfg.fetchTimeout, func(ctx context.Context) (*crlEntry, error) {
-		entry, err := c.downloadCRL(ctx, point, issuer)
+		der, err := c.downloadCRL(ctx, point)
+		var entry *crlEntry
+		if err == nil {
+			entry, err = c.parseCRL(der, issuer)
+		}
 		if err != nil {
 			c.failed(log, point, err)
 			return nil, err
 		}
 		c.crls.put(key, entry, entry.expires)
+		c.save(ctx, log, key, der, entry.expires)
 		return entry, nil
 	})
 }
 
-func (c *Checker) downloadCRL(ctx context.Context, point string, issuer *x509.Certificate) (*crlEntry, error) {
+// storedCRL loads and validates the CRL stored under key. Concurrent
+// loads of one key share one Store read.
+func (c *Checker) storedCRL(ctx context.Context, log *slog.Logger, key string, issuer *x509.Certificate) (*crlEntry, bool) {
+	if c.cfg.store == nil {
+		return nil, false
+	}
+	entry, err := c.crlLoads.do(ctx, key, c.cfg.fetchTimeout, func(ctx context.Context) (*crlEntry, error) {
+		der, err := c.load(ctx, log, key, c.cfg.maxCRLBytes)
+		if err != nil {
+			return nil, err
+		}
+		entry, err := c.parseCRL(der, issuer)
+		if err != nil {
+			c.storeRejected(ctx, log, key, err)
+			return nil, err
+		}
+		c.storeHit(ctx, log, key)
+		c.crls.put(key, entry, entry.expires)
+		return entry, nil
+	})
+	return entry, err == nil
+}
+
+// downloadCRL returns the DER CRL served at point.
+func (c *Checker) downloadCRL(ctx context.Context, point string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, point, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -225,9 +256,14 @@ func (c *Checker) downloadCRL(ctx context.Context, point string, issuer *x509.Ce
 	// Distribution points serve DER (RFC 5280 §4.2.1.13); some serve
 	// PEM.
 	if block, _ := pem.Decode(body); block != nil && block.Type == "X509 CRL" {
-		body = block.Bytes
+		return block.Bytes, nil
 	}
-	list, err := x509.ParseRevocationList(body)
+	return body, nil
+}
+
+// parseCRL parses a DER CRL and validates it as issuer's.
+func (c *Checker) parseCRL(der []byte, issuer *x509.Certificate) (*crlEntry, error) {
+	list, err := x509.ParseRevocationList(der)
 	if err != nil {
 		return nil, fmt.Errorf("parse CRL: %w", err)
 	}

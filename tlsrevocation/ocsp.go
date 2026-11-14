@@ -3,11 +3,9 @@ package tlsrevocation
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -60,15 +58,44 @@ func (c *Checker) parseOCSP(der []byte, cert, issuer *x509.Certificate) (answer,
 	return a, nil
 }
 
-// fetchedOCSP asks the responder at server for cert's status, through
-// the cache.
-func (c *Checker) fetchedOCSP(ctx context.Context, log *slog.Logger, server string, cert, issuer *x509.Certificate) (answer, error) {
-	key := certKey(issuer, cert)
+// errUnknownStatus reports an OCSP response that answers unknown.
+var errUnknownStatus = errors.New("the responder does not know the certificate")
+
+// cachedOCSP returns an answer about cert from the cache or, failing
+// that, the Store. Concurrent loads of one key share one Store read.
+func (c *Checker) cachedOCSP(ctx context.Context, log *slog.Logger, key string, cert, issuer *x509.Certificate) (answer, bool) {
 	if a, ok := c.ocspAnswers.get(key, c.cfg.now()); ok {
 		c.stats.cacheHits.Add(1)
-		return a, nil
+		return a, true
 	}
 	c.stats.cacheMisses.Add(1)
+	if c.cfg.store == nil {
+		return answer{}, false
+	}
+	a, err := c.ocspLoads.do(ctx, key, c.cfg.fetchTimeout, func(ctx context.Context) (answer, error) {
+		der, err := c.load(ctx, log, key, c.cfg.maxOCSPBytes)
+		if err != nil {
+			return answer{}, err
+		}
+		a, err := c.parseOCSP(der, cert, issuer)
+		if err == nil && a.status == statusUnknown {
+			err = errUnknownStatus
+		}
+		if err != nil {
+			c.storeRejected(ctx, log, key, err)
+			return answer{}, err
+		}
+		c.storeHit(ctx, log, key)
+		a.source = SourceOCSP
+		c.ocspAnswers.put(key, a, a.expires)
+		return a, nil
+	})
+	return a, err == nil
+}
+
+// fetchedOCSP asks the responder at server for cert's status, and keeps
+// a definitive answer in the cache and the Store under key.
+func (c *Checker) fetchedOCSP(ctx context.Context, log *slog.Logger, key, server string, cert, issuer *x509.Certificate) (answer, error) {
 	if err := checkURL(server); err != nil {
 		return answer{}, err
 	}
@@ -88,6 +115,7 @@ func (c *Checker) fetchedOCSP(ctx context.Context, log *slog.Logger, server stri
 		a.source = SourceOCSP
 		if a.status != statusUnknown {
 			c.ocspAnswers.put(key, a, a.expires)
+			c.save(ctx, log, key, der, a.expires)
 		}
 		return a, nil
 	})
@@ -179,17 +207,6 @@ func defaultHTTPClient(timeout time.Duration) *http.Client {
 			return checkURL(req.URL.String())
 		},
 	}
-}
-
-// certKey identifies cert by its issuer's key and its serial number,
-// the pair OCSP answers are about.
-func certKey(issuer, cert *x509.Certificate) string {
-	return issuerKey(issuer) + ":" + serialText(cert.SerialNumber)
-}
-
-func issuerKey(issuer *x509.Certificate) string {
-	sum := sha256.Sum256(issuer.RawSubjectPublicKeyInfo)
-	return hex.EncodeToString(sum[:])
 }
 
 // oidTLSFeature is the TLS Feature extension (RFC 7633).

@@ -97,7 +97,7 @@ control queue that survives reconnects.
 | `queue/queuetest` | conformance tests for `PublisherQueue` implementations |
 | `wire` | MQTT v5 codec (unstable API) |
 | `transport`, `transport/ws` | TCP/TLS dialing; WebSocket |
-| `tlsrevocation` | OCSP and CRL revocation checks of the broker's chain, for `WithTLSVerifier` |
+| `tlsrevocation`, `tlsrevocation/storetest` | OCSP and CRL revocation checks of the broker's chain, for `WithTLSVerifier`; conformance tests for its `Store` |
 | `store/file`, `queue/file` | durable session store and publish queue |
 | `codec/json`, `codec/msgpack` | `Encoding` implementations |
 | `conformance` | tests against real brokers (`-tags conformance`) |

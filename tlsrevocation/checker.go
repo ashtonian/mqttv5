@@ -26,6 +26,11 @@
 // order, and the first definitive answer decides. When nothing answers,
 // the status is unknown and [WithUnknownPolicy] decides; by default the
 // check fails.
+//
+// Fetched answers are cached in memory until their NextUpdate (see
+// [WithCacheEntries]). A [Store] (see [WithStore]) keeps the signed
+// responses and CRLs beyond the process, for a client that must check a
+// broker after a restart while the responders are unreachable.
 package tlsrevocation
 
 import (
@@ -170,6 +175,7 @@ type config struct {
 	maxCRLBytes      int64
 	ocspCacheEntries int
 	crlCacheEntries  int
+	store            Store
 	now              func() time.Time
 	logger           *slog.Logger
 }
@@ -295,6 +301,22 @@ func WithCacheEntries(ocsp, crls int) Option {
 	}
 }
 
+// WithStore keeps the OCSP responses and CRLs the checker fetches in s,
+// beneath the in-memory cache, and consults s when the cache misses,
+// before any network fetch, so a restarted client can check a broker
+// while its responders are unreachable. s holds signed DER that the
+// checker re-verifies on every read; see [Store]. Default none: answers
+// last as long as the process. Nil rejected.
+func WithStore(s Store) Option {
+	return func(c *config) error {
+		if s == nil {
+			return errors.New("tlsrevocation: WithStore(nil) is invalid")
+		}
+		c.store = s
+		return nil
+	}
+}
+
 // WithClock replaces the time source used for validity checks and
 // cache expiry. Default time.Now.
 func WithClock(now func() time.Time) Option {
@@ -329,7 +351,8 @@ func positive[T int64 | time.Duration](name string, v T, set func(*config)) Opti
 }
 
 // Checker checks certificate chains for revocation. It is safe for
-// concurrent use; share one across clients so they share its cache.
+// concurrent use; share one across clients so they share its cache and
+// in-flight fetches.
 type Checker struct {
 	cfg        config
 	httpClient *http.Client
@@ -339,6 +362,8 @@ type Checker struct {
 	failures    *cache[error]
 	ocspFetches flight[answer]
 	crlFetches  flight[*crlEntry]
+	ocspLoads   flight[answer]
+	crlLoads    flight[*crlEntry]
 
 	stats counters
 }
@@ -457,7 +482,7 @@ func (c *Checker) checkCert(ctx context.Context, broker string, cert, issuer *x5
 		case err != nil:
 			failures = append(failures, fmt.Errorf("%s: %w", SourceStaple, err))
 		case a.status == statusUnknown:
-			failures = append(failures, fmt.Errorf("%s: the responder does not know the certificate", SourceStaple))
+			failures = append(failures, fmt.Errorf("%s: %w", SourceStaple, errUnknownStatus))
 		default:
 			a.source = SourceStaple
 			local = append(local, a)
@@ -489,17 +514,23 @@ func (c *Checker) checkCert(ctx context.Context, broker string, cert, issuer *x5
 		return c.good(log, local[0])
 	}
 
+	key := ocspKey(issuer, cert)
+	if len(cert.OCSPServer) > 0 {
+		if a, ok := c.cachedOCSP(ctx, log, key, cert, issuer); ok {
+			return c.decide(log, cert, a)
+		}
+	}
 	for _, server := range cert.OCSPServer {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		a, err := c.fetchedOCSP(ctx, log, server, cert, issuer)
+		a, err := c.fetchedOCSP(ctx, log, key, server, cert, issuer)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s %s: %w", SourceOCSP, server, err))
 			continue
 		}
 		if a.status == statusUnknown {
-			failures = append(failures, fmt.Errorf("%s %s: the responder does not know the certificate", SourceOCSP, server))
+			failures = append(failures, fmt.Errorf("%s %s: %w", SourceOCSP, server, errUnknownStatus))
 			continue
 		}
 		return c.decide(log, cert, a)
@@ -587,6 +618,9 @@ type answer struct {
 	expires time.Time
 }
 
+// errStale reports an OCSP response or CRL past its NextUpdate.
+var errStale = errors.New("stale")
+
 // fresh checks a thisUpdate/nextUpdate window against the clock, and
 // returns when the evidence goes stale.
 func (c *Checker) fresh(thisUpdate, nextUpdate time.Time) (time.Time, error) {
@@ -599,7 +633,7 @@ func (c *Checker) fresh(thisUpdate, nextUpdate time.Time) (time.Time, error) {
 		expires = thisUpdate.Add(c.cfg.maxAge)
 	}
 	if now.Add(-c.cfg.skew).After(expires) {
-		return time.Time{}, fmt.Errorf("stale since %s", expires.UTC().Format(time.RFC3339))
+		return time.Time{}, fmt.Errorf("%w since %s", errStale, expires.UTC().Format(time.RFC3339))
 	}
 	return expires, nil
 }

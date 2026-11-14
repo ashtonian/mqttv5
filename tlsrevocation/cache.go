@@ -132,8 +132,15 @@ type Stats struct {
 	// and Revoked answers by source.
 	FromStaple, FromCRLProvider, FromOCSP, FromCRL uint64
 
-	// CacheHits and CacheMisses count lookups of OCSP answers and CRLs.
+	// CacheHits and CacheMisses count in-memory lookups of OCSP answers
+	// and CRLs.
 	CacheHits, CacheMisses uint64
+
+	// StoreHits, StoreMisses and StoreRejects count [Store] reads after
+	// a cache miss: a value that verified, no value, and a value that
+	// failed verification and was refetched. StoreErrors counts Get and
+	// Put calls that returned an error.
+	StoreHits, StoreMisses, StoreRejects, StoreErrors uint64
 
 	// FetchFailures counts OCSP and CRL fetches that produced no usable
 	// answer.
@@ -155,14 +162,19 @@ func (c *Checker) Stats() Stats {
 		FromCRL:         s.fromCRL.Load(),
 		CacheHits:       s.cacheHits.Load(),
 		CacheMisses:     s.cacheMisses.Load(),
+		StoreHits:       s.storeHits.Load(),
+		StoreMisses:     s.storeMisses.Load(),
+		StoreRejects:    s.storeRejects.Load(),
+		StoreErrors:     s.storeErrors.Load(),
 		FetchFailures:   s.fetchFailures.Load(),
 	}
 }
 
 type counters struct {
-	checked, good, revoked, unknown, allowedUnknown atomic.Uint64
-	fromStaple, fromProvider, fromOCSP, fromCRL     atomic.Uint64
-	cacheHits, cacheMisses, fetchFailures           atomic.Uint64
+	checked, good, revoked, unknown, allowedUnknown   atomic.Uint64
+	fromStaple, fromProvider, fromOCSP, fromCRL       atomic.Uint64
+	cacheHits, cacheMisses, fetchFailures             atomic.Uint64
+	storeHits, storeMisses, storeRejects, storeErrors atomic.Uint64
 }
 
 func (s *counters) bySource(src Source) {

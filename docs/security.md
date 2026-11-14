@@ -122,6 +122,9 @@ cli, err := mqttv5.New(
 A private CA without distribution points supplies its CRL through
 `tlsrevocation.WithCRLProvider`. Against a broker that staples OCSP
 responses, `tlsrevocation.WithScope(tlsrevocation.LeafOnly)` checks
-without any network access. The
+without any network access. `tlsrevocation.WithStore` keeps fetched
+responses and CRLs beyond the process, so a client that restarts while
+the responders are unreachable can still check the broker; the checker
+re-verifies everything it reads back, so the store is not trusted. The
 [tlsrevocation README](../tlsrevocation/README.md) covers the policies,
 caching and troubleshooting.
