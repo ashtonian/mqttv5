@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"math/big"
 	"net"
@@ -53,12 +54,31 @@ func NewRoot(t testing.TB, cn string) *Authority {
 }
 
 // NewIntermediate creates an intermediate CA named cn, signed by a.
-func (a *Authority) NewIntermediate(t testing.TB, cn string) *Authority {
+func (a *Authority) NewIntermediate(t testing.TB, cn string, opts ...Option) *Authority {
 	t.Helper()
 	key := newKey(t)
-	cert := create(t, caTemplate(cn), a.Cert, &key.PublicKey, a.Key)
+	tmpl := caTemplate(cn)
+	for _, opt := range opts {
+		opt(tmpl)
+	}
+	cert := create(t, tmpl, a.Cert, &key.PublicKey, a.Key)
 	chain := append([][]byte{cert.Raw}, a.chain...)
 	return &Authority{Cert: cert, Key: key, chain: chain}
+}
+
+// CrossSigned returns a copy of a with the same subject and key, its
+// certificate signed by other: certificates a issues verify through
+// either.
+func (a *Authority) CrossSigned(t testing.TB, other *Authority, opts ...Option) *Authority {
+	t.Helper()
+	tmpl := caTemplate(a.Cert.Subject.CommonName)
+	tmpl.Subject = a.Cert.Subject
+	for _, opt := range opts {
+		opt(tmpl)
+	}
+	cert := create(t, tmpl, other.Cert, &a.Key.PublicKey, other.Key)
+	chain := append([][]byte{cert.Raw}, other.chain...)
+	return &Authority{Cert: cert, Key: a.Key, chain: chain}
 }
 
 // Pool returns a pool holding only a's certificate: trust a as a root.
@@ -68,7 +88,7 @@ func (a *Authority) Pool() *x509.CertPool {
 	return p
 }
 
-// Option adjusts a leaf certificate before it is signed.
+// Option adjusts a certificate before it is signed.
 type Option func(*x509.Certificate)
 
 // WithValidity sets the leaf's validity window.
@@ -87,6 +107,45 @@ func WithDNSNames(names ...string) Option {
 // WithIPs replaces the leaf's IP subject alternative names.
 func WithIPs(ips ...net.IP) Option {
 	return func(c *x509.Certificate) { c.IPAddresses = ips }
+}
+
+// WithExtKeyUsage replaces the certificate's extended key usages.
+func WithExtKeyUsage(usages ...x509.ExtKeyUsage) Option {
+	return func(c *x509.Certificate) { c.ExtKeyUsage = usages }
+}
+
+// WithOCSPServer sets the OCSP responder URLs the certificate names.
+func WithOCSPServer(urls ...string) Option {
+	return func(c *x509.Certificate) { c.OCSPServer = urls }
+}
+
+// WithCRLDistributionPoints sets the CRL URLs the certificate names.
+func WithCRLDistributionPoints(urls ...string) Option {
+	return func(c *x509.Certificate) { c.CRLDistributionPoints = urls }
+}
+
+// oidTLSFeature is the TLS Feature extension (RFC 7633).
+var oidTLSFeature = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}
+
+// WithMustStaple adds the TLS Feature extension requesting
+// status_request (RFC 7633): the certificate must be served with a
+// stapled OCSP response.
+func WithMustStaple() Option {
+	return func(c *x509.Certificate) {
+		value, err := asn1.Marshal([]int{5}) // status_request
+		if err != nil {
+			panic(err)
+		}
+		c.ExtraExtensions = append(c.ExtraExtensions, pkix.Extension{Id: oidTLSFeature, Value: value})
+	}
+}
+
+// Leaf issues a certificate with common name cn and no extended key
+// usage or subject alternative names beyond what opts set.
+func (a *Authority) Leaf(t testing.TB, cn string, opts ...Option) tls.Certificate {
+	t.Helper()
+	tmpl := leafTemplate(cn)
+	return a.issue(t, tmpl, opts)
 }
 
 // Server issues a server certificate for 127.0.0.1 and localhost.
@@ -127,14 +186,14 @@ func caTemplate(cn string) *x509.Certificate {
 	}
 }
 
-func leafTemplate(cn string, eku x509.ExtKeyUsage) *x509.Certificate {
+func leafTemplate(cn string, eku ...x509.ExtKeyUsage) *x509.Certificate {
 	return &x509.Certificate{
 		SerialNumber: nextSerial(),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    Now.Add(-time.Hour),
 		NotAfter:     Now.Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{eku},
+		ExtKeyUsage:  eku,
 	}
 }
 

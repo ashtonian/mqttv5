@@ -322,6 +322,22 @@ func (c *Client) dial(ctx context.Context, brokerURL string) (transport.Conn, er
 	})
 }
 
+// verifyTLS runs the configured TLSVerifier on conn's TLS handshake.
+func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL string) error {
+	state, ok := transport.TLSState(conn)
+	if !ok {
+		return fmt.Errorf("mqttv5: verify TLS for %s: %w", brokerURL, ErrNotTLS)
+	}
+	u, err := url.Parse(brokerURL)
+	if err != nil {
+		return fmt.Errorf("mqttv5: verify TLS: parse broker URL: %w", err)
+	}
+	if err := c.cfg.TLSVerifier(ctx, u, state); err != nil {
+		return fmt.Errorf("mqttv5: verify TLS for %s: %w", brokerURL, err)
+	}
+	return nil
+}
+
 // handshakeViolation answers a broker protocol violation during the
 // handshake: DISCONNECT 0x82, close, and the error to return.
 func (c *Client) handshakeViolation(conn transport.Conn, t wire.PacketType, detail string) *ProtocolError {
@@ -359,6 +375,12 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 	conn, err := c.dial(dialCtx, brokerURL)
 	if err != nil {
 		return nil, fmt.Errorf("mqttv5: dial: %w", err)
+	}
+	if c.cfg.TLSVerifier != nil {
+		if err = c.verifyTLS(dialCtx, conn, brokerURL); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 	}
 
 	if dl, ok := dialCtx.Deadline(); ok {

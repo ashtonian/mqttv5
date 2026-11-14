@@ -19,6 +19,7 @@
 | `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial. Takes precedence over `WithDialer`/`WithTLSConfig`. Nil rejected. |
 | `WithTLSConfig(*tls.Config)` | — | TLS for `mqtts://`. |
 | `WithDialer(*net.Dialer)` | default | Override transport `net.Dialer`. |
+| `WithTLSVerifier(v)` | — | `func(ctx, *url.URL, tls.ConnectionState) error` run on every connection after the TLS handshake and before CONNECT, under the attempt's context. An error fails the attempt like a dial error; a connection without TLS fails with `ErrNotTLS`. `tlsrevocation.Checker.Verify` checks revocation ([Revocation](security.md#revocation)). Nil rejected. |
 
 #### Identity and authentication
 

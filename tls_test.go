@@ -226,3 +226,122 @@ func TestConnackInfoTLSFromCustomDialFunc(t *testing.T) {
 		}
 	})
 }
+
+// The TLS verifier runs after the handshake and before CONNECT, under
+// the attempt's deadline, with the broker's URL and TLS state; an error
+// fails the attempt before the broker sees a packet.
+func TestTLSVerifierRunsBeforeConnect(t *testing.T) {
+	brokerCA := testpki.NewRoot(t, "broker CA")
+	serverCert := brokerCA.Server(t)
+	b := testbroker.NewTLS(t, &tls.Config{Certificates: []tls.Certificate{serverCert}})
+	refused := errors.New("refused by the verifier")
+	var (
+		gotURL      *url.URL
+		gotState    tls.ConnectionState
+		hadDeadline bool
+	)
+	reported := make(chan error, 1)
+	c, err := New(
+		WithBroker(b.URL()),
+		WithClientID("tb-"+t.Name()),
+		WithCredentials("user", []byte("secret")),
+		WithLogger(quietLogger()),
+		WithTLSConfig(&tls.Config{RootCAs: brokerCA.Pool(), Time: testpki.Clock}),
+		WithTLSVerifier(func(ctx context.Context, u *url.URL, state tls.ConnectionState) error {
+			gotURL, gotState = u, state
+			_, hadDeadline = ctx.Deadline()
+			return refused
+		}),
+		WithOnConnectError(func(err error) {
+			select {
+			case reported <- err:
+			default:
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); !errors.Is(err, refused) {
+		t.Fatalf("Connect error = %v, want the verifier's error", err)
+	}
+	if got := <-reported; !errors.Is(got, refused) {
+		t.Fatalf("OnConnectError got %v, want the verifier's error", got)
+	}
+	if gotURL == nil || gotURL.String() != b.URL() {
+		t.Fatalf("verifier got URL %v, want %s", gotURL, b.URL())
+	}
+	if len(gotState.PeerCertificates) == 0 || !gotState.PeerCertificates[0].Equal(serverCert.Leaf) {
+		t.Fatal("verifier did not get the broker's certificate")
+	}
+	if !hadDeadline {
+		t.Fatal("verifier's context has no deadline; want the connect timeout")
+	}
+	conn := b.Conn(0, time.Second)
+	if conn == nil {
+		t.Fatal("broker accepted no connection")
+	}
+	<-conn.Gone()
+	if log := conn.Log(); len(log) != 0 {
+		t.Fatalf("broker received %d packets from a connection the verifier refused", len(log))
+	}
+}
+
+// A verifier that accepts lets the connection proceed, and runs again on
+// every reconnect.
+func TestTLSVerifierRunsPerConnection(t *testing.T) {
+	brokerCA := testpki.NewRoot(t, "broker CA")
+	b := testbroker.NewTLS(t, &tls.Config{Certificates: []tls.Certificate{brokerCA.Server(t)}})
+	var calls atomic.Int32
+	tbClient(t, b,
+		WithTLSConfig(&tls.Config{RootCAs: brokerCA.Pool(), Time: testpki.Clock}),
+		WithTLSVerifier(func(context.Context, *url.URL, tls.ConnectionState) error {
+			calls.Add(1)
+			return nil
+		}),
+	)
+	b.DropAll()
+	reconnected := b.Conn(1, 3*time.Second)
+	if reconnected == nil {
+		t.Fatal("client did not reconnect")
+	}
+	waitLog(t, reconnected, wire.CONNECT, 1)
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("verifier ran %d times, want once per connection (2)", n)
+	}
+}
+
+// A verifier on a connection without TLS fails closed.
+func TestTLSVerifierRequiresTLS(t *testing.T) {
+	b := testbroker.New(t)
+	c, err := New(
+		WithBroker(b.URL()),
+		WithClientID("tb-"+t.Name()),
+		WithLogger(quietLogger()),
+		WithTLSVerifier(func(context.Context, *url.URL, tls.ConnectionState) error { return nil }),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); !errors.Is(err, ErrNotTLS) {
+		t.Fatalf("Connect error = %v, want ErrNotTLS", err)
+	}
+	conn := b.Conn(0, time.Second)
+	if conn == nil {
+		t.Fatal("broker accepted no connection")
+	}
+	<-conn.Gone()
+	if log := conn.Log(); len(log) != 0 {
+		t.Fatalf("broker received %d packets over a connection the verifier could not check", len(log))
+	}
+}
+
+func TestWithTLSVerifierRejectsNil(t *testing.T) {
+	if _, err := New(WithBroker("mqtts://broker.example"), WithTLSVerifier(nil)); err == nil {
+		t.Fatal("New accepted WithTLSVerifier(nil)")
+	}
+}
