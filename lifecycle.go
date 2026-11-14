@@ -304,49 +304,40 @@ type connectResult struct {
 	connectExpiry uint32
 }
 
-// dial resolves the broker URL to a live transport.Conn. A custom
-// DialFunc is given a parsed *url.URL so the implementation doesn't
-// re-parse. Otherwise the built-in transport.Dial handles TCP and TLS
-// schemes, with the TLS config from TLSConfigFunc when one is set and
-// the client's session cache, so reconnects resume the TLS session.
-func (c *Client) dial(ctx context.Context, brokerURL string) (transport.Conn, error) {
+// dial resolves the broker URL to a live transport.Conn. If a custom
+// DialFunc is configured it takes precedence. Otherwise the built-in
+// transport.Dial handles TCP and TLS schemes, with the TLS config from
+// TLSConfigFunc when one is set and the client's session cache, so
+// reconnects resume the TLS session.
+func (c *Client) dial(ctx context.Context, brokerURL *url.URL) (transport.Conn, error) {
+	if c.cfg.DialFunc != nil {
+		return c.cfg.DialFunc(ctx, brokerURL)
+	}
 	opts := transport.DialOpts{
 		TLSConfig:    c.cfg.TLSConfig,
 		Dialer:       c.cfg.Dialer,
 		SessionCache: c.tlsSessions,
 	}
-	if c.cfg.DialFunc == nil && c.cfg.TLSConfigFunc == nil {
-		return transport.Dial(ctx, brokerURL, opts)
-	}
-	u, err := url.Parse(brokerURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse broker URL: %w", err)
-	}
-	if c.cfg.DialFunc != nil {
-		return c.cfg.DialFunc(ctx, u)
-	}
-	if transport.IsTLSScheme(u.Scheme) {
-		if opts.TLSConfig, err = c.cfg.TLSConfigFunc(ctx, u); err != nil {
+	if c.cfg.TLSConfigFunc != nil && transport.IsTLSScheme(brokerURL.Scheme) {
+		cfg, err := c.cfg.TLSConfigFunc(ctx, brokerURL)
+		if err != nil {
 			return nil, fmt.Errorf("TLS config: %w", err)
 		}
-		if opts.TLSConfig == nil {
+		if cfg == nil {
 			return nil, fmt.Errorf("TLS config: %w", transport.ErrNilTLSConfig)
 		}
+		opts.TLSConfig = cfg
 	}
-	return transport.Dial(ctx, brokerURL, opts)
+	return transport.Dial(ctx, brokerURL.String(), opts)
 }
 
 // verifyTLS runs the configured TLSVerifier on conn's TLS handshake.
-func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL string) error {
+func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL *url.URL) error {
 	state, ok := transport.TLSState(conn)
 	if !ok {
 		return fmt.Errorf("mqttv5: verify TLS for %s: %w", brokerURL, ErrNotTLS)
 	}
-	u, err := url.Parse(brokerURL)
-	if err != nil {
-		return fmt.Errorf("mqttv5: verify TLS: parse broker URL: %w", err)
-	}
-	if err := c.cfg.TLSVerifier(ctx, u, state); err != nil {
+	if err := c.cfg.TLSVerifier(ctx, brokerURL, state); err != nil {
 		return fmt.Errorf("mqttv5: verify TLS for %s: %w", brokerURL, err)
 	}
 	return nil
@@ -383,15 +374,20 @@ func (c *Client) newDecoder(conn transport.Conn) *wire.Decoder {
 // for a CleanStart=1 CONNECT violates [MQTT-3.2.2-2]; the attempt fails
 // with a [*ProtocolError] after DISCONNECT 0x82.
 func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart bool) (*connectResult, error) {
+	u, err := url.Parse(brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("mqttv5: parse broker URL: %w", err)
+	}
+
 	dialCtx, cancel := context.WithTimeout(ctx, c.cfg.ConnectTimeout)
 	defer cancel()
 
-	conn, err := c.dial(dialCtx, brokerURL)
+	conn, err := c.dial(dialCtx, u)
 	if err != nil {
 		return nil, fmt.Errorf("mqttv5: dial: %w", err)
 	}
 	if c.cfg.TLSVerifier != nil {
-		if err = c.verifyTLS(dialCtx, conn, brokerURL); err != nil {
+		if err = c.verifyTLS(dialCtx, conn, u); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
@@ -413,7 +409,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 		return err
 	}
 
-	sent, err := c.writeConnect(dialCtx, conn, cleanStart)
+	sent, err := c.writeConnect(dialCtx, conn, u, cleanStart)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mqttv5: write CONNECT: %w", ioErr(err))
@@ -986,10 +982,9 @@ func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
 // Authenticator.Begin(ctx). connectOnce then drives the AUTH loop.
 //
 // If cfg.ConnectPacketBuilder is set, it runs after this method has
-// populated opts and may mutate any field — useful for per-attempt
-// credential rotation. A non-nil error from the builder fails the
-// attempt.
-func (c *Client) writeConnect(ctx context.Context, w io.Writer, cleanStart bool) (wire.ConnectOpts, error) {
+// populated opts, is told brokerURL, and may change the credentials and
+// user properties. A non-nil error from the builder fails the attempt.
+func (c *Client) writeConnect(ctx context.Context, w io.Writer, brokerURL *url.URL, cleanStart bool) (wire.ConnectOpts, error) {
 	cfg := c.cfg
 	opts := wire.ConnectOpts{
 		ClientID:          c.ClientID(),
@@ -1030,7 +1025,7 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, cleanStart bool)
 	}
 	if cfg.ConnectPacketBuilder != nil {
 		co := ConnectOptions{Username: opts.Username, Password: opts.Password, UserProperties: opts.UserProperties}
-		if err := cfg.ConnectPacketBuilder(ctx, &co); err != nil {
+		if err := cfg.ConnectPacketBuilder(ctx, brokerURL, &co); err != nil {
 			return opts, fmt.Errorf("mqttv5: ConnectPacketBuilder: %w", err)
 		}
 		opts.Username, opts.Password, opts.UserProperties = co.Username, co.Password, co.UserProperties
