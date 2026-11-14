@@ -39,8 +39,14 @@ CONNECT, so credentials are not sent to it; `Connect` and
 `errors.As` resolves (`x509.UnknownAuthorityError`,
 `x509.HostnameError`, `x509.CertificateInvalidError`).
 
-**What it does not check.** Revocation: Go's `crypto/x509` consults
-neither CRLs nor OCSP. See [Revocation](#revocation).
+**What it does not check.** Revocation, unless `WithTLSVerifier` adds
+the check (see [Revocation](#revocation)): Go's own verifier consults
+neither CRLs nor OCSP. One exception is outside the client's control:
+on macOS and iOS with the system roots (`RootCAs` nil or
+`x509.SystemCertPool()`), Go hands verification to the platform, whose
+trust evaluation rejects some revoked public certificates by Apple's own
+policy. On Windows Go asks the platform for no revocation check, and a
+private CA in `RootCAs` always gets Go's own verifier.
 
 **Private CA.** Put the CA in `RootCAs`. Setting `RootCAs` replaces the
 system roots rather than adding to them.

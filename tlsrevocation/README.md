@@ -26,9 +26,13 @@ cli, err := mqttv5.New(
 
 ## Overview
 
-Go's `crypto/x509` verifies a certificate's chain, name and validity
-window, but never asks whether the certificate has been revoked. A
-`Checker` does, after the handshake: `mqttv5.WithTLSVerifier` runs
+Go's own certificate verifier checks a chain, its names and validity
+windows, but never asks whether a certificate has been revoked. (On
+macOS and iOS with the system roots, Go hands verification to the
+platform, whose trust evaluation rejects some revoked public
+certificates by Apple's own policy; a private CA in `RootCAs`, and every
+other platform, get Go's verifier.) A `Checker` checks, after the
+handshake: `mqttv5.WithTLSVerifier` runs
 `Checker.Verify` before CONNECT, under the connection attempt's context,
 so credentials never reach a broker whose certificate is revoked and every
 lookup is bounded by the connect timeout. `Checker.VerifyConnection` fits

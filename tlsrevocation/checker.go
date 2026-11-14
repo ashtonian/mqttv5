@@ -1,7 +1,7 @@
 // Package tlsrevocation checks the certificates of a verified TLS chain
-// for revocation, which crypto/tls does not: a stapled OCSP response,
-// CRLs supplied by the caller, OCSP responders, and CRL distribution
-// points.
+// for revocation, which Go's own certificate verifier does not: a
+// stapled OCSP response, CRLs supplied by the caller, OCSP responders,
+// and CRL distribution points.
 //
 // A [Checker] plugs into the MQTT client through
 // mqttv5.WithTLSVerifier, which runs it after the TLS handshake and
