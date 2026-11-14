@@ -96,7 +96,7 @@ control queue that survives reconnects.
 | `session`, `session/storetest` | `Store` interface, memory store, conformance tests for stores |
 | `queue/queuetest` | conformance tests for `PublisherQueue` implementations |
 | `wire` | MQTT v5 codec (unstable API) |
-| `transport`, `transport/ws` | TCP/TLS dialing; WebSocket |
+| `transport`, `transport/ws` | TCP/TLS dialing and the TLS config each dial uses (server name, session resumption); WebSocket |
 | `tlsrevocation`, `tlsrevocation/storetest` | OCSP and CRL revocation checks of the broker's chain, for `WithTLSVerifier`; conformance tests for its `Store` |
 | `store/file`, `queue/file` | durable session store and publish queue |
 | `codec/json`, `codec/msgpack` | `Encoding` implementations |

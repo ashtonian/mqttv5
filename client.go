@@ -53,6 +53,10 @@ type Client struct {
 	// of the list (a temporary server redirect).
 	redirectOnce atomic.Pointer[string]
 
+	// tlsSessions lets reconnects of the built-in dial resume the TLS
+	// session (see transport.TLSClientConfig).
+	tlsSessions tls.ClientSessionCache
+
 	router *trie.Tree
 
 	// Lifecycle. life is the current Connect…Disconnect span; startMu
@@ -144,6 +148,8 @@ func New(opts ...Option) (*Client, error) {
 		brokerSubs: make(map[string]*brokerSub),
 		identRefs:  make(map[uint32]int),
 		curChanged: make(chan struct{}),
+		// Zero capacity: the standard library's default.
+		tlsSessions: tls.NewLRUClientSessionCache(0),
 	}
 	if cfg.StatsEnabled {
 		c.stats = &clientStats{}

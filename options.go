@@ -1269,7 +1269,10 @@ func WithOnStoreFailure(fn func(err error)) Option {
 
 // WithTLSConfig supplies a [*tls.Config] for mqtts:// / tls:// / ssl://
 // dials, used for every dial of every broker. Ignored for plain TCP
-// schemes. New rejects it beside [WithTLSConfigFunc] or [WithDialFunc].
+// schemes. Reconnects resume the TLS session through a cache the client
+// owns unless t presents a client certificate or sets its own
+// ClientSessionCache (see [transport.TLSClientConfig]); t is never
+// modified. New rejects it beside [WithTLSConfigFunc] or [WithDialFunc].
 func WithTLSConfig(t *tls.Config) Option {
 	return func(c *Config) error {
 		c.TLSConfig = t
@@ -1282,9 +1285,10 @@ func WithTLSConfig(t *tls.Config) Option {
 // ConnectTimeout. Use it to rotate trusted roots without a new client,
 // or to trust each broker of [WithBrokers] differently. An error from
 // fn, or a nil config ([transport.ErrNilTLSConfig]), fails the attempt,
-// which is retried like a dial failure. fn is not called for plain TCP
-// schemes. New rejects it beside [WithTLSConfig] or [WithDialFunc]; nil
-// is rejected.
+// which is retried like a dial failure. Reconnects resume the TLS
+// session as with [WithTLSConfig], though fn returns a new config each
+// time. fn is not called for plain TCP schemes. New rejects it beside
+// [WithTLSConfig] or [WithDialFunc]; nil is rejected.
 func WithTLSConfigFunc(fn transport.TLSConfigFunc) Option {
 	return func(c *Config) error {
 		if fn == nil {

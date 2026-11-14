@@ -95,6 +95,12 @@ type DialOpts struct {
 	// Dialer overrides the default net.Dialer if non-nil. Use this to
 	// set custom KeepAlive, LocalAddr, or DualStack behaviour.
 	Dialer *net.Dialer
+
+	// SessionCache lets dials that share it resume TLS sessions, for a
+	// TLSConfig without a ClientSessionCache of its own; see
+	// [TLSClientConfig] for which configs it applies to. Nil resumes
+	// only through the config's own cache.
+	SessionCache tls.ClientSessionCache
 }
 
 // Errors that callers might want to branch on.
@@ -186,10 +192,11 @@ func DialTCP(ctx context.Context, addr string, opts DialOpts) (Conn, error) {
 }
 
 // DialTLS dials addr (host:port) over TCP, then performs a TLS
-// handshake using opts.TLSConfig.
+// handshake using the config [TLSClientConfig] derives from
+// opts.TLSConfig, serverName and opts.SessionCache.
 //
-// serverName is set as ServerName on a cloned TLS config when the
-// caller's config has none — this is what enables proper SAN
+// serverName is the name the broker's certificate must match when the
+// caller's config sets no ServerName — this is what enables proper SAN
 // validation when the URL hostname differs from the connect address
 // (rare but valid: e.g., a load-balancer fronting a cert with a SAN
 // list).
@@ -205,19 +212,46 @@ func DialTLS(ctx context.Context, addr, serverName string, opts DialOpts) (Conn,
 		return nil, fmt.Errorf("mqttv5/transport: dial tcp %s: %w", addr, err)
 	}
 
-	cfg := opts.TLSConfig
-	if cfg == nil {
-		cfg = &tls.Config{}
-	}
-	if cfg.ServerName == "" && serverName != "" {
-		cfg = cfg.Clone()
-		cfg.ServerName = serverName
-	}
-
-	tlsConn := tls.Client(rawConn, cfg)
+	tlsConn := tls.Client(rawConn, TLSClientConfig(opts.TLSConfig, serverName, opts.SessionCache))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("mqttv5/transport: tls handshake %s: %w", addr, err)
 	}
 	return tlsConn, nil
+}
+
+// TLSClientConfig returns the config a TLS dial to serverName uses: cfg,
+// or an empty config when cfg is nil, with ServerName set to serverName
+// when it has none, and with cache as its ClientSessionCache when it has
+// none, allows session tickets, and presents no client certificate.
+// cfg is never modified: what is filled in is filled in on a copy, and
+// cfg itself is returned when nothing is.
+//
+// A config that presents a client certificate gets no session cache: a
+// resumed session does not present the certificate again (RFC 8446
+// §4.3.2), so resuming would keep the earlier certificate's identity
+// past a rotation by GetClientCertificate for as long as the broker
+// honours the session ticket. Such a config resumes only through a
+// ClientSessionCache of its own.
+func TLSClientConfig(cfg *tls.Config, serverName string, cache tls.ClientSessionCache) *tls.Config {
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
+	setName := cfg.ServerName == "" && serverName != ""
+	setCache := cache != nil && cfg.ClientSessionCache == nil && !cfg.SessionTicketsDisabled && !presentsClientCertificate(cfg)
+	if !setName && !setCache {
+		return cfg
+	}
+	cfg = cfg.Clone()
+	if setName {
+		cfg.ServerName = serverName
+	}
+	if setCache {
+		cfg.ClientSessionCache = cache
+	}
+	return cfg
+}
+
+func presentsClientCertificate(cfg *tls.Config) bool {
+	return len(cfg.Certificates) > 0 || cfg.GetClientCertificate != nil
 }

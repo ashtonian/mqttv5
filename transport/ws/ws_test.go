@@ -327,3 +327,49 @@ func TestMultipleSmallReads(t *testing.T) {
 		t.Fatalf("byte-by-byte read mismatch")
 	}
 }
+
+// A DialFunc's wss:// dials resume the TLS session, so a client's
+// reconnects do; Dial alone resumes only through the config's own cache.
+func TestWssResumesSession(t *testing.T) {
+	root := testpki.NewRoot(t, "root")
+	resumed := make(chan bool, 8)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resumed <- r.TLS.DidResume
+		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{root.Server(t)}}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(strings.Replace(srv.URL, "https://", "wss://", 1))
+	opts := DialOpts{TLSConfig: &tls.Config{RootCAs: root.Pool(), Time: testpki.Clock}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	dials := func(dial transport.DialFunc) []bool {
+		t.Helper()
+		var got []bool
+		for range 2 {
+			conn, err := dial(ctx, u)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			conn.Close()
+			got = append(got, <-resumed)
+		}
+		return got
+	}
+	if got := dials(DialFunc(opts)); got[0] || !got[1] {
+		t.Fatalf("DialFunc resumed = %v, want [false true]", got)
+	}
+	oneShot := func(ctx context.Context, u *url.URL) (transport.Conn, error) { return Dial(ctx, u, opts) }
+	if got := dials(oneShot); got[0] || got[1] {
+		t.Fatalf("Dial resumed = %v, want [false false]", got)
+	}
+	if opts.TLSConfig.ClientSessionCache != nil || opts.TLSConfig.ServerName != "" {
+		t.Fatal("dialing modified the caller's TLS config")
+	}
+}
