@@ -87,5 +87,41 @@ built-in dial, so `New` rejects them beside `WithDialFunc`; a custom
 dial configures its own TLS (`ws.DialOpts` has `TLSConfig` and
 `TLSConfigFunc` of its own).
 
+**Session resumption.** The client keeps TLS sessions in an in-memory
+cache of its own, so a reconnect to the same broker resumes the session
+instead of repeating the full handshake: the broker sends no
+certificate chain and signs nothing, which saves bandwidth and CPU on
+both ends during reconnect storms. It applies to the config of
+`WithTLSConfig` or `WithTLSConfigFunc` when that config sets no
+`ClientSessionCache` and presents no client certificate; a config
+returned fresh on each dial resumes too. `ws.DialFunc` does the same
+for `wss://`.
+
+- **Client certificates.** A resumed session does not present the
+  client certificate again ([RFC 8446, section
+  4.3.2](https://www.rfc-editor.org/rfc/rfc8446#section-4.3.2)), so a
+  certificate rotated through `GetClientCertificate` would not reach the
+  broker until it stopped honouring the session ticket, up to seven days
+  in TLS 1.3. A config presenting a client certificate therefore gets no
+  cache from the client; set `ClientSessionCache` on it to resume anyway.
+- **Verification.** Before resuming, Go checks the cached certificate's
+  validity window and host name and verifies its chain against the
+  `RootCAs` of the config at hand, so removing a root ends resumption
+  with it: the next connection is a full handshake and is refused.
+  `tls.Config.VerifyConnection` runs on resumed connections too, given
+  the chain and stapled OCSP response of the handshake that created the
+  session.
+- **Your own cache.** Set `ClientSessionCache`, for example to resume
+  across restarts (`tls.ClientSessionState.ResumptionState` and
+  `tls.NewResumptionState` convert a session to and from
+  `tls.SessionState`, whose `Bytes` and `tls.ParseSessionState`
+  serialise it). A persistent cache must be confidential and
+  integrity-protected: a stored session holds its resumption secret, and
+  a resumed TLS 1.3 broker proves itself with that secret rather than
+  its certificate, so whoever can read or write the store can
+  impersonate the broker.
+- **Turning it off.** `SessionTicketsDisabled: true` makes every
+  connection a full handshake.
+
 **Protocol version.** Go's client accepts TLS 1.2 and later by default.
 Set `MinVersion: tls.VersionTLS13` when every broker supports it.

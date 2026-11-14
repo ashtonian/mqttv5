@@ -3,6 +3,7 @@ package mqttv5
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	mathrand "math/rand/v2"
 	"slices"
 	"strings"
@@ -50,6 +51,10 @@ type Client struct {
 	// redirectOnce, when set, is the URL the next attempt dials instead
 	// of the list (a temporary server redirect).
 	redirectOnce atomic.Pointer[string]
+
+	// tlsSessions lets reconnects of the built-in dial resume the TLS
+	// session (see transport.TLSClientConfig).
+	tlsSessions tls.ClientSessionCache
 
 	router *trie.Tree
 
@@ -142,6 +147,8 @@ func New(opts ...Option) (*Client, error) {
 		brokerSubs: make(map[string]*brokerSub),
 		identRefs:  make(map[uint32]int),
 		curChanged: make(chan struct{}),
+		// Zero capacity: the standard library's default.
+		tlsSessions: tls.NewLRUClientSessionCache(0),
 	}
 	if cfg.StatsEnabled {
 		c.stats = &clientStats{}

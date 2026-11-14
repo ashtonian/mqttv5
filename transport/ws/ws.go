@@ -86,12 +86,15 @@ type DialOpts struct {
 //
 //	mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg}))
 //
-// Equivalent to writing the closure by hand around [Dial]; provided
-// because the closure form reads poorly when several broker options
-// are stacked together.
+// Its wss:// dials share one in-memory TLS session cache, so the
+// client's reconnects resume the TLS session, for configs without a
+// ClientSessionCache of their own that present no client certificate
+// (see [transport.TLSClientConfig]). Otherwise it is [Dial].
 func DialFunc(opts DialOpts) transport.DialFunc {
+	// Zero capacity: the standard library's default.
+	sessions := tls.NewLRUClientSessionCache(0)
 	return func(ctx context.Context, brokerURL *url.URL) (transport.Conn, error) {
-		return Dial(ctx, brokerURL, opts)
+		return dial(ctx, brokerURL, opts, sessions)
 	}
 }
 
@@ -100,8 +103,15 @@ func DialFunc(opts DialOpts) transport.DialFunc {
 // control packet (per MQTT-over-WS §6 — "single WebSocket data
 // frame"). Prefer [DialFunc] when wiring into mqttv5.WithDialFunc;
 // call Dial directly when you need a one-shot upgrade outside the
-// client.
+// client. Dial resumes a TLS session only through the config's own
+// ClientSessionCache.
 func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Conn, error) {
+	return dial(ctx, brokerURL, opts, nil)
+}
+
+// dial is Dial with sessions as the TLS session cache for configs that
+// have none (see transport.TLSClientConfig).
+func dial(ctx context.Context, brokerURL *url.URL, opts DialOpts, sessions tls.ClientSessionCache) (transport.Conn, error) {
 	if brokerURL == nil {
 		return nil, errors.New("mqttv5/transport/ws: nil URL")
 	}
@@ -114,6 +124,9 @@ func Dial(ctx context.Context, brokerURL *url.URL, opts DialOpts) (transport.Con
 	tlsCfg, err := tlsConfig(ctx, brokerURL, opts)
 	if err != nil {
 		return nil, err
+	}
+	if brokerURL.Scheme == "wss" {
+		tlsCfg = transport.TLSClientConfig(tlsCfg, brokerURL.Hostname(), sessions)
 	}
 
 	subprotocols := opts.Subprotocols

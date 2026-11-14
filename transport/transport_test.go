@@ -262,3 +262,54 @@ func TestSchemes(t *testing.T) {
 		})
 	}
 }
+
+// TLSClientConfig fills in a server name and a session cache only where
+// the caller's config leaves them to the dial, never on the caller's
+// config itself.
+func TestTLSClientConfig(t *testing.T) {
+	cache := tls.NewLRUClientSessionCache(1)
+	own := tls.NewLRUClientSessionCache(1)
+	cert := tls.Certificate{Certificate: [][]byte{{1}}}
+	getCert := func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil }
+	tests := []struct {
+		name       string
+		cfg        *tls.Config
+		serverName string
+		cache      tls.ClientSessionCache
+		wantName   string
+		wantCache  tls.ClientSessionCache
+		// wantSame expects cfg itself back: nothing to fill in.
+		wantSame bool
+	}{
+		{name: "nil config", serverName: "broker", cache: cache, wantName: "broker", wantCache: cache},
+		{name: "nil config without a cache", serverName: "broker", wantName: "broker"},
+		{name: "server name kept", cfg: &tls.Config{ServerName: "lb"}, serverName: "broker", cache: cache, wantName: "lb", wantCache: cache},
+		{name: "nothing to fill in", cfg: &tls.Config{ServerName: "lb"}, serverName: "broker", wantName: "lb", wantSame: true},
+		{name: "own cache kept", cfg: &tls.Config{ServerName: "lb", ClientSessionCache: own}, cache: cache, wantName: "lb", wantCache: own, wantSame: true},
+		{name: "client certificate", cfg: &tls.Config{Certificates: []tls.Certificate{cert}}, serverName: "broker", cache: cache, wantName: "broker"},
+		{name: "GetClientCertificate", cfg: &tls.Config{GetClientCertificate: getCert}, serverName: "broker", cache: cache, wantName: "broker"},
+		{name: "client certificate with its own cache", cfg: &tls.Config{Certificates: []tls.Certificate{cert}, ClientSessionCache: own}, cache: cache, wantCache: own, wantSame: true},
+		{name: "session tickets disabled", cfg: &tls.Config{SessionTicketsDisabled: true}, serverName: "broker", cache: cache, wantName: "broker"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var before tls.Config
+			if tt.cfg != nil {
+				before = *tt.cfg.Clone()
+			}
+			got := TLSClientConfig(tt.cfg, tt.serverName, tt.cache)
+			if got.ServerName != tt.wantName {
+				t.Errorf("ServerName = %q, want %q", got.ServerName, tt.wantName)
+			}
+			if got.ClientSessionCache != tt.wantCache {
+				t.Errorf("ClientSessionCache = %v, want %v", got.ClientSessionCache, tt.wantCache)
+			}
+			if (got == tt.cfg) != tt.wantSame {
+				t.Errorf("returned the caller's config = %v, want %v", got == tt.cfg, tt.wantSame)
+			}
+			if tt.cfg != nil && (tt.cfg.ServerName != before.ServerName || tt.cfg.ClientSessionCache != before.ClientSessionCache) {
+				t.Error("modified the caller's config")
+			}
+		})
+	}
+}

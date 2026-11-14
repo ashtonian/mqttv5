@@ -43,6 +43,13 @@ the MQTT byte stream in WebSocket binary frames:
   `DialOpts.TLSConfigFunc` instead supplies the config on each `wss://`
   dial, so a long-lived `DialFunc` can rotate trusted roots or client
   certificates.
+- **TLS session resumption.** The `wss://` dials of one `DialFunc` share
+  an in-memory session cache, so a client's reconnects resume the TLS
+  session, for a config that sets no `ClientSessionCache` and presents
+  no client certificate (a resumed session does not present it again,
+  which would delay a rotation). `Dial` on its own resumes only through
+  the config's own `ClientSessionCache`. The caller's config is never
+  modified. See [Certificate management](../../docs/security.md#certificate-management).
 
 `mqttv5.New` rejects `ws://` and `wss://` broker URLs unless
 `WithDialFunc` is set.
@@ -92,7 +99,7 @@ go -C transport/ws test -race ./...
 
 The tests run against an in-process WebSocket server: round trips,
 byte-at-a-time reads, ping/pong under concurrent writes, broker Close,
-text frames, closing during a stalled write, TLS verification and the per-dial `TLSConfigFunc`. [`examples/ws`](../../examples/ws)
+text frames, closing during a stalled write, TLS verification, the per-dial `TLSConfigFunc` and session resumption. [`examples/ws`](../../examples/ws)
 connects to a real broker.
 
 ## Operations

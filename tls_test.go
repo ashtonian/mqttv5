@@ -138,6 +138,10 @@ func TestTLSConfigFuncRotatesRoots(t *testing.T) {
 	serving.Store(&oldLeaf)
 	b := testbroker.NewTLS(t, &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return serving.Load(), nil },
+		// Every reconnect is a full handshake, in which the broker
+		// presents its current certificate; a resumed one would carry
+		// the session's. TestTLSResumptionReverifiesRoots covers that.
+		SessionTicketsDisabled: true,
 	})
 
 	var trusted atomic.Pointer[testpki.Authority]
@@ -331,5 +335,162 @@ func TestTLSOptionConflictsRejected(t *testing.T) {
 		if _, err := New(append([]Option{WithBroker("mqtts://broker.example")}, opts...)...); err != nil {
 			t.Fatalf("New rejected a single option: %v", err)
 		}
+	}
+}
+
+// countingCache is a session cache that counts its use.
+type countingCache struct {
+	tls.ClientSessionCache
+	gets, puts atomic.Int32
+}
+
+func (c *countingCache) Get(key string) (*tls.ClientSessionState, bool) {
+	c.gets.Add(1)
+	return c.ClientSessionCache.Get(key)
+}
+
+func (c *countingCache) Put(key string, cs *tls.ClientSessionState) {
+	c.puts.Add(1)
+	c.ClientSessionCache.Put(key, cs)
+}
+
+func didResume(t *testing.T, c *testbroker.Conn) bool {
+	t.Helper()
+	waitLog(t, c, wire.CONNECT, 1)
+	state, ok := c.TLS()
+	if !ok {
+		t.Fatalf("connection %d is not TLS", c.Index)
+	}
+	return state.DidResume
+}
+
+// A reconnect resumes the TLS session through the client's own cache,
+// whether the config is fixed or built per dial, without modifying the
+// caller's config. A config presenting a client certificate resumes only
+// through a cache of its own, so a rotated certificate is presented on
+// the next connection; SessionTicketsDisabled turns resumption off.
+func TestTLSReconnectResumesSession(t *testing.T) {
+	brokerCA := testpki.NewRoot(t, "broker CA")
+	deviceCA := testpki.NewRoot(t, "device CA")
+	device := deviceCA.Client(t, "device")
+	tests := []struct {
+		name string
+		// perDial supplies the config through WithTLSConfigFunc, a new
+		// one per dial, instead of WithTLSConfig.
+		perDial         bool
+		clientCert      bool
+		getClientCert   bool
+		ownCache        bool
+		ticketsDisabled bool
+		wantResume      bool
+	}{
+		{name: "WithTLSConfig", wantResume: true},
+		{name: "WithTLSConfigFunc", perDial: true, wantResume: true},
+		{name: "own session cache", ownCache: true, wantResume: true},
+		{name: "client certificate", clientCert: true},
+		{name: "GetClientCertificate", getClientCert: true},
+		{name: "GetClientCertificate per dial", perDial: true, getClientCert: true},
+		{name: "client certificate with its own session cache", clientCert: true, ownCache: true, wantResume: true},
+		{name: "SessionTicketsDisabled", ticketsDisabled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &tls.Config{Certificates: []tls.Certificate{brokerCA.Server(t)}}
+			if tt.clientCert || tt.getClientCert {
+				server.ClientAuth = tls.RequireAndVerifyClientCert
+				server.ClientCAs = deviceCA.Pool()
+				server.Time = testpki.Clock
+			}
+			b := testbroker.NewTLS(t, server)
+
+			var own *countingCache
+			if tt.ownCache {
+				own = &countingCache{ClientSessionCache: tls.NewLRUClientSessionCache(0)}
+			}
+			config := func() *tls.Config {
+				cfg := tlsConfigTrusting(brokerCA)
+				if tt.clientCert {
+					cfg.Certificates = []tls.Certificate{device}
+				}
+				if tt.getClientCert {
+					cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &device, nil }
+				}
+				if own != nil {
+					cfg.ClientSessionCache = own
+				}
+				cfg.SessionTicketsDisabled = tt.ticketsDisabled
+				return cfg
+			}
+			given := config()
+			opt := WithTLSConfig(given)
+			if tt.perDial {
+				opt = WithTLSConfigFunc(func(context.Context, *url.URL) (*tls.Config, error) { return config(), nil })
+			}
+			tbClient(t, b, opt)
+
+			if didResume(t, b.Conn(0, 0)) {
+				t.Fatal("the first connection resumed a session")
+			}
+			b.DropAll()
+			reconnected := b.Conn(1, 3*time.Second)
+			if reconnected == nil {
+				t.Fatal("client did not reconnect")
+			}
+			if got := didResume(t, reconnected); got != tt.wantResume {
+				t.Fatalf("reconnection resumed = %v, want %v", got, tt.wantResume)
+			}
+			if own != nil && (own.puts.Load() == 0 || own.gets.Load() < 2) {
+				t.Fatalf("own session cache used %d gets, %d puts; want a get per connection and a put", own.gets.Load(), own.puts.Load())
+			}
+			if given.ClientSessionCache != config().ClientSessionCache || given.ServerName != "" {
+				t.Fatal("the client modified the caller's TLS config")
+			}
+		})
+	}
+}
+
+// A session is resumed only while its certificate chain still verifies
+// against the roots of the config at hand: once the client stops
+// trusting the root, the reconnect is a full handshake and is refused,
+// though the client holds a ticket the broker would accept.
+func TestTLSResumptionReverifiesRoots(t *testing.T) {
+	oldCA, newCA := testpki.NewRoot(t, "old CA"), testpki.NewRoot(t, "new CA")
+	b := testbroker.NewTLS(t, &tls.Config{Certificates: []tls.Certificate{oldCA.Server(t)}})
+
+	var trusted atomic.Pointer[testpki.Authority]
+	trusted.Store(oldCA)
+	refused := make(chan error, 16)
+	up := make(chan ConnackInfo, 4)
+	tbClient(t, b,
+		WithTLSConfigFunc(func(context.Context, *url.URL) (*tls.Config, error) {
+			return tlsConfigTrusting(trusted.Load()), nil
+		}),
+		WithOnConnectError(func(err error) {
+			select {
+			case refused <- err:
+			default:
+			}
+		}),
+		WithOnConnectionUp(func(info ConnackInfo) { up <- info }),
+	)
+	<-up
+	b.DropAll()
+	if reconnected := b.Conn(1, 3*time.Second); reconnected == nil || !didResume(t, reconnected) {
+		t.Fatal("the reconnect under the same roots did not resume")
+	}
+	<-up
+
+	trusted.Store(newCA)
+	b.DropAll()
+	select {
+	case err := <-refused:
+		var unknown x509.UnknownAuthorityError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("reconnect after distrusting the root failed with %v, want x509.UnknownAuthorityError", err)
+		}
+	case <-up:
+		t.Fatal("resumed a session whose certificate chains to a root the client no longer trusts")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no reconnect attempt")
 	}
 }
