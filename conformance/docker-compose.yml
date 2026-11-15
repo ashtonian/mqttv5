@@ -42,17 +42,44 @@ services:
       timeout: 2s
       retries: 15
 
+  # quic-pki builds the certificate of emqx's QUIC listener into
+  # ./quic/pki (gitignored) on first start, then exits; it runs the EMQX
+  # image only for that image's OpenSSL. The suite and the quic example
+  # trust ./quic/pki/root.pem.
+  quic-pki:
+    image: emqx/emqx:6.3.1
+    container_name: mqttv5-conformance-quic-pki
+    mem_limit: 64m
+    # Root, to write the bind-mounted ./quic/pki; pki.sh hands the files
+    # to the directory's owner.
+    user: "0:0"
+    entrypoint: ["sh", "/quic/pki.sh"]
+    volumes:
+      - ./quic/pki.sh:/quic/pki.sh:ro
+      - ./quic/pki:/pki
+
   # emqx covers the cases mosquitto handles differently (e.g.,
-  # AssignedClientIdentifier policy, shared subscriptions).
+  # AssignedClientIdentifier policy, shared subscriptions), and serves
+  # MQTT over QUIC for transport/quic.
   emqx:
     image: emqx/emqx:6.3.1
     container_name: mqttv5-conformance-emqx
     mem_limit: 1536m
+    depends_on:
+      quic-pki:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:1884:1883"
       - "127.0.0.1:8083:8083" # WebSocket listener, for the ws example
+      - "127.0.0.1:14567:14567/udp" # QUIC listener
+    volumes:
+      - ./quic/pki:/pki:ro
     environment:
-      - EMQX_ALLOW_ANONYMOUS=true
+      EMQX_ALLOW_ANONYMOUS: "true"
+      EMQX_LISTENERS__QUIC__DEFAULT__ENABLE: "true"
+      EMQX_LISTENERS__QUIC__DEFAULT__BIND: "0.0.0.0:14567"
+      EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE: /pki/broker.pem
+      EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE: /pki/broker.key
     healthcheck: *emqx-healthcheck
 
   # emqx-scram is a dedicated EMQX with MQTT 5 enhanced authentication

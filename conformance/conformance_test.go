@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -108,7 +107,7 @@ func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 	topic := "conformance/clean/" + randSuffix()
 
 	first, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
+		withBroker(brokerURL()),
 		mqttv5.WithClientID(id),
 		mqttv5.WithCleanStart(false),
 		mqttv5.WithSessionExpiry(60),
@@ -127,7 +126,7 @@ func TestConnect_CleanStartWipesPriorSubscription(t *testing.T) {
 
 	// Same ID, CleanStart=true → broker wipes the prior session.
 	second, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
+		withBroker(brokerURL()),
 		mqttv5.WithClientID(id),
 		mqttv5.WithCleanStart(true),
 	)
@@ -168,7 +167,7 @@ func TestSession_DurableConsumerRestart(t *testing.T) {
 	id := "conformance-durable-" + randSuffix()
 	topic := "conformance/durable/" + randSuffix()
 	opts := []mqttv5.Option{
-		mqttv5.WithBroker(brokerURL()),
+		withBroker(brokerURL()),
 		mqttv5.WithClientID(id),
 		mqttv5.WithCleanStart(false),
 		mqttv5.WithSessionExpiry(60),
@@ -665,8 +664,7 @@ func TestTopicAlias_OutboundReducesBytes(t *testing.T) {
 		mqttv5.WithOutboundTopicAliases(),
 		mqttv5.WithPublishMode(mqttv5.PublishWaitForFlush),
 		mqttv5.WithDialFunc(func(ctx context.Context, u *url.URL) (transport.Conn, error) {
-			var d net.Dialer
-			c, err := d.DialContext(ctx, "tcp", u.Host)
+			c, err := brokerDial(brokerURL())(ctx, u)
 			if err != nil {
 				return nil, err
 			}
@@ -714,7 +712,7 @@ func TestTopicAlias_OutboundReducesBytes(t *testing.T) {
 
 // countingConn counts the bytes written to the broker.
 type countingConn struct {
-	net.Conn
+	transport.Conn
 	n *atomic.Int64
 }
 
@@ -977,8 +975,8 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 	topic := "conformance/group/" + randSuffix()
 	want := []byte("fanout-msg")
 
-	sub1Cli := connect(t, mqttv5.WithBroker(brokerURL()))
-	sub2Cli := connect(t, mqttv5.WithBroker(secondaryBrokerURL()))
+	sub1Cli := connectTo(t, brokerURL())
+	sub2Cli := connectTo(t, secondaryBrokerURL())
 	ch1, _, err := sub1Cli.Subscribe(context.Background(),
 		[]mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(4))
 	if err != nil {
@@ -993,8 +991,8 @@ func TestClientGroup_PublishFanOutToBothBrokers(t *testing.T) {
 
 	g, err := mqttv5.NewClientGroup(
 		[]mqttv5.GroupMember{
-			{Brokers: []string{brokerURL()}},
-			{Brokers: []string{secondaryBrokerURL()}},
+			{Brokers: []string{brokerURL()}, Opts: transportOpts(brokerURL())},
+			{Brokers: []string{secondaryBrokerURL()}, Opts: transportOpts(secondaryBrokerURL())},
 		},
 		mqttv5.WithGroupSharedOpts(
 			mqttv5.WithClientID("conformance-group-"+randSuffix()),

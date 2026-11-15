@@ -11,7 +11,10 @@
 //	go -C conformance test -tags conformance -race -v -timeout 120s
 //	docker compose -f conformance/docker-compose.yml down
 //
-// MQTT_BROKER env var overrides the default mqtt://127.0.0.1:1883.
+// MQTT_BROKER env var overrides the default mqtt://127.0.0.1:1883. An
+// mqtt-quic:// broker runs the suite over transport/quic, trusting
+// MQTT_QUIC_CA (default quic/pki/root.pem, which the compose file
+// generates).
 package conformance
 
 import (
@@ -22,11 +25,14 @@ import (
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -36,6 +42,8 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5"
+	"github.com/ashtonian/mqttv5/transport"
+	"github.com/ashtonian/mqttv5/transport/quic"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -61,14 +69,91 @@ func secondaryBrokerURL() string {
 
 // requireBroker skips the test when the broker is unreachable. Run the
 // compose file before invoking the suite — see this package's docs.
-func requireBroker(t *testing.T, url string) {
+func requireBroker(t *testing.T, broker string) {
 	t.Helper()
-	host := stripScheme(url)
-	c, err := net.DialTimeout("tcp", host, 500*time.Millisecond)
+	if !isQUIC(broker) {
+		c, err := net.DialTimeout("tcp", stripScheme(broker), 500*time.Millisecond)
+		if err != nil {
+			t.Skipf("conformance: broker %s unreachable (%v) — start docker-compose first", broker, err)
+		}
+		_ = c.Close()
+		return
+	}
+	u, err := url.Parse(broker)
 	if err != nil {
-		t.Skipf("conformance: broker %s unreachable (%v) — start docker-compose first", url, err)
+		t.Fatalf("broker URL %q: %v", broker, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := quic.Dial(ctx, u, quicOpts(t))
+	if err != nil {
+		t.Skipf("conformance: broker %s unreachable (%v) — start docker-compose first", broker, err)
 	}
 	_ = c.Close()
+}
+
+func isQUIC(broker string) bool { return strings.HasPrefix(broker, "mqtt-quic://") }
+
+// withBroker is mqttv5.WithBroker plus what broker's transport needs:
+// the QUIC dial for an mqtt-quic:// URL.
+func withBroker(broker string) mqttv5.Option {
+	return func(c *mqttv5.Config) error {
+		if err := mqttv5.WithBroker(broker)(c); err != nil {
+			return err
+		}
+		for _, o := range transportOpts(broker) {
+			if err := o(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// transportOpts are the options a client of broker needs beside its
+// URL: a ClientGroup member's Opts, for one.
+func transportOpts(broker string) []mqttv5.Option {
+	if !isQUIC(broker) {
+		return nil
+	}
+	return []mqttv5.Option{mqttv5.WithDialFunc(quic.DialFunc(quicOpts(nil)))}
+}
+
+// brokerDial dials broker the way a client of it does, for tests that
+// wrap or bypass the client's connection.
+func brokerDial(broker string) transport.DialFunc {
+	if isQUIC(broker) {
+		return quic.DialFunc(quicOpts(nil))
+	}
+	return func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+		return transport.Dial(ctx, u.String(), transport.DialOpts{})
+	}
+}
+
+var quicRoots = sync.OnceValues(func() (*x509.CertPool, error) {
+	path := os.Getenv("MQTT_QUIC_CA")
+	if path == "" {
+		path = "quic/pki/root.pem"
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("QUIC broker CA (MQTT_QUIC_CA): %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("QUIC broker CA %s holds no certificate", path)
+	}
+	return pool, nil
+})
+
+// quicOpts trusts the QUIC broker's CA. With t nil, a CA that cannot be
+// read leaves the system roots, and the dial fails verification.
+func quicOpts(t *testing.T) quic.DialOpts {
+	roots, err := quicRoots()
+	if err != nil && t != nil {
+		t.Fatal(err)
+	}
+	return quic.DialOpts{TLSConfig: &tls.Config{RootCAs: roots}}
 }
 
 func stripScheme(u string) string {
@@ -88,7 +173,7 @@ func connect(t *testing.T, opts ...mqttv5.Option) *mqttv5.Client {
 	requireBroker(t, brokerURL())
 
 	all := []mqttv5.Option{
-		mqttv5.WithBroker(brokerURL()),
+		withBroker(brokerURL()),
 		mqttv5.WithClientID(t.Name() + "-" + randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5 * time.Second),
@@ -143,10 +228,15 @@ type faultProxy struct {
 	refuseUntil time.Time
 }
 
-// newFaultProxy relays to upstream; with traced it also records the
-// packets it relays (see packetTrace).
-func newFaultProxy(t *testing.T, upstream string, traced bool) *faultProxy {
+// newFaultProxy relays to broker; with traced it also records the
+// packets it relays (see packetTrace). It relays TCP: over QUIC the test
+// is skipped.
+func newFaultProxy(t *testing.T, broker string, traced bool) *faultProxy {
 	t.Helper()
+	if isQUIC(broker) {
+		t.Skip("the fault proxy relays TCP, not QUIC")
+	}
+	upstream := stripScheme(broker)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
