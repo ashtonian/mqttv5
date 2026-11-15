@@ -28,6 +28,10 @@ import (
 type connState struct {
 	clk  clock.Clock
 	conn transport.Conn
+	// out writes packets to conn under wmu: in one writev on a TCP or
+	// Unix socket, and gathered into one Write per packet or batch on a
+	// connection without vectored writes.
+	out *packetWriter
 	// connectedAt is when the CONNACK arrived; the supervisor compares
 	// how long the connection lasted with its reconnect delay.
 	connectedAt time.Time
@@ -393,7 +397,7 @@ const writeSlice = 20 * time.Millisecond
 // ends the connection.
 func (cs *connState) writeDirect(ctx context.Context, bufs *net.Buffers, must bool) (started bool, err error) {
 	if ctx.Done() == nil {
-		_, err = bufs.WriteTo(cs.conn)
+		_, err = cs.out.WriteBuffers(bufs)
 		return cs.wrote(err)
 	}
 	if err = ctx.Err(); err != nil && !must {
@@ -406,7 +410,7 @@ func (cs *connState) writeDirect(ctx context.Context, bufs *net.Buffers, must bo
 			deadline = d
 		}
 		_ = cs.conn.SetWriteDeadline(deadline)
-		n, werr := bufs.WriteTo(cs.conn)
+		n, werr := cs.out.WriteBuffers(bufs)
 		written += n
 		if werr == nil || !errors.Is(werr, os.ErrDeadlineExceeded) {
 			_ = cs.conn.SetWriteDeadline(time.Time{})
@@ -875,7 +879,7 @@ type writeReq struct {
 const writeBatchHardCap = 64
 
 // writeBatch accumulates pre-encoded packets to coalesce into one
-// net.Buffers.WriteTo (= one writev syscall on *net.TCPConn). Lives
+// write (see packetWriter: one writev on a TCP socket). Lives
 // on the writer goroutine's stack frame and reuses the same backing
 // arrays across batches — zero alloc per batch. cap is set at
 // construction time from Config.WriteBatchMax (clamped to
@@ -911,7 +915,7 @@ func (b *writeBatch) add(req writeReq) {
 	b.n++
 }
 
-// flush coalesces every queued pkt into one writev. Updates
+// flush coalesces every queued pkt into one write. Updates
 // lastWriteUnixNano on success, releases every buffer, and signals
 // every done channel (with err for failures, nil for success). Resets
 // the batch to empty.
@@ -932,7 +936,7 @@ func (b *writeBatch) flush(cs *connState) error {
 		// WriteTo advances the slice it writes from; keep the full one so
 		// the next batch reuses its array.
 		b.bufs = full
-		_, err = b.bufs.WriteTo(cs.conn)
+		_, err = cs.out.WriteBuffers(&b.bufs)
 		clear(full)
 		b.bufs = full[:0]
 	}
@@ -962,7 +966,7 @@ func (b *writeBatch) flush(cs *connState) error {
 // answers the requests left in it with ErrNotConnected, so callers
 // waiting on req.done never orphan.
 //
-// Batching: pkt-mode reqs coalesce into one writev when WithWriteBatch
+// Batching: pkt-mode reqs coalesce into one write when WithWriteBatch
 // is set; engine packets (QoS 1/2 PUBLISH, PUBREL and the PUBACK /
 // PUBREC / PUBCOMP owed to the broker) always go out as one batch per
 // collection. Channel FIFO order is preserved across all request kinds.
@@ -1005,7 +1009,7 @@ func (c *Client) writeLoop(cs *connState) {
 
 // processWrite handles one writeReq received from the queue; the caller
 // holds cs.wmu. For pkt-mode reqs it drains any further pkt-mode reqs
-// into the batch (bounded by writeBatchMax) and flushes once via writev.
+// into the batch (bounded by writeBatchMax) and flushes them in one write.
 // For fn-mode reqs it flushes any pending batch first, then invokes
 // req.fn directly. Every request taken from the queue is uncounted once
 // it is written or failed.
@@ -1041,7 +1045,7 @@ func (c *Client) writeOne(cs *connState, req writeReq) error {
 	if req.mark != 0 {
 		_, err = cs.flushEngine(context.Background(), req.mark)
 	} else {
-		_, err = req.fn(cs.conn)
+		_, err = cs.out.WritePacket(req.fn)
 		if err == nil {
 			cs.lastWriteUnixNano.Store(cs.clk.Now().UnixNano())
 		}

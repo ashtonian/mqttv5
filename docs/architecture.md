@@ -8,7 +8,7 @@ Outbound, a publish takes the shortest path the connection allows:
 flowchart LR
     pub["Publish"] -- "QoS 1/2: packet ID,<br/>send quota, record" --> engine["session engine"] --> store[("session.Store")]
     pub -- "idle TCP or Unix socket" --> direct["caller's goroutine,<br/>direct write"] --> sock(("socket"))
-    pub -- "busy writer, TLS, WebSocket, QUIC,<br/>fire-and-forget QoS 0" --> writer["writer goroutine<br/>queue, writev batches"] --> sock
+    pub -- "busy writer, TLS, WebSocket, QUIC,<br/>fire-and-forget QoS 0" --> writer["writer goroutine<br/>queue, batched writes"] --> sock
 ```
 
 Inbound, acknowledgements leave in arrival order, from the read loop
@@ -32,9 +32,14 @@ the write and the writer goroutine sends the rest before anything else.
 Otherwise — TLS, WebSocket and QUIC connections, a busy writer, and
 fire-and-forget QoS 0 — one writer goroutine per connection drains an
 MPSC channel of encoded packets to the socket, coalescing queued
-packets into one `writev` when `WithWriteBatch` is set; a write lock
+packets into one write when `WithWriteBatch` is set; a write lock
 keeps the two paths from interleaving, and a publish never overtakes a
-packet its caller queued earlier. Before the read loop waits for more
+packet its caller queued earlier. A TCP or Unix socket takes a batch in
+one `writev`. TLS, WebSocket and QUIC have no vectored write, and each
+write is a TLS record, a WebSocket frame or a stream write of its own,
+so the client copies a packet's header and body, or a batch, into one
+write of up to 16 KiB; a larger payload goes out on its own, uncopied.
+Before the read loop waits for more
 input, it writes the acknowledgements and PUBRELs it has made ready
 itself — on an idle TCP or Unix connection, on unix systems — as far as
 the socket takes them without waiting; the writer goroutine sends the

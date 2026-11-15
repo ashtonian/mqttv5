@@ -27,8 +27,10 @@ with `ErrNoSubprotocol` unless the broker selects one
 [MQTT-6.0.0-4], then carries the MQTT byte stream in WebSocket binary
 frames:
 
-- **Writes.** Every MQTT packet the client writes goes out as one masked
-  binary frame, in a single write to the socket.
+- **Writes.** Each write from the client goes out as one masked binary
+  frame, in a single write to the socket. The client gathers a packet,
+  or a batch of queued packets, into one write of up to 16 KiB, so a
+  packet is split across frames only when it is larger than that.
 - **Reads.** Frames are reassembled into the byte stream the MQTT
   decoder reads, however the broker fragments them, through a 4 KiB
   buffer: a stream of small frames costs a socket read per buffer, not

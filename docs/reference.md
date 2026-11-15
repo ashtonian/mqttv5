@@ -136,7 +136,7 @@ the main connection stands and stop with it.
 | Option | Default | Effect |
 |---|---|---|
 | `WithWriteQueueSize(n)` | 256 | Internal MPSC write buffer. |
-| `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per writev syscall. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
+| `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per write: one `writev` on TCP, one write of up to 16 KiB on TLS, WebSocket and QUIC. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
 | `WithWriteOverflowPolicy(p)` | `WriteBlock` | QoS 0 only. See note below. |
 | `WithPublishMode(mode)` | `PublishFireAndForget` | `PublishWaitForFlush` makes QoS 0 wait until the packet is written; on an idle TCP or Unix connection the caller writes it itself, without copying the payload. ctx bounds the wait; a write it interrupts is finished by the writer goroutine. |
 | `WithPublisherPool(N)` | 0 (off) | N publish-only connections to the client's brokers, beside the main one, that `Publish` spreads over ([Publish pool](publisher-pool.md#publish-pool-withpublisherpool)). |

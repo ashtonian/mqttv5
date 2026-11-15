@@ -198,7 +198,7 @@ type Config struct {
 	WriteOverflowPolicy WriteOverflowPolicy
 
 	// WriteBatchMax caps how many pre-encoded packets the writer
-	// goroutine coalesces into one writev. 0 disables batching. See
+	// goroutine coalesces into one write. 0 disables batching. See
 	// [WithWriteBatch].
 	WriteBatchMax int
 
@@ -785,11 +785,13 @@ func WithWriteQueueSize(n int) Option {
 	}
 }
 
-// WithWriteBatch coalesces up to n queued packets into one writev
-// syscall. Off by default (n=0 or 1). It saves syscalls when many
-// goroutines publish concurrently and packets queue behind the writer;
-// with one publisher or large payloads there is little to coalesce.
-// Measure with your workload before enabling it.
+// WithWriteBatch coalesces up to n queued packets into one write: one
+// writev on a TCP or Unix socket, and on TLS, WebSocket and QUIC one
+// write of up to 16 KiB (a TLS record, a WebSocket frame). Off by
+// default (n=0 or 1). It saves syscalls when many goroutines publish
+// concurrently and packets queue behind the writer; with one publisher
+// or large payloads there is little to coalesce. Measure with your
+// workload before enabling it.
 func WithWriteBatch(n int) Option {
 	return func(c *Config) error {
 		if n < 0 {

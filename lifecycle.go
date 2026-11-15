@@ -298,6 +298,7 @@ func (c *Client) finish(ctx context.Context, life *lifecycle) error {
 type connectResult struct {
 	url     string
 	conn    transport.Conn
+	out     *packetWriter
 	decoder *wire.Decoder
 	info    ConnackInfo
 	// connectExpiry is the Session Expiry Interval the CONNECT carried.
@@ -345,16 +346,18 @@ func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL *
 
 // handshakeViolation answers a broker protocol violation during the
 // handshake: DISCONNECT 0x82, transport.Abort, and the error to return.
-func (c *Client) handshakeViolation(conn transport.Conn, t wire.PacketType, detail string) *ProtocolError {
-	return c.abortHandshake(conn, &ProtocolError{Reason: wire.ReasonProtocolError, Packet: t, Detail: detail})
+func (c *Client) handshakeViolation(out *packetWriter, t wire.PacketType, detail string) *ProtocolError {
+	return c.abortHandshake(out, &ProtocolError{Reason: wire.ReasonProtocolError, Packet: t, Detail: detail})
 }
 
-// abortHandshake sends DISCONNECT with perr's reason code and ends conn
-// through transport.Abort.
-func (c *Client) abortHandshake(conn transport.Conn, perr *ProtocolError) *ProtocolError {
+// abortHandshake sends DISCONNECT with perr's reason code and ends the
+// connection through transport.Abort.
+func (c *Client) abortHandshake(out *packetWriter, perr *ProtocolError) *ProtocolError {
 	c.stats.addProtocolError()
-	_, _ = wire.WriteDisconnect(conn, wire.DisconnectOpts{ReasonCode: perr.Reason})
-	_ = transport.Abort(conn, byte(perr.Reason))
+	_, _ = out.WritePacket(func(w io.Writer) (int64, error) {
+		return wire.WriteDisconnect(w, wire.DisconnectOpts{ReasonCode: perr.Reason})
+	})
+	_ = transport.Abort(out.conn, byte(perr.Reason))
 	return perr
 }
 
@@ -414,7 +417,8 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 		return err
 	}
 
-	sent, err := c.writeConnect(dialCtx, conn, u, cleanStart)
+	out := newPacketWriter(conn)
+	sent, err := c.writeConnect(dialCtx, out, u, cleanStart)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mqttv5: write CONNECT: %w", ioErr(err))
@@ -426,7 +430,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 	for {
 		pkt, err := dec.ReadPacket()
 		if perr := decodeViolation(err); perr != nil {
-			return nil, c.abortHandshake(conn, perr)
+			return nil, c.abortHandshake(out, perr)
 		}
 		if err != nil {
 			_ = conn.Close()
@@ -443,7 +447,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 			brokerData := authData(p.Properties)
 			p.Release()
 			if reason != wire.ReasonContinueAuthentication || !methodOK {
-				return nil, c.handshakeViolation(conn, wire.AUTH, fmt.Sprintf(
+				return nil, c.handshakeViolation(out, wire.AUTH, fmt.Sprintf(
 					"AUTH reason %#x method %q during CONNECT (method %q)", byte(reason), method, sent.AuthenticationMethod))
 			}
 			response, err := c.authContinue(dialCtx, brokerData)
@@ -451,10 +455,12 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				_ = conn.Close()
 				return nil, fmt.Errorf("mqttv5: Authenticator.Continue: %w", err)
 			}
-			if _, err := wire.WriteAuth(conn, wire.AuthOpts{
-				ReasonCode:           wire.ReasonContinueAuthentication,
-				AuthenticationMethod: sent.AuthenticationMethod,
-				AuthenticationData:   response,
+			if _, err := out.WritePacket(func(w io.Writer) (int64, error) {
+				return wire.WriteAuth(w, wire.AuthOpts{
+					ReasonCode:           wire.ReasonContinueAuthentication,
+					AuthenticationMethod: sent.AuthenticationMethod,
+					AuthenticationData:   response,
+				})
 			}); err != nil {
 				_ = conn.Close()
 				return nil, fmt.Errorf("mqttv5: write AUTH: %w", ioErr(err))
@@ -469,12 +475,12 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 			}
 			if sent.CleanStart && p.SessionPresent {
 				p.Release()
-				return nil, c.handshakeViolation(conn, wire.CONNACK, "Session Present set in reply to CleanStart=1")
+				return nil, c.handshakeViolation(out, wire.CONNACK, "Session Present set in reply to CleanStart=1")
 			}
 			if method, ok := p.Properties.String(wire.PropAuthMethod); ok && method != sent.AuthenticationMethod {
 				method = strings.Clone(method)
 				p.Release()
-				return nil, c.handshakeViolation(conn, wire.CONNACK, fmt.Sprintf(
+				return nil, c.handshakeViolation(out, wire.CONNACK, fmt.Sprintf(
 					"CONNACK authentication method %q, CONNECT used %q", method, sent.AuthenticationMethod))
 			}
 			// Enhanced-auth mutual verification (§4.12): an Authenticator
@@ -500,7 +506,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				return nil, fmt.Errorf("mqttv5: connect: %w", dialCtx.Err())
 			}
 			_ = conn.SetDeadline(time.Time{})
-			r := &connectResult{url: brokerURL, conn: conn, decoder: dec, info: info}
+			r := &connectResult{url: brokerURL, conn: conn, out: out, decoder: dec, info: info}
 			if sent.SessionExpiryInterval != nil {
 				r.connectExpiry = *sent.SessionExpiryInterval
 			}
@@ -526,6 +532,7 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		clk:           c.cfg.clock,
 		connectedAt:   c.cfg.clock.Now(),
 		conn:          r.conn,
+		out:           r.out,
 		decoder:       r.decoder,
 		writeQueue:    make(chan writeReq, c.cfg.WriteQueueSize),
 		direct:        supportsDirectWrites(r.conn),
@@ -972,9 +979,9 @@ func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
 		slog.Int("reason", int(opts.ReasonCode)), slog.Any("error", err))
 }
 
-// writeConnect emits the CONNECT packet directly against w (used during
-// the handshake, before the writer goroutine has started) and returns
-// the options actually sent.
+// writeConnect writes the CONNECT packet to out (during the handshake,
+// before the writer goroutine has started) and returns the options
+// actually sent.
 //
 // The ClientID is the configured one or, when that is empty, the one the
 // broker assigned earlier, so the session can resume.
@@ -986,7 +993,7 @@ func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
 // If cfg.ConnectPacketBuilder is set, it runs after this method has
 // populated opts, is told brokerURL, and may change the credentials and
 // user properties. A non-nil error from the builder fails the attempt.
-func (c *Client) writeConnect(ctx context.Context, w io.Writer, brokerURL *url.URL, cleanStart bool) (wire.ConnectOpts, error) {
+func (c *Client) writeConnect(ctx context.Context, out *packetWriter, brokerURL *url.URL, cleanStart bool) (wire.ConnectOpts, error) {
 	cfg := c.cfg
 	opts := wire.ConnectOpts{
 		ClientID:          c.ClientID(),
@@ -1032,7 +1039,7 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, brokerURL *url.U
 		}
 		opts.Username, opts.Password, opts.UserProperties = co.Username, co.Password, co.UserProperties
 	}
-	_, err := wire.WriteConnect(w, opts)
+	_, err := out.WritePacket(func(w io.Writer) (int64, error) { return wire.WriteConnect(w, opts) })
 	return opts, err
 }
 
