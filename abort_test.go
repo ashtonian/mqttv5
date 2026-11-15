@@ -97,7 +97,9 @@ func TestProtocolViolationAborts(t *testing.T) {
 		{"protocol error", []byte{0xc0, 0}, wire.ReasonProtocolError},                    // PINGREQ from a broker
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			checked := make(chan struct{})
 			b := testbroker.New(t, func(c *testbroker.Conn) {
+				defer close(checked)
 				c.AcceptConnect(wire.ConnackOpts{})
 				_ = c.Raw(tt.packet)
 				if p := c.Expect(wire.DISCONNECT, 0); p.Reason != tt.reason {
@@ -108,6 +110,13 @@ func TestProtocolViolationAborts(t *testing.T) {
 			tbClient(t, b, seamDial(conns))
 			if got, want := (<-conns).endedWith(t), []string{event("abort", tt.reason)}; !slices.Equal(got, want) {
 				t.Fatalf("the client ended the connection with %v, want %v", got, want)
+			}
+			// The broker reads the DISCONNECT behind the abort; closing it
+			// before then would cut its check short.
+			select {
+			case <-checked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the broker never finished checking the DISCONNECT")
 			}
 		})
 	}
