@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -339,5 +341,45 @@ func TestTLSClientConfig(t *testing.T) {
 				t.Error("modified the caller's config")
 			}
 		})
+	}
+}
+
+// endings records how a connection was ended.
+type endings struct {
+	net.Conn
+	calls []string
+}
+
+func (e *endings) Close() error {
+	e.calls = append(e.calls, "close")
+	return nil
+}
+
+type aborting struct{ endings }
+
+func (a *aborting) Abort(reason byte) error {
+	a.calls = append(a.calls, fmt.Sprintf("abort %#x", reason))
+	return nil
+}
+
+func (a *aborting) ObserveDisconnect(reason byte) {
+	a.calls = append(a.calls, fmt.Sprintf("observe %#x", reason))
+}
+
+// Abort and ObserveDisconnect reach a conn that implements them; a conn
+// that does not is closed, and not told of the DISCONNECT.
+func TestOptionalEndings(t *testing.T) {
+	plain := &endings{}
+	_ = Abort(plain, 0x82)
+	ObserveDisconnect(plain, 0x8E)
+	if !slices.Equal(plain.calls, []string{"close"}) {
+		t.Fatalf("plain conn got %v, want [close]", plain.calls)
+	}
+
+	ext := &aborting{}
+	ObserveDisconnect(ext, 0x8E)
+	_ = Abort(ext, 0x82)
+	if want := []string{"observe 0x8e", "abort 0x82"}; !slices.Equal(ext.calls, want) {
+		t.Fatalf("conn with the interfaces got %v, want %v", ext.calls, want)
 	}
 }

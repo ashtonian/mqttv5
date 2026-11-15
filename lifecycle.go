@@ -344,12 +344,17 @@ func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL *
 }
 
 // handshakeViolation answers a broker protocol violation during the
-// handshake: DISCONNECT 0x82, close, and the error to return.
+// handshake: DISCONNECT 0x82, transport.Abort, and the error to return.
 func (c *Client) handshakeViolation(conn transport.Conn, t wire.PacketType, detail string) *ProtocolError {
-	perr := &ProtocolError{Reason: wire.ReasonProtocolError, Packet: t, Detail: detail}
+	return c.abortHandshake(conn, &ProtocolError{Reason: wire.ReasonProtocolError, Packet: t, Detail: detail})
+}
+
+// abortHandshake sends DISCONNECT with perr's reason code and ends conn
+// through transport.Abort.
+func (c *Client) abortHandshake(conn transport.Conn, perr *ProtocolError) *ProtocolError {
 	c.stats.addProtocolError()
 	_, _ = wire.WriteDisconnect(conn, wire.DisconnectOpts{ReasonCode: perr.Reason})
-	_ = conn.Close()
+	_ = transport.Abort(conn, byte(perr.Reason))
 	return perr
 }
 
@@ -421,10 +426,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 	for {
 		pkt, err := dec.ReadPacket()
 		if perr := decodeViolation(err); perr != nil {
-			c.stats.addProtocolError()
-			_, _ = wire.WriteDisconnect(conn, wire.DisconnectOpts{ReasonCode: perr.Reason})
-			_ = conn.Close()
-			return nil, perr
+			return nil, c.abortHandshake(conn, perr)
 		}
 		if err != nil {
 			_ = conn.Close()

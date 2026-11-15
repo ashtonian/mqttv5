@@ -490,12 +490,24 @@ func supportsDirectWrites(conn transport.Conn) bool {
 
 var _ inflight.Link = (*connState)(nil)
 
-// signalDown marks this connection as dying. Idempotent.
+// signalDown marks this connection as dying and closes it. Idempotent.
 func (cs *connState) signalDown() {
+	cs.down(transport.Conn.Close)
+}
+
+// abortDown is signalDown over a broker protocol violation with reason:
+// the connection ends through transport.Abort.
+func (cs *connState) abortDown(reason wire.ReasonCode) {
+	cs.down(func(conn transport.Conn) error { return transport.Abort(conn, byte(reason)) })
+}
+
+// down marks this connection as dying and ends it with end; the first
+// call wins.
+func (cs *connState) down(end func(transport.Conn) error) {
 	cs.dyingOnce.Do(func() {
 		close(cs.dying)
 		if cs.conn != nil {
-			_ = cs.conn.Close()
+			_ = end(cs.conn)
 		}
 	})
 }
@@ -580,6 +592,7 @@ func (c *Client) dispatch(cs *connState, pkt wire.Packet) {
 		info := disconnectInfoOf(p)
 		cs.serverDisconnect.Store(&info)
 		c.cfg.Logger.Warn("mqttv5: broker DISCONNECT", slog.Int("reason", int(p.ReasonCode)))
+		transport.ObserveDisconnect(cs.conn, byte(p.ReasonCode))
 		pkt.Release()
 		cs.signalDown()
 	default:
@@ -788,15 +801,15 @@ func (c *Client) resolveTopicAlias(cs *connState, pub *wire.Publish) *ProtocolEr
 }
 
 // protocolViolation handles a broker packet that breaks MQTT v5:
-// DISCONNECT with the error's reason code, then close. The supervisor
-// reconnects.
+// DISCONNECT with the error's reason code, then transport.Abort. The
+// supervisor reconnects.
 func (c *Client) protocolViolation(cs *connState, perr *ProtocolError) {
 	c.stats.addProtocolError()
 	c.cfg.Logger.Error("mqttv5: broker protocol violation; disconnecting",
 		slog.String("packet", perr.Packet.String()),
 		slog.Int("reason", int(perr.Reason)),
 		slog.String("detail", perr.Detail))
-	c.writeDisconnectAndClose(cs, wire.DisconnectOpts{ReasonCode: perr.Reason})
+	c.writeDisconnectAndAbort(cs, wire.DisconnectOpts{ReasonCode: perr.Reason})
 }
 
 // handlePubResp routes PUBACK/PUBREC/PUBREL/PUBCOMP to the session

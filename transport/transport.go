@@ -8,9 +8,10 @@
 //	mqtt://, tcp://         → TCP (DialTCP)
 //	mqtts://, tls://, ssl:// → TLS  (DialTLS)
 //
-// WebSocket transports (ws://, wss://) are intentionally not in this
-// package — they require a non-stdlib dependency and belong in a
-// sibling extension package.
+// WebSocket (ws://, wss://) and QUIC (mqtt-quic://) transports are
+// intentionally not in this package — they require non-stdlib
+// dependencies and live in the sibling transport/ws and transport/quic
+// modules.
 package transport
 
 import (
@@ -54,6 +55,41 @@ type ConnectionStater interface {
 }
 
 var _ ConnectionStater = (*tls.Conn)(nil)
+
+// Aborter is implemented by connections that can end abortively and
+// tell the peer an MQTT reason code at the transport level, such as
+// transport/quic, which resets the stream with QUIC error code 0x300 +
+// reason. The client ends a connection through [Abort] when the broker
+// broke the protocol, after its DISCONNECT with that reason.
+type Aborter interface {
+	Abort(reason byte) error
+}
+
+// Abort ends conn over a protocol violation with MQTT reason code
+// reason: Abort when conn implements [Aborter], Close otherwise.
+func Abort(conn Conn, reason byte) error {
+	if a, ok := conn.(Aborter); ok {
+		return a.Abort(reason)
+	}
+	return conn.Close()
+}
+
+// DisconnectObserver is implemented by connections that act on the
+// reason code of a DISCONNECT the broker sent on them, such as
+// transport/quic, which waits before dialing again after Session Taken
+// Over. The client reports it through [ObserveDisconnect] before closing
+// the connection.
+type DisconnectObserver interface {
+	ObserveDisconnect(reason byte)
+}
+
+// ObserveDisconnect reports a broker DISCONNECT with reason code reason
+// to conn, when conn implements [DisconnectObserver].
+func ObserveDisconnect(conn Conn, reason byte) {
+	if o, ok := conn.(DisconnectObserver); ok {
+		o.ObserveDisconnect(reason)
+	}
+}
 
 // TLSState returns the TLS state conn negotiated, and false when conn
 // did not negotiate TLS: it does not implement [ConnectionStater], or

@@ -82,6 +82,23 @@ func WithAuthenticator(a Authenticator) Option {
 // our reason code before the socket disappears (e.g. mid-session
 // auth failure).
 func (c *Client) writeDisconnectAndClose(cs *connState, opts wire.DisconnectOpts) {
+	c.writeDisconnect(cs, opts)
+	cs.signalDown()
+}
+
+// writeDisconnectAndAbort is writeDisconnectAndClose for a broker
+// protocol violation: the connection ends through transport.Abort, which
+// a transport that can carries the reason code to the broker at its own
+// level as well (transport/quic resets the stream with it).
+func (c *Client) writeDisconnectAndAbort(cs *connState, opts wire.DisconnectOpts) {
+	c.writeDisconnect(cs, opts)
+	cs.abortDown(opts.ReasonCode)
+}
+
+// writeDisconnect queues a DISCONNECT with opts and waits, at most
+// DisconnectFlushTimeout or until the connection dies, for the writer
+// to send it.
+func (c *Client) writeDisconnect(cs *connState, opts wire.DisconnectOpts) {
 	done := make(chan error, 1)
 	req := writeReq{
 		fn: func(w io.Writer) (int64, error) {
@@ -93,17 +110,16 @@ func (c *Client) writeDisconnectAndClose(cs *connState, opts wire.DisconnectOpts
 		// Write queue full / writer dead — best-effort only.
 		c.cfg.Logger.Debug("mqttv5: DISCONNECT dropped (writer wedged)",
 			slog.Int("reason", int(opts.ReasonCode)), slog.Any("error", err))
-	} else {
-		select {
-		case err := <-done:
-			if err != nil {
-				c.logDisconnectNotWritten(opts, err)
-			}
-		case <-c.cfg.clock.After(c.cfg.DisconnectFlushTimeout):
-		case <-cs.dying:
-		}
+		return
 	}
-	cs.signalDown()
+	select {
+	case err := <-done:
+		if err != nil {
+			c.logDisconnectNotWritten(opts, err)
+		}
+	case <-c.cfg.clock.After(c.cfg.DisconnectFlushTimeout):
+	case <-cs.dying:
+	}
 }
 
 // handleServerAuth processes an AUTH packet after CONNACK (§4.12).
