@@ -49,9 +49,9 @@ const (
 	// DefaultWriteQueueSize sizes the internal MPSC write channel.
 	DefaultWriteQueueSize = 256
 
-	// DefaultDisconnectFlushTimeout caps how long writeDisconnectAndClose
-	// will wait for the DISCONNECT packet to flush before the
-	// connection is forcibly torn down.
+	// DefaultDisconnectFlushTimeout caps how long the client waits for a
+	// DISCONNECT it sends, on Disconnect or over a protocol error, to be
+	// written before the connection is torn down.
 	DefaultDisconnectFlushTimeout = 500 * time.Millisecond
 
 	// DefaultReadBufferSize is the per-connection read window used when

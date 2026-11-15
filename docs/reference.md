@@ -65,7 +65,7 @@
 | `WithoutKeepAlive()` | — | Request no keep-alive (no PINGREQ unless the broker sets a Server Keep Alive). Rarely correct in production. |
 | `WithConnectTimeout(d)` | 10 s | Dial + CONNECT/CONNACK budget. |
 | `WithPingTimeout(d)` | min(10 s, KeepAlive/2) | How long to wait for any packet after a PINGREQ before declaring the connection dead. Must be shorter than the keep-alive (`New` rejects it otherwise). |
-| `WithDisconnectFlushTimeout(d)` | 500 ms | Flush budget for the DISCONNECT write on graceful shutdown. |
+| `WithDisconnectFlushTimeout(d)` | 500 ms | How long `Disconnect`, or a protocol error the client disconnects over, waits for its DISCONNECT to be written before closing the connection; the packets ahead of it may be held up by a broker that stopped reading. |
 | `WithReadBufferSize(n)` | 16 KiB | Per-connection read window. Larger windows cut read syscalls for floods of small messages (`BenchmarkReceiveWindow`). |
 
 > **Keep-alive.** A PINGREQ goes out once either direction has been

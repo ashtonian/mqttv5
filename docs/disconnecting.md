@@ -5,7 +5,9 @@
 `Disconnect(ctx)` ends the client gracefully:
 
 1. it sends DISCONNECT (Normal disconnection) after any acknowledgements
-   already made;
+   already made, waiting at most `WithDisconnectFlushTimeout` (500 ms)
+   for it to be written, as the packets ahead of it may be held up by a
+   broker that stopped reading, and closes the connection;
 2. it waits for the connection's goroutines (the read loop runs
    `SubscribeCallback` handlers) and closes every subscription's channel
    or queue;

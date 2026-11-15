@@ -95,9 +95,8 @@ func (c *Client) writeDisconnectAndAbort(cs *connState, opts wire.DisconnectOpts
 	cs.abortDown(opts.ReasonCode)
 }
 
-// writeDisconnect queues a DISCONNECT with opts and waits, at most
-// DisconnectFlushTimeout or until the connection dies, for the writer
-// to send it.
+// writeDisconnect queues a DISCONNECT with opts and waits for the writer
+// to send it (see awaitDisconnect).
 func (c *Client) writeDisconnect(cs *connState, opts wire.DisconnectOpts) {
 	done := make(chan error, 1)
 	req := writeReq{
@@ -112,14 +111,7 @@ func (c *Client) writeDisconnect(cs *connState, opts wire.DisconnectOpts) {
 			slog.Int("reason", int(opts.ReasonCode)), slog.Any("error", err))
 		return
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			c.logDisconnectNotWritten(opts, err)
-		}
-	case <-c.cfg.clock.After(c.cfg.DisconnectFlushTimeout):
-	case <-cs.dying:
-	}
+	c.awaitDisconnect(context.Background(), cs, done, opts)
 }
 
 // handleServerAuth processes an AUTH packet after CONNACK (§4.12).

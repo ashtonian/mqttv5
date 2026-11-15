@@ -938,9 +938,7 @@ func (c *Client) tryBroker(life *lifecycle, attempt int, brokerURL string, clean
 }
 
 // sendDisconnectWith best-effort writes a graceful DISCONNECT carrying
-// opts. cs.dying short-circuits the wait if the connection is going
-// down before the writer drains; combined with drainWriteQueue in
-// writeLoop's deferred exit, req.done is always signalled.
+// opts (see awaitDisconnect).
 func (c *Client) sendDisconnectWith(ctx context.Context, opts wire.DisconnectOpts) {
 	cs := c.cur.Load()
 	if cs == nil {
@@ -962,11 +960,22 @@ func (c *Client) sendDisconnectWith(ctx context.Context, opts wire.DisconnectOpt
 	if err != nil {
 		return
 	}
+	c.awaitDisconnect(ctx, cs, done, opts)
+}
+
+// awaitDisconnect waits for the writer to send a DISCONNECT it queued
+// with done: at most DisconnectFlushTimeout, as the packets ahead of it
+// may be stalled behind a broker that stopped reading, and no longer than
+// ctx or the connection lasts.
+func (c *Client) awaitDisconnect(ctx context.Context, cs *connState, done <-chan error, opts wire.DisconnectOpts) {
+	flush := c.cfg.clock.NewTimer(c.cfg.DisconnectFlushTimeout)
+	defer flush.Stop()
 	select {
 	case err := <-done:
 		if err != nil {
 			c.logDisconnectNotWritten(opts, err)
 		}
+	case <-flush.C():
 	case <-ctx.Done():
 	case <-cs.dying:
 	}

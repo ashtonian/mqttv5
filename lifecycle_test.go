@@ -1603,16 +1603,17 @@ func TestTeardownReportsAHandlerThatDoesNotReturn(t *testing.T) {
 	timers := clk.Pending()
 	stopped := make(chan error, 1)
 	go func() { stopped <- cli.Disconnect(ctx) }()
-	if !clk.WaitPending(timers+1, 5*time.Second) {
-		t.Fatal("the teardown did not start waiting for the handler")
-	}
-	clk.Advance(joinStallWarning)
+	// The teardown arms other timers before it waits for the handler (the
+	// DISCONNECT's flush timeout), so the clock moves on until it reports
+	// the handler.
 	const warning = "mqttv5: disconnect is waiting for a SubscribeCallback handler"
 	for deadline := time.Now().Add(5 * time.Second); !log.logged(warning); {
 		if time.Now().After(deadline) {
 			t.Fatal("no warning about the handler holding the teardown")
 		}
-		time.Sleep(time.Millisecond)
+		if clk.WaitPending(timers+1, 10*time.Millisecond) {
+			clk.Advance(joinStallWarning)
+		}
 	}
 	select {
 	case <-stopped:
