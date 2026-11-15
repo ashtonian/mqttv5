@@ -80,6 +80,9 @@ jobs:
           - { name: mosquitto, url: "mqtt://127.0.0.1:1883", second: "mqtt://127.0.0.1:1884" }
           - { name: emqx, url: "mqtt://127.0.0.1:1884", second: "mqtt://127.0.0.1:1883" }
           - { name: hivemq, url: "mqtt://127.0.0.1:1886", second: "mqtt://127.0.0.1:1883" }
+          # The suite over transport/quic against EMQX's QUIC listener; the
+          # fault-proxy tests, which relay TCP, skip.
+          - { name: emqx-quic, url: "mqtt-quic://127.0.0.1:14567", second: "mqtt://127.0.0.1:1883" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

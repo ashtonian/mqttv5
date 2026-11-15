@@ -67,6 +67,7 @@ SUBMODULES=(
     store/file
     queue/file
     transport/ws
+    transport/quic
     tlsrevocation
 )
 
