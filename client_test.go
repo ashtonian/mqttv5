@@ -435,6 +435,7 @@ func TestNewValidatesOptions(t *testing.T) {
 	}{
 		{"ws without a dial function", []Option{WithBroker("ws://broker:80/mqtt")}},
 		{"wss without a dial function", []Option{WithBroker("wss://broker:443/mqtt")}},
+		{"mqtt-quic without a dial function", []Option{WithBroker("mqtt-quic://broker:14567")}},
 		{"negative write queue", []Option{WithWriteQueueSize(-1)}},
 		{"negative pool size", []Option{WithPublisherPool(-2)}},
 		{"negative connect timeout", []Option{WithConnectTimeout(-time.Second)}},
@@ -450,8 +451,10 @@ func TestNewValidatesOptions(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New(WithBroker("ws://broker:80/mqtt"), WithDialFunc(func(context.Context, *url.URL) (transport.Conn, error) { return nil, nil })); err != nil {
-		t.Fatalf("ws with a dial function: %v", err)
+	for _, u := range []string{"ws://broker:80/mqtt", "mqtt-quic://broker:14567"} {
+		if _, err := New(WithBroker(u), WithDialFunc(func(context.Context, *url.URL) (transport.Conn, error) { return nil, nil })); err != nil {
+			t.Fatalf("%s with a dial function: %v", u, err)
+		}
 	}
 }
 
