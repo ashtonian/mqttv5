@@ -7,7 +7,7 @@
 // Run a broker with an MQTT-over-QUIC listener (EMQX's quic:default, in
 // conformance/docker-compose.yml on 14567/udp) then:
 //
-//	MQTT_CA_FILE=../conformance/quic/pki/root.pem go -C examples run ./quic
+//	MQTT_CA_FILE=../conformance/tls/pki/root.pem go -C examples run ./quic
 //
 // MQTT_CA_FILE is resolved from the examples directory; empty verifies
 // the broker against the system roots. MQTT_FALLBACK, an mqtts:// URL,

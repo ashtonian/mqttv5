@@ -750,7 +750,7 @@ func newWillClient(t *testing.T, will *mqttv5.WillOptions, sessionExpiry uint32)
 
 	w := &connWatcher{}
 	cli, err := mqttv5.New(
-		withBroker(brokerURL()),
+		withBrokerDial(brokerURL(), w.dialFunc()),
 		mqttv5.WithClientID(t.Name()+"-will-"+randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5*time.Second),
@@ -759,7 +759,6 @@ func newWillClient(t *testing.T, will *mqttv5.WillOptions, sessionExpiry uint32)
 		// close is terminal — no reconnect, no re-armed will.
 		mqttv5.WithOnConnectionDown(func() bool { return false }),
 		mqttv5.WithWill(will),
-		mqttv5.WithDialFunc(w.dialFunc()),
 	)
 	if err != nil {
 		t.Fatalf("New will client: %v", err)

@@ -29,7 +29,7 @@ var examples = []string{
 // env is what an example needs beyond the defaults: the quic example
 // trusts the certificate the compose file generates for EMQX.
 var env = map[string][]string{
-	"quic": {"MQTT_CA_FILE=../conformance/quic/pki/root.pem"},
+	"quic": {"MQTT_CA_FILE=../conformance/tls/pki/root.pem"},
 }
 
 const (

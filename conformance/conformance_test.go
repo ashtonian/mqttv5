@@ -660,16 +660,16 @@ func TestPublish_LargePayload_ByteEquality(t *testing.T) {
 // sees the full topic.
 func TestTopicAlias_OutboundReducesBytes(t *testing.T) {
 	var written atomic.Int64
-	pub := connect(t,
+	countWrites := func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+		c, err := brokerDial(brokerURL())(ctx, u)
+		if err != nil {
+			return nil, err
+		}
+		return countingConn{Conn: c, n: &written}, nil
+	}
+	pub := connectWith(t, withBrokerDial(brokerURL(), countWrites),
 		mqttv5.WithOutboundTopicAliases(),
-		mqttv5.WithPublishMode(mqttv5.PublishWaitForFlush),
-		mqttv5.WithDialFunc(func(ctx context.Context, u *url.URL) (transport.Conn, error) {
-			c, err := brokerDial(brokerURL())(ctx, u)
-			if err != nil {
-				return nil, err
-			}
-			return countingConn{Conn: c, n: &written}, nil
-		}))
+		mqttv5.WithPublishMode(mqttv5.PublishWaitForFlush))
 	if info, ok := pub.ServerInfo(); !ok || info.TopicAliasMaximum == 0 {
 		t.Skip("broker grants no topic aliases")
 	}

@@ -42,40 +42,46 @@ services:
       timeout: 2s
       retries: 15
 
-  # quic-pki builds the certificate of emqx's QUIC listener into
-  # ./quic/pki (gitignored) on first start, then exits; it runs the EMQX
-  # image only for that image's OpenSSL. The suite and the quic example
-  # trust ./quic/pki/root.pem.
-  quic-pki:
+  # tls-pki builds the certificate of emqx's TLS listeners (mqtts, wss
+  # and QUIC) into ./tls/pki (gitignored) on first start, then exits; it
+  # runs the EMQX image only for that image's OpenSSL. The suite and the
+  # examples trust ./tls/pki/root.pem.
+  tls-pki:
     image: emqx/emqx:6.3.1
-    container_name: mqttv5-conformance-quic-pki
+    container_name: mqttv5-conformance-tls-pki
     mem_limit: 64m
-    # Root, to write the bind-mounted ./quic/pki; pki.sh hands the files
+    # Root, to write the bind-mounted ./tls/pki; pki.sh hands the files
     # to the directory's owner.
     user: "0:0"
-    entrypoint: ["sh", "/quic/pki.sh"]
+    entrypoint: ["sh", "/tls/pki.sh"]
     volumes:
-      - ./quic/pki.sh:/quic/pki.sh:ro
-      - ./quic/pki:/pki
+      - ./tls/pki.sh:/tls/pki.sh:ro
+      - ./tls/pki:/pki
 
   # emqx covers the cases mosquitto handles differently (e.g.,
   # AssignedClientIdentifier policy, shared subscriptions), and serves
-  # MQTT over QUIC for transport/quic.
+  # every transport: mqtt, mqtts, ws, wss and QUIC.
   emqx:
     image: emqx/emqx:6.3.1
     container_name: mqttv5-conformance-emqx
     mem_limit: 1536m
     depends_on:
-      quic-pki:
+      tls-pki:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:1884:1883"
-      - "127.0.0.1:8083:8083" # WebSocket listener, for the ws example
-      - "127.0.0.1:14567:14567/udp" # QUIC listener
+      - "127.0.0.1:8893:8883" # mqtts (emqx-ocsp holds 8883-8887)
+      - "127.0.0.1:8083:8083" # ws
+      - "127.0.0.1:8084:8084" # wss
+      - "127.0.0.1:14567:14567/udp" # QUIC
     volumes:
-      - ./quic/pki:/pki:ro
+      - ./tls/pki:/pki:ro
     environment:
       EMQX_ALLOW_ANONYMOUS: "true"
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: /pki/broker.pem
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE: /pki/broker.key
+      EMQX_LISTENERS__WSS__DEFAULT__SSL_OPTIONS__CERTFILE: /pki/broker.pem
+      EMQX_LISTENERS__WSS__DEFAULT__SSL_OPTIONS__KEYFILE: /pki/broker.key
       EMQX_LISTENERS__QUIC__DEFAULT__ENABLE: "true"
       EMQX_LISTENERS__QUIC__DEFAULT__BIND: "0.0.0.0:14567"
       EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE: /pki/broker.pem

@@ -307,7 +307,7 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 	// connCapture DialFunc lets the test sever P's socket directly.
 	cc := &connCapture{}
 	pub, err := mqttv5.New(
-		withBroker(brokerURL()),
+		withBrokerDial(brokerURL(), cc.DialFunc()),
 		mqttv5.WithClientID("conformance-replay-pub-"+randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5*time.Second),
@@ -315,7 +315,6 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 		mqttv5.WithCleanStartOnReconnect(false),
 		mqttv5.WithSessionExpiry(300),
 		mqttv5.WithReconnectBackoff(mqttv5.ConstantBackoff(100*time.Millisecond)),
-		mqttv5.WithDialFunc(cc.DialFunc()),
 	)
 	if err != nil {
 		t.Fatalf("New pub: %v", err)

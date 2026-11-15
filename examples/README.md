@@ -41,7 +41,7 @@ cleanly, and exits 1 with the error on failure.
 | `MQTT_SOURCE` | `bridge` | `mqtt://127.0.0.1:1883` | Broker the bridge copies from. |
 | `MQTT_DESTINATION` | `bridge` | `mqtt://127.0.0.1:1884` | Broker the bridge copies to. |
 | `MQTT_DATA_DIR` | `durable` | `$TMPDIR/mqttv5-durable` | Directory of the queue and session files; delete it to start over. |
-| `MQTT_CA_FILE` | `quic` | none (system roots) | PEM CA bundle the broker's certificate is verified against, relative to `examples/`. The conformance EMQX's is `../conformance/quic/pki/root.pem`. |
+| `MQTT_CA_FILE` | `quic` | none (system roots) | PEM CA bundle the broker's certificate is verified against, relative to `examples/`. The conformance EMQX's is `../conformance/tls/pki/root.pem`. |
 | `MQTT_FALLBACK` | `quic` | none (no fallback) | An `mqtts://` URL to fall back to when QUIC cannot reach the broker. |
 
 ## External dependencies
@@ -82,7 +82,7 @@ MQTT_BROKER=ws://127.0.0.1:8083/mqtt go -C examples run ./ws
 # QUIC: the conformance EMQX, whose QUIC certificate the compose file
 # generates, then:
 docker compose -f conformance/docker-compose.yml up -d --wait emqx
-MQTT_CA_FILE=../conformance/quic/pki/root.pem go -C examples run ./quic
+MQTT_CA_FILE=../conformance/tls/pki/root.pem go -C examples run ./quic
 
 # Compile everything and check the README snippets:
 go -C examples vet ./...
@@ -121,7 +121,7 @@ needs nothing from this repository.
 | `ErrConnectRefused` (0x87 Not authorized) | the broker's `allow_anonymous` setting | Allow anonymous clients or add credentials to the example. |
 | `ws` example: `unexpected HTTP response status` | the broker's WebSocket listener and path | Configure a `protocol websockets` listener; most brokers serve it on `/mqtt`. |
 | `quic` example: `context deadline exceeded` | `docker compose ps emqx`; the `127.0.0.1:14567/udp` port mapping | Start the conformance EMQX; set `MQTT_FALLBACK` where UDP is blocked. |
-| `quic` example: `x509: certificate signed by unknown authority` | `MQTT_CA_FILE` | Point it at the broker's CA; for the conformance EMQX, `../conformance/quic/pki/root.pem`. |
+| `quic` example: `x509: certificate signed by unknown authority` | `MQTT_CA_FILE` | Point it at the broker's CA; for the conformance EMQX, `../conformance/tls/pki/root.pem`. |
 | `TestREADMESnippets` fails | the documentation snippet it names | Change the Markdown and the matching file in `readme/` together. |
 | `failover` never moves | which broker `UP` names; whether you stopped that one | Stop the broker it reports; with one broker up it stays there. |
 | `durable` or `bridge` repeats old messages at start | `MQTT_DATA_DIR`, and the brokers' sessions for the example's ClientID | They resume earlier runs on purpose; delete `MQTT_DATA_DIR` or let the sessions expire to start over. |

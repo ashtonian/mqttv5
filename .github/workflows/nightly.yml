@@ -5,7 +5,8 @@ name: nightly
 #   - the model-based fault-injection tests with a million seeds that
 #     change every night (a failure prints its seed; reproduce with
 #     MQTTV5_SEED_BASE=<seed> MQTTV5_SEEDS=1);
-#   - the conformance suite against mosquitto, EMQX and HiveMQ CE,
+#   - the conformance suite against mosquitto, EMQX (over every
+#     transport) and HiveMQ CE,
 #     with the strict-limit tests against a HiveMQ that announces tight
 #     CONNACK limits, and a ten-minute connection-cut soak per broker.
 
@@ -80,8 +81,11 @@ jobs:
           - { name: mosquitto, url: "mqtt://127.0.0.1:1883", second: "mqtt://127.0.0.1:1884" }
           - { name: emqx, url: "mqtt://127.0.0.1:1884", second: "mqtt://127.0.0.1:1883" }
           - { name: hivemq, url: "mqtt://127.0.0.1:1886", second: "mqtt://127.0.0.1:1883" }
-          # The suite over transport/quic against EMQX's QUIC listener; the
-          # fault-proxy tests, which relay TCP, skip.
+          # The suite over each of EMQX's other transports; the fault-proxy
+          # tests and the soak, which read plain MQTT, skip.
+          - { name: emqx-mqtts, url: "mqtts://127.0.0.1:8893", second: "mqtt://127.0.0.1:1883" }
+          - { name: emqx-ws, url: "ws://127.0.0.1:8083/mqtt", second: "mqtt://127.0.0.1:1883" }
+          - { name: emqx-wss, url: "wss://127.0.0.1:8084/mqtt", second: "mqtt://127.0.0.1:1883" }
           - { name: emqx-quic, url: "mqtt-quic://127.0.0.1:14567", second: "mqtt://127.0.0.1:1883" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

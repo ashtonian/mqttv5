@@ -1,7 +1,8 @@
 #!/bin/sh
-# Builds the PKI for EMQX's QUIC listener into /pki once: a root and a
-# broker certificate for localhost and 127.0.0.1, which the conformance
-# suite and the quic example trust through root.pem.
+# Builds the PKI for EMQX's TLS listeners (mqtts, wss and QUIC) into
+# /pki once: a root and a broker certificate for localhost and
+# 127.0.0.1, which the conformance suite and the examples trust through
+# root.pem.
 set -eu
 cd /pki
 
