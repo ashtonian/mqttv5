@@ -149,6 +149,71 @@ func TestPacketWriterReportsWriteErrors(t *testing.T) {
 	}
 }
 
+// QoS 1 publishes queued behind a write in progress go out together:
+// the writer takes their markers as one run and collects once.
+func TestQueuedQoS1PublishesShareAWrite(t *testing.T) {
+	b := testbroker.New(t)
+	var conn *writeLog
+	dial := func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+		nc, err := (&net.Dialer{}).DialContext(ctx, "tcp", u.Host)
+		if err != nil {
+			return nil, err
+		}
+		conn = &writeLog{Conn: nc}
+		return conn, nil
+	}
+	cli := tbClient(t, b, WithDialFunc(dial))
+	conn.take()
+
+	gate, entered := make(chan struct{}), make(chan struct{})
+	conn.mu.Lock()
+	conn.gate, conn.entered = gate, entered
+	conn.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", Payload: []byte("first")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("the first publish was not written")
+	}
+	cs := cli.cur.Load()
+	const n = 5
+	errs := make(chan error, n)
+	for range n {
+		go func() { errs <- cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("x")}) }()
+	}
+	for cs.queued.Load() != 1+n {
+		if ctx.Err() != nil {
+			t.Fatalf("%d writes queued, want %d", cs.queued.Load(), 1+n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	writes := conn.take()
+	if len(writes) != 2 {
+		t.Fatalf("writes of %v bytes, want the first publish and then the %d QoS 1 publishes in one", lens(writes), n)
+	}
+	dec := wire.NewDecoder(bytes.NewReader(writes[1]))
+	for i := range n {
+		p, err := dec.ReadPacket()
+		if err != nil {
+			t.Fatalf("packet %d of the second write: %v", i, err)
+		}
+		if pub, ok := p.(*wire.Publish); !ok || pub.QoS != 1 {
+			t.Fatalf("packet %d of the second write is %v, want a QoS 1 PUBLISH", i, p.Type())
+		}
+		p.Release()
+	}
+}
+
 // Over a connection without vectored writes, the CONNECT reaches it in
 // one Write, and packets the writer finds queued go out together.
 func TestPacketsGatheredWithoutVectoredWrites(t *testing.T) {

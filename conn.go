@@ -864,12 +864,13 @@ func writeBytes(b []byte) writeFn {
 // A mark lets the writer send QoS 1/2 PUBLISH packets held by the
 // session engine up to that sequence number. Queuing the mark, rather
 // than writing the packet directly, keeps a QoS 1/2 publish behind any
-// write its caller queued before it.
+// write its caller queued before it. A mark is never answered: its
+// caller waits for the broker's acknowledgement instead.
 type writeReq struct {
 	fn   writeFn
 	pkt  *[]byte // pre-encoded packet; writer releases after Write
 	mark uint64
-	done chan<- error // nil for fire-and-forget
+	done chan<- error // nil for fire-and-forget, and for a mark
 }
 
 // writeBatchHardCap caps any user-supplied WithWriteBatch(n) to avoid
@@ -969,7 +970,8 @@ func (b *writeBatch) flush(cs *connState) error {
 // Batching: pkt-mode reqs coalesce into one write when WithWriteBatch
 // is set; engine packets (QoS 1/2 PUBLISH, PUBREL and the PUBACK /
 // PUBREC / PUBCOMP owed to the broker) always go out as one batch per
-// collection. Channel FIFO order is preserved across all request kinds.
+// collection, and a run of queued marks collects once. Channel FIFO
+// order is preserved across all request kinds.
 func (c *Client) writeLoop(cs *connState) {
 	defer cs.wg.Done()
 	defer close(cs.writerDone)
@@ -1007,48 +1009,105 @@ func (c *Client) writeLoop(cs *connState) {
 	}
 }
 
-// processWrite handles one writeReq received from the queue; the caller
-// holds cs.wmu. For pkt-mode reqs it drains any further pkt-mode reqs
-// into the batch (bounded by writeBatchMax) and flushes them in one write.
-// For fn-mode reqs it flushes any pending batch first, then invokes
-// req.fn directly. Every request taken from the queue is uncounted once
-// it is written or failed.
+// processWrite handles one writeReq received from the queue, and the
+// requests queued behind it that go out with it; the caller holds
+// cs.wmu. A run of pkt-mode requests goes out in one write, up to the
+// batch's capacity. A run of marks releases the session engine's
+// publishes up to the highest of them, which go out together rather than
+// one write per mark. The request that ends a run is handled next, so
+// queue order holds. Every request taken from the queue is uncounted
+// once it is written or failed.
 func (c *Client) processWrite(cs *connState, batch *writeBatch, req writeReq) error {
 	for {
-		if req.mark != 0 || req.fn != nil {
-			if err := batch.flush(cs); err != nil {
-				c.failRequest(cs, req, err)
-				return err
-			}
+		var (
+			next writeReq
+			more bool
+			err  error
+		)
+		switch {
+		case req.pkt != nil:
+			next, more, err = writePackets(cs, batch, req)
+		case req.mark != 0:
+			next, more, err = writeMarks(cs, req)
+		default:
 			return c.writeOne(cs, req)
 		}
-		batch.add(req)
-		if batch.n == batch.cap {
-			return batch.flush(cs)
-		}
-		select {
-		case more, ok := <-cs.writeQueue:
-			if !ok {
-				return batch.flush(cs)
+		if err != nil {
+			if more {
+				c.failRequest(cs, next, err)
 			}
-			req = more
-		default:
-			return batch.flush(cs)
+			return err
 		}
+		if !more {
+			return nil
+		}
+		req = next
 	}
 }
 
-// writeOne writes a mark (the engine's packets up to it) or a fn-mode
-// request and answers it.
-func (c *Client) writeOne(cs *connState, req writeReq) error {
-	var err error
-	if req.mark != 0 {
-		_, err = cs.flushEngine(context.Background(), req.mark)
-	} else {
-		_, err = cs.out.WritePacket(req.fn)
-		if err == nil {
-			cs.lastWriteUnixNano.Store(cs.clk.Now().UnixNano())
+// writePackets writes req and the pkt-mode requests queued behind it, up
+// to the batch's capacity, in one write. more reports next: a request
+// of another kind, taken from the queue, that ended the run.
+func writePackets(cs *connState, batch *writeBatch, req writeReq) (next writeReq, more bool, err error) {
+	batch.add(req)
+	for batch.n < batch.cap {
+		r, ok := cs.dequeue()
+		if !ok {
+			break
 		}
+		if r.pkt == nil {
+			next, more = r, true
+			break
+		}
+		batch.add(r)
+	}
+	return next, more, batch.flush(cs)
+}
+
+// maxMarkRun bounds the marks writeMarks takes before it writes: one
+// Collect's worth, as each mark usually releases one publish.
+const maxMarkRun = 64
+
+// writeMarks writes the session engine's publishes up to req's mark and
+// the marks queued right behind it. Each mark releases its caller's
+// publish once the writes queued ahead of it are written; releasing up
+// to the highest mark of a run keeps that, as only marks lie between
+// them. more reports next: a request of another kind, taken from the
+// queue, that ended the run.
+func writeMarks(cs *connState, req writeReq) (next writeReq, more bool, err error) {
+	upTo, n := req.mark, int64(1)
+	for n < maxMarkRun {
+		r, ok := cs.dequeue()
+		if !ok {
+			break
+		}
+		if r.mark == 0 {
+			next, more = r, true
+			break
+		}
+		upTo = max(upTo, r.mark)
+		n++
+	}
+	_, err = cs.flushEngine(context.Background(), upTo)
+	cs.queued.Add(-n)
+	return next, more, err
+}
+
+// dequeue takes the next request from the queue without waiting.
+func (cs *connState) dequeue() (writeReq, bool) {
+	select {
+	case req, ok := <-cs.writeQueue:
+		return req, ok
+	default:
+		return writeReq{}, false
+	}
+}
+
+// writeOne writes a fn-mode request and answers it.
+func (c *Client) writeOne(cs *connState, req writeReq) error {
+	_, err := cs.out.WritePacket(req.fn)
+	if err == nil {
+		cs.lastWriteUnixNano.Store(cs.clk.Now().UnixNano())
 	}
 	cs.queued.Add(-1)
 	if req.done != nil {

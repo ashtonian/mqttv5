@@ -31,8 +31,9 @@ retransmission. If the caller's ctx ends mid-write, a deadline stops
 the write and the writer goroutine sends the rest before anything else.
 Otherwise — TLS, WebSocket and QUIC connections, a busy writer, and
 fire-and-forget QoS 0 — one writer goroutine per connection drains an
-MPSC channel of encoded packets to the socket, coalescing queued
-packets into one write when `WithWriteBatch` is set; a write lock
+MPSC channel of encoded packets to the socket. The QoS 1/2 publishes
+queued behind a write go out together in one write, and queued QoS 0
+packets do when `WithWriteBatch` is set; a write lock
 keeps the two paths from interleaving, and a publish never overtakes a
 packet its caller queued earlier. A TCP or Unix socket takes a batch in
 one `writev`. TLS, WebSocket and QUIC have no vectored write, and each
