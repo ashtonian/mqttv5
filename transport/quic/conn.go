@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -206,8 +207,11 @@ func (c *Conn) ObserveDisconnect(reason byte) {
 // reset first. Read and Write return net.ErrClosed at once. A write in
 // progress, which may be stalled behind flow control, is not waited for:
 // the stream is reset instead, since a FIN would cut its packet short.
+// Closing a closed connection reports net.ErrClosed.
 func (c *Conn) Close() error {
+	err := net.ErrClosed
 	c.closeOnce.Do(func() {
+		err = nil
 		c.markClosed()
 		s := c.currentStream()
 		c.dialer.closing.add()
@@ -224,7 +228,7 @@ func (c *Conn) Close() error {
 		c.wmu.Unlock()
 		go c.drain(s)
 	})
-	return nil
+	return err
 }
 
 // markClosed fails Read and Write from now on and ends the caller's Read
@@ -262,6 +266,9 @@ func (c *Conn) drain(s *quicgo.Stream) {
 	case <-drained:
 		_ = c.qc.CloseWithError(0, "")
 	case <-timer.C():
+		c.dialer.logger.Warn("mqttv5/transport/quic: the broker did not end the stream within the close timeout; closing the connection",
+			slog.String("broker", c.qc.RemoteAddr().String()),
+			slog.Duration("close_timeout", c.dialer.closeTimeout()))
 		s.CancelWrite(0)
 		_ = c.qc.CloseWithError(0, "graceful close timed out")
 		// Closing the connection ends the read.
@@ -274,9 +281,12 @@ func (c *Conn) drain(s *quicgo.Stream) {
 // with 0x300 + reason, after the DISCONNECT the client already wrote,
 // which a broker supporting RESET_STREAM_AT still receives. The QUIC
 // connection is closed with the same code once the broker has closed it,
-// or at DialOpts.CloseTimeout.
+// or at DialOpts.CloseTimeout. Aborting a closed connection reports
+// net.ErrClosed.
 func (c *Conn) Abort(reason byte) error {
+	err := net.ErrClosed
 	c.closeOnce.Do(func() {
+		err = nil
 		c.markClosed()
 		code := codeBase + uint64(reason)
 		s := c.currentStream()
@@ -289,7 +299,7 @@ func (c *Conn) Abort(reason byte) error {
 		c.dialer.closing.add()
 		go c.linger(quicgo.ApplicationErrorCode(code))
 	})
-	return nil
+	return err
 }
 
 // linger closes the QUIC connection with code unless the broker closes

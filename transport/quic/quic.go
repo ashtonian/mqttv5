@@ -431,6 +431,8 @@ func (d *Dialer) dialQUICPhase(ctx context.Context, t target, tlsBase *tls.Confi
 	}
 	start := d.clock.Now()
 	budget := maxQUICPhase
+	// ctx's deadline is wall-clock time; the budget it leaves is spent on
+	// d.clock, which paces the retries.
 	if deadline, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(deadline)/2)
 	}

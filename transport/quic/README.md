@@ -214,12 +214,13 @@ conformance suite runs against EMQX's QUIC listener
 
 ## Operations
 
-This package logs two events through `DialOpts.Logger`:
+This package logs three events through `DialOpts.Logger`:
 
 | Level | Message | Attributes | Meaning |
 |---|---|---|---|
 | Warn | `QUIC unavailable, connected over TLS` | `broker`, `fallback`, `error` | A dial fell back; `error` is the last QUIC failure. |
 | Info | `waiting before reconnecting after a session takeover` | `broker`, `wait` | The broker reported Session Taken Over; the next dial waits. |
+| Warn | `the broker did not end the stream within the close timeout; closing the connection` | `broker` (address), `close_timeout` | After `Close`, the broker never sent its FIN; the stream was reset and the connection closed. `Dialer.Wait` took the whole timeout. |
 
 Connection-level health and counters come from the client
 (`Client.Stats()`, the lifecycle callbacks).
@@ -236,6 +237,7 @@ Connection-level health and counters come from the client
 | quic-go prints `failed to sufficiently increase receive buffer size` | `net.core.rmem_max` / `wmem_max` (Linux) | quic-go asks for 7 MiB of socket buffer. MQTT rates rarely need it; raise the limits, or set `QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true`. |
 | Handshakes stall with a custom `PacketConn` | whether anything else reads that socket | Only the dials on it may read it while their connections are open. |
 | The broker logs idle-timeout closes at client shutdown | whether the process exits before the graceful close | Call `Dialer.Wait` after `Client.Disconnect` (see above). |
+| Warn `did not end the stream within the close timeout` | the broker's handling of a stream FIN after DISCONNECT | The broker keeps its side of the stream open; shutdown waits `CloseTimeout` for it. Lower `CloseTimeout` if that delay matters, or report it to the broker's maintainers. |
 
 ## Security
 

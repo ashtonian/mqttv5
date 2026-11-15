@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,6 +114,8 @@ func TestCloseIsGraceful(t *testing.T) {
 func TestCloseTimesOut(t *testing.T) {
 	srv := startServer(t)
 	opts, fake := withClock(srv.opts())
+	var logs lockedBuffer
+	opts.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 	conn := dial(t, srv.url, opts)
 	write(t, conn, connectPacket(1))
 	sc := srv.next(t)
@@ -118,6 +123,30 @@ func TestCloseTimesOut(t *testing.T) {
 
 	advanceWhenPending(t, fake, DefaultCloseTimeout)
 	wantAppClose(t, closeCause(t, sc.qc), 0)
+	if !strings.Contains(logs.String(), "did not end the stream within the close timeout") {
+		t.Fatalf("no warning logged for the timed-out close; logs:\n%s", logs.String())
+	}
+	if err := conn.Close(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("second Close = %v, want net.ErrClosed", err)
+	}
+}
+
+// lockedBuffer is a log destination safe for concurrent writes.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // A write stalled behind flow control does not hold Close up, and the
