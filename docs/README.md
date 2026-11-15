@@ -10,7 +10,7 @@ root unless a guide says otherwise.
 
 - [Quick start](../README.md#quick-start): connect, subscribe, publish and acknowledge.
 - [Why mqttv5](comparison.md): differences from Paho and the supported MQTT v5 features.
-- [Modules and dependencies](modules.md): core, codecs, file stores and WebSocket transport.
+- [Modules and dependencies](modules.md): core, codecs, file stores, and the WebSocket and QUIC transports.
 - [Runnable examples](../examples/README.md): programs and broker configuration.
 
 ## Using a client
@@ -22,6 +22,7 @@ root unless a guide says otherwise.
 - [Durable publishing](durable-publishing.md): outbound queues and crash recovery.
 - [Authentication](authentication.md): fixed and rotating credentials, enhanced authentication and re-authentication.
 - [WebSocket](websocket.md): ws:// and wss:// transport.
+- [QUIC](quic.md): mqtt-quic:// transport, fallback to TLS, 0-RTT.
 - [Disconnecting](disconnecting.md): graceful shutdown and DISCONNECT properties.
 
 ## Multiple connections and brokers

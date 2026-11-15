@@ -14,7 +14,7 @@
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. Several URLs fail over in the `WithFailoverOrder` order ([Failover](multi-broker.md#failover-withbrokers)). |
+| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`, `mqtt-quic` via `WithDialFunc(quic.DialFunc(opts))`. Several URLs fail over in the `WithFailoverOrder` order ([Failover](multi-broker.md#failover-withbrokers)). |
 | `WithFailoverOrder(o)` | `FailoverRotate` | How several brokers are tried. `FailoverRotate`: each client starts at a random entry and each reconnect attempt moves on one. `FailoverPriority`: the list is a preference order; `Connect` and each reconnect start at the first entry, and one reconnect attempt is a pass over the list with no backoff between entries ([Primary and standby](multi-broker.md#primary-and-standby-failoverpriority)). |
 | `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial; configure TLS inside `fn`. `New` rejects it beside `WithDialer`, `WithTLSConfig` or `WithTLSConfigFunc`. Nil rejected. |
 | `WithTLSConfig(*tls.Config)` | system roots, server name from the URL | TLS for `mqtts://`/`tls://`/`ssl://`, the same config for every dial. Reconnects resume the TLS session unless the config presents a client certificate or sets its own `ClientSessionCache` ([Certificate management](security.md#certificate-management)). The config is never modified. `New` rejects it beside `WithTLSConfigFunc`. |

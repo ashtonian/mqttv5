@@ -12,8 +12,8 @@ the API; see [stability](docs/reference.md#stability).
 
 ## Why mqttv5
 
-- **Standard-library-only core.** Persistence, WebSocket transport and
-  payload codecs are optional submodules.
+- **Standard-library-only core.** Persistence, the WebSocket and QUIC
+  transports and payload codecs are optional submodules.
 - **Built-in supervisor.** Reconnects, session resumption, in-flight
   replay and re-subscription are part of every `Client`.
 - **Delivery you control.** Channels, bounded queues or callbacks,
@@ -131,7 +131,7 @@ allocations, throughput, latency, methodology and reproduction commands.
 |---|---|
 | Publish and receive messages | [Publishing](docs/publishing.md), [subscriptions](docs/subscribing.md), [typed payloads](docs/typed-payloads.md) |
 | Keep messages through outages | [Durable publishing](docs/durable-publishing.md), [reliability](docs/reliability.md) |
-| Add authentication or another transport | [Authentication](docs/authentication.md), [WebSocket](docs/websocket.md) |
+| Add authentication or another transport | [Authentication](docs/authentication.md), [WebSocket](docs/websocket.md), [QUIC](docs/quic.md) |
 | Connect multiple brokers | [Multi-broker guide](docs/multi-broker.md), [recipes](docs/recipes.md) |
 | Find options, errors and defaults | [Configuration reference](docs/reference.md), [Go API](https://pkg.go.dev/github.com/ashtonian/mqttv5) |
 | Operate a client | [Metrics and troubleshooting](docs/operations.md), [security](docs/security.md) |
