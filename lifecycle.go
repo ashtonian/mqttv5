@@ -242,7 +242,7 @@ func (c *Client) stop(ctx context.Context, life *lifecycle, opts wire.Disconnect
 func (c *Client) teardown(ctx context.Context, life *lifecycle, opts wire.DisconnectOpts, cause error) error {
 	life.disconnOnce.Do(func() {
 		c.sendDisconnectWith(ctx, opts)
-		life.endWith(cause)
+		c.endSpan(life, cause)
 		if cs := c.cur.Load(); cs != nil {
 			cs.signalDown()
 		}
@@ -542,7 +542,6 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		life:          life,
 		dying:         make(chan struct{}),
 		resumed:       make(chan struct{}),
-		writerDone:    make(chan struct{}),
 		done:          make(chan struct{}),
 		aliasMap:      make(map[uint16]string),
 		outAliasMap:   make(map[string]uint16),
@@ -789,12 +788,24 @@ func (c *Client) supervisor(life *lifecycle, cleanStart bool, down *outage) {
 	}
 }
 
+// endSpan ends span life, recording cause as the reason when it is the
+// first to, and reports whether it was. The session engine then ends
+// the waits of the publishes still waiting for an acknowledgement, which
+// return what the span's end gives calls it cuts short.
+func (c *Client) endSpan(life *lifecycle, cause error) bool {
+	if !life.endWith(cause) {
+		return false
+	}
+	c.engine.Interrupt()
+	return true
+}
+
 // quit ends span life from its supervisor, which has no connection, as
 // Disconnect would: calls cut short return cause, or ErrClosed when it
 // is nil. It reports whether it ended the span; when a teardown ended it
 // first, that teardown finishes it once the supervisor has returned.
 func (c *Client) quit(life *lifecycle, cause error) bool {
-	if !life.endWith(cause) {
+	if !c.endSpan(life, cause) {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)

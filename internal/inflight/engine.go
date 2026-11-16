@@ -58,6 +58,9 @@ var (
 	// ErrMessageExpired completes outbound messages whose Message Expiry
 	// Interval ran out before they could be republished.
 	ErrMessageExpired = errors.New("mqttv5: message expired before it could be sent again")
+	// ErrInterrupted is the Err of a flow whose wait [Engine.Interrupt]
+	// ended before the flow finished.
+	ErrInterrupted = errors.New("mqttv5: stopped waiting for the broker's acknowledgement")
 	// ErrReceiveMaximumExceeded is returned by Receive when the broker
 	// sends more unacknowledged QoS > 0 PUBLISHes than the client allows.
 	ErrReceiveMaximumExceeded = errors.New("mqttv5: broker exceeded the client's Receive Maximum")
@@ -313,7 +316,7 @@ func (e *Engine) Restore(ctx context.Context) error {
 					slog.Int("packet_id", int(r.Key.PacketID)), slog.Int("outcome", int(r.Outcome)))
 				continue
 			}
-			close(o.done)
+			o.wake(o.err)
 			e.orphans[string(o.ref)] = o
 			e.nextSeq = max(e.nextSeq, r.Seq+1)
 		case r.Key.Dir == session.Outbound:
@@ -643,6 +646,19 @@ func (e *Engine) Discard(ctx context.Context) error {
 		_ = settle(ctx, ErrSessionLost)
 	}
 	return nil
+}
+
+// Interrupt ends the wait on every unfinished flow: Done closes and Err
+// reports ErrInterrupted. The flows themselves go on, and a later
+// connection sends them as before. It lets a caller waiting on Done also
+// stop when something ends that is not the flow, without selecting on a
+// channel every waiter shares.
+func (e *Engine) Interrupt() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, o := range e.out {
+		o.wake(ErrInterrupted)
+	}
 }
 
 // Disconnected unbinds the engine from l's connection. State is kept

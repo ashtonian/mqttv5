@@ -282,21 +282,29 @@ func assignOutboundAlias(cs *connState, opts *wire.PublishOpts) (topic string, r
 // publishQoSReliable starts a QoS 1/2 exchange and waits for the
 // broker's answer. If ctx ends before the PUBLISH was ever handed to a
 // connection the message is withdrawn; after that it may still be
-// delivered.
+// delivered. When the span ends first, the session engine ends the wait
+// (see endSpan): a select on the span's shutdown would have every
+// waiting publisher lock that one channel, twice per publish.
 func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) error {
+	life := c.life.Load()
 	flow, err := c.startReliable(ctx, opts, nil, nil)
 	if err != nil {
 		return err
 	}
-	life := c.life.Load()
+	// A span that ended before the flow was registered ended the waits
+	// before this one began.
+	if err = life.endedErr(); err != nil {
+		return err
+	}
 	select {
 	case <-flow.Done():
-		return flow.Err()
+		if err = flow.Err(); errors.Is(err, inflight.ErrInterrupted) {
+			return life.closedErr()
+		}
+		return err
 	case <-ctx.Done():
 		c.engine.Withdraw(flow)
 		return ctx.Err()
-	case <-life.shutdown:
-		return life.closedErr()
 	}
 }
 

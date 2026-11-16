@@ -608,6 +608,41 @@ func TestWithdrawOnlyUnsentFlows(t *testing.T) {
 	}
 }
 
+// Interrupt ends the waits on unfinished flows and leaves the flows to
+// go on: a later connection resends them and their acknowledgement
+// finishes them.
+func TestInterruptEndsWaitsNotFlows(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.connect(false, 0)
+	acked := h.publish(1, "acked")
+	pending := h.publish(1, "pending")
+	h.collect()
+	h.e.HandlePuback(acked.PacketID(), 0, nil)
+
+	h.e.Interrupt()
+	if err := done(t, pending); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("interrupted flow err = %v, want ErrInterrupted", err)
+	}
+	if err := done(t, acked); err != nil {
+		t.Fatalf("finished flow err = %v after Interrupt, want its outcome", err)
+	}
+	later := h.publish(1, "later")
+	notDone(t, later)
+
+	h.disconnect()
+	h.connect(true, 0)
+	want(t, h.collect(),
+		fmt.Sprintf("PUBLISH#%d+dup", pending.PacketID()),
+		fmt.Sprintf("PUBLISH#%d", later.PacketID()))
+	h.e.HandlePuback(pending.PacketID(), 0, nil)
+	if err := done(t, pending); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("err = %v once acknowledged, want the ErrInterrupted its wait ended with", err)
+	}
+	if h.e.OutboundLen() != 1 || h.e.ids.owner[pending.PacketID()] != OwnerNone {
+		t.Fatal("the acknowledged flow, or its identifier, was left behind")
+	}
+}
+
 func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 	h := newHarness(t, Config{})
 	for i := 0; i < 65535; i++ {

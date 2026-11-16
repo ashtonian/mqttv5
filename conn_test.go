@@ -401,7 +401,7 @@ func TestTeardownAnswersEveryQueuedRequest(t *testing.T) {
 	stop()
 	wg.Wait()
 	for _, cs := range dead[:len(dead)-1] {
-		<-cs.writerDone
+		<-cs.done
 		if n := cs.queued.Load(); n != 0 {
 			t.Fatalf("a closed connection still counts %d queued writes", n)
 		}
@@ -495,7 +495,7 @@ func TestClosedWriteQueueAdmitsNothing(t *testing.T) {
 		t.Fatal("not connected")
 	}
 	drop()
-	<-cs.writerDone
+	<-cs.done
 	done := make(chan error, 1)
 	if err := cs.queue(context.Background(), writeReq{fn: writeBytes(nil), done: done}, true); !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("queue after the writer exited: %v", err)

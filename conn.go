@@ -94,14 +94,11 @@ type connState struct {
 	// and UNSUBSCRIBEs it re-issues; every PUBLISH made on it waits for
 	// that, so a broker that kept no session has the subscriptions
 	// before it gets any message.
-	resumed chan struct{}
-	// writerDone is closed once the writer goroutine has exited and
-	// answered every request it took.
-	writerDone chan struct{}
-	dyingOnce  sync.Once
-	done       chan struct{}
-	doneOnce   sync.Once
-	wg         sync.WaitGroup
+	resumed   chan struct{}
+	dyingOnce sync.Once
+	done      chan struct{}
+	doneOnce  sync.Once
+	wg        sync.WaitGroup
 
 	// reads counts packets read on this connection; the keep-alive
 	// treats any packet read after a PINGREQ as the broker's answer.
@@ -242,28 +239,39 @@ func (cs *connState) queue(ctx context.Context, req writeReq, block bool) error 
 }
 
 func (cs *connState) send(ctx context.Context, req writeReq, block bool) error {
-	if !block {
+	// The span's end is left out: it ends the connection too, and a
+	// channel every sender shares would be one more lock for each to take.
+	if block {
 		select {
 		case cs.writeQueue <- req:
 			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-cs.dying:
-			return ErrNotConnected
-		case <-cs.life.shutdown:
-			return cs.life.closedErr()
-		default:
-			return ErrWriteQueueFull
+			return cs.notConnected()
 		}
 	}
 	select {
 	case cs.writeQueue <- req:
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-cs.dying:
-		return ErrNotConnected
-	case <-cs.life.shutdown:
-		return cs.life.closedErr()
+	default:
 	}
+	select {
+	case <-cs.dying:
+		return cs.notConnected()
+	default:
+		return ErrWriteQueueFull
+	}
+}
+
+// notConnected is the error for a request the connection did not take:
+// what the span's end gives the calls it cuts short, once it has ended,
+// and otherwise ErrNotConnected.
+func (cs *connState) notConnected() error {
+	if err := cs.life.endedErr(); err != nil {
+		return err
+	}
+	return ErrNotConnected
 }
 
 // closeQueue stops admitting requests; queue fails with ErrNotConnected
@@ -974,7 +982,6 @@ func (b *writeBatch) flush(cs *connState) error {
 // order is preserved across all request kinds.
 func (c *Client) writeLoop(cs *connState) {
 	defer cs.wg.Done()
-	defer close(cs.writerDone)
 	defer drainWriteQueue(cs)
 	batch := newWriteBatch(c.cfg.WriteBatchMax)
 	for {
@@ -1167,27 +1174,23 @@ func (c *Client) enqueueFireAndForget(cs *connState, fn writeFn) {
 }
 
 // awaitWrite waits for the writer's answer to a queued request: nil once
-// it was written, ErrNotConnected when it never will be, or ctx's error,
-// in which case it may still be written.
+// it was written, otherwise why it was not (what the span's end gives
+// calls it cuts short, when it has ended), or ctx's error, in which case
+// it may still be written. The writer answers every request it admits,
+// also as it exits, which it does once the connection dies; so the wait
+// needs no channel for the connection's or the span's end, which every
+// waiter would share.
 func awaitWrite(ctx context.Context, cs *connState, done <-chan error) error {
 	select {
 	case err := <-done:
+		if err != nil {
+			if ended := cs.life.endedErr(); ended != nil {
+				return ended
+			}
+		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-cs.dying:
-		// The writer answers every request it takes, also when it
-		// drains the queue on exit; once it is gone, no answer means
-		// the packet was never written.
-		<-cs.writerDone
-		select {
-		case err := <-done:
-			return err
-		default:
-			return ErrNotConnected
-		}
-	case <-cs.life.shutdown:
-		return cs.life.closedErr()
 	}
 }
 

@@ -1351,6 +1351,40 @@ func heldPubackBroker(t *testing.T, got chan<- uint16, release <-chan struct{}) 
 	return b
 }
 
+// Disconnect ends a QoS 1 publish waiting for its PUBACK with ErrClosed;
+// the message stays in the session, to be resent on the next connection.
+func TestDisconnectEndsAWaitForAnAck(t *testing.T) {
+	got := make(chan uint16, 1)
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		if c.AcceptConnect(wire.ConnackOpts{}) == nil {
+			return
+		}
+		if p, ok := c.Await(wire.PUBLISH, 0); ok {
+			got <- p.PacketID
+		}
+		c.Hold(0)
+	})
+	cli := tbClient(t, b)
+	pubErr := make(chan error, 1)
+	go func() { pubErr <- cli.Publish(context.Background(), PublishOptions{Topic: "t", QoS: 1}) }()
+	<-got
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-pubErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("publish waiting for its PUBACK = %v, want ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Disconnect left the publish waiting")
+	}
+	if n := cli.engine.OutboundLen(); n != 1 {
+		t.Fatalf("%d messages in the session after Disconnect, want the unacknowledged one", n)
+	}
+}
+
 // Disconnect waits for publishes in flight on pool members: a member has
 // no session to finish them later.
 func TestDisconnectDrainsPooledPublishes(t *testing.T) {

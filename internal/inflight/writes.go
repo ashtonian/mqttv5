@@ -214,7 +214,7 @@ func (e *Engine) failLocked(err error) (dropped []func(context.Context, error) e
 	for _, o := range e.drainFlowsLocked() {
 		o.finished = true
 		o.err = err
-		close(o.done)
+		o.wake(err)
 		if o.settle != nil {
 			dropped = append(dropped, o.settle)
 		}

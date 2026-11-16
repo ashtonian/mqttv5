@@ -40,8 +40,12 @@ type Out struct {
 	list       *flowList
 	prev, next *Out
 
-	done chan struct{}
-	err  error
+	err error // the outcome, once finished
+	// done is closed, once, when the flow finishes or when Interrupt ends
+	// the wait on it first; waitErr is what Err reports from then on.
+	done    chan struct{}
+	woken   bool
+	waitErr error
 }
 
 // PacketID returns the flow's packet identifier.
@@ -50,12 +54,25 @@ func (o *Out) PacketID() uint16 { return o.id }
 // Seq returns the flow's send sequence number, for Link.SendOrdered.
 func (o *Out) Seq() uint64 { return o.pubSeq }
 
-// Done is closed when the flow completes.
+// Done is closed when the flow completes, or when [Engine.Interrupt]
+// ends the wait on it before that.
 func (o *Out) Done() <-chan struct{} { return o.done }
 
-// Err is the flow's outcome once Done is closed: nil when the broker
-// accepted the message, otherwise why it did not.
-func (o *Out) Err() error { return o.err }
+// Err is why Done closed: the flow's outcome, nil when the broker
+// accepted the message and otherwise why it did not, or
+// [ErrInterrupted].
+func (o *Out) Err() error { return o.waitErr }
+
+// wake ends the wait on Done with err, unless it has ended already. The
+// caller holds the engine's mutex.
+func (o *Out) wake(err error) {
+	if o.woken {
+		return
+	}
+	o.woken = true
+	o.waitErr = err
+	close(o.done)
+}
 
 // Message is an outbound QoS 1/2 PUBLISH to register.
 type Message struct {
@@ -315,7 +332,7 @@ func (e *Engine) finishLocked(o *Out, err error) {
 	delete(e.out, o.id)
 	o.finished = true
 	o.err = err
-	close(o.done)
+	o.wake(err)
 	if len(o.ref) > 0 {
 		delete(e.refs, string(o.ref))
 	}
