@@ -46,6 +46,7 @@ func Run(t *testing.T, f Factory) {
 	t.Run("DropNewest", func(t *testing.T) { testDropNewest(t, open(t)) })
 	t.Run("DropOldest", func(t *testing.T) { testDropOldest(t, open(t)) })
 	t.Run("ConcurrentBound", func(t *testing.T) { testConcurrentBound(t, open) })
+	t.Run("ConcurrentPeek", func(t *testing.T) { testConcurrentPeek(t, open(t)) })
 	t.Run("Closed", func(t *testing.T) { testClosed(t, f.Open(t)) })
 	if f.Reopen != nil {
 		t.Run("Reopen", func(t *testing.T) {
@@ -298,6 +299,62 @@ func testConcurrentBound(t *testing.T, open func(*testing.T) mqttv5.PublisherQue
 				t.Fatalf("Len %d, stored %d, evicted %d, bound %d", n, stored, evicted, max)
 			}
 		})
+	}
+}
+
+// Entries become visible in Seq order while producers race: a reader
+// that, like the QueuePublisher's drain, peeks after the last Seq it
+// has seen misses none of them.
+func testConcurrentPeek(t *testing.T, q mqttv5.PublisherQueue) {
+	const producers, each = 8, 50
+	var wg sync.WaitGroup
+	for g := range producers {
+		wg.Go(func() {
+			for i := range each {
+				if _, _, err := q.Enqueue(ctx, entry(fmt.Sprint(g, "-", i)), mqttv5.QueueLimit{}); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	stored := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(stored)
+	}()
+	var (
+		after uint64
+		seen  []uint64
+	)
+	for done := false; !done; {
+		select {
+		case <-stored:
+			// One more pass after the last Enqueue has returned sees what
+			// is left.
+			done = true
+		default:
+		}
+		for {
+			es := peek(t, q, after, 16)
+			if len(es) == 0 {
+				break
+			}
+			for _, e := range es {
+				seen = append(seen, e.Seq)
+			}
+			after = es[len(es)-1].Seq
+		}
+	}
+	all := peek(t, q, 0, producers*each+1)
+	if len(all) != producers*each {
+		t.Fatalf("queue holds %d entries, want %d", len(all), producers*each)
+	}
+	want := make([]uint64, len(all))
+	for i, e := range all {
+		want[i] = e.Seq
+	}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("a reader peeking after the last Seq it saw got %d entries, want all %d: entries appeared behind it", len(seen), len(want))
 	}
 }
 

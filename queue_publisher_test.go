@@ -338,6 +338,56 @@ func TestQueuePublisherWindowBeyondFreeIdentifiers(t *testing.T) {
 	}
 }
 
+// heldEnqueue holds the Enqueue of the entry whose payload is hold,
+// before it stores it, until release is closed.
+type heldEnqueue struct {
+	*MemoryPublisherQueue
+	hold          string
+	held, release chan struct{}
+}
+
+func (q *heldEnqueue) Enqueue(ctx context.Context, e QueueEntry, limit QueueLimit) (uint64, []QueueEntry, error) {
+	if string(e.Publish.Payload) == q.hold {
+		close(q.held)
+		<-q.release
+	}
+	return q.MemoryPublisherQueue.Enqueue(ctx, e, limit)
+}
+
+// A queue that cannot evict does not make the drain wait for a Publish
+// whose Enqueue is still writing: the messages already stored go out
+// meanwhile.
+func TestQueuePublisherDrainsDuringEnqueue(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	cli := tbClient(t, b)
+	q := &heldEnqueue{MemoryPublisherQueue: NewMemoryPublisherQueue(), hold: "held", held: make(chan struct{}), release: make(chan struct{})}
+	p := newQueuePublisher(t, cli, q)
+	release := sync.OnceFunc(func() { close(q.release) })
+	t.Cleanup(release)
+	published := make(chan error, 1)
+	go func() {
+		published <- p.Publish(context.Background(), PublishOptions{Topic: "q/t", QoS: 1, Payload: []byte("held")})
+	}()
+	<-q.held
+	enqueueAll(t, p, 1, "next")
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"next"}) {
+		t.Fatalf("broker received %q while an Enqueue was held, want [next]", got)
+	}
+	release()
+	if err := <-published; err != nil {
+		t.Fatalf("Publish(held): %v", err)
+	}
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"next", "held"}) {
+		t.Fatalf("broker received %q, want [next held]", got)
+	}
+}
+
 // ackLog holds the first Ack until release is closed and records the
 // seqs of every Ack.
 type ackLog struct {
@@ -380,24 +430,33 @@ func TestQueuePublisherRemovesFinishedMessagesTogether(t *testing.T) {
 	for i := range n {
 		payloads = append(payloads, strconv.Itoa(i))
 	}
-	enqueueAll(t, p, 1, payloads...)
+	// The first message's Ack is held while the others are published, so
+	// their outcomes arrive while the queue is busy.
+	enqueueAll(t, p, 1, payloads[0])
 	<-q.held
-	first := len(q.get()[0])
+	enqueueAll(t, p, 1, payloads[1:]...)
 	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
 		p.mu.Lock()
 		waiting := len(p.outcomes)
 		p.mu.Unlock()
-		if first+waiting == n {
+		if waiting == n-1 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d outcomes waiting behind an Ack of %d, want %d", waiting, first, n-first)
+			t.Fatalf("%d outcomes waiting behind the first Ack, want %d", waiting, n-1)
 		}
 	}
 	close(q.release)
 	waitQueueLen(t, q, 0)
-	if acks := q.get(); len(acks) != 2 || len(acks[1]) != n-first {
-		t.Fatalf("Acks %v; want the %d outcomes that waited in one", acks, n-first)
+	acks := q.get()
+	if len(acks) != 2 || !slices.Equal(acks[0], []uint64{1}) || len(acks[1]) != n-1 {
+		t.Fatalf("Acks %v; want [1] and then the %d outcomes that waited, in one", acks, n-1)
+	}
+	slices.Sort(acks[1])
+	for i, seq := range acks[1] {
+		if seq != uint64(i+2) {
+			t.Fatalf("second Ack %v; want seqs 2 to %d", acks[1], n)
+		}
 	}
 }
 

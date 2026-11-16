@@ -71,6 +71,10 @@ concurrent producers cannot exceed it. At the bound `DropNewest`
 (default) returns `ErrQueueFull`; `DropOldest` evicts the oldest
 messages not yet being published and dead-letters them with
 `ErrQueueFull`. Constructing a `QueuePublisher` never removes anything.
+Only `DropOldest` with a bound can evict a message the drain is about
+to take, so only then does the drain wait for each `Publish` whose
+`Enqueue` is still writing, which with a syncing `queue/file` is a disk
+sync; otherwise the drain sends what is stored while producers write.
 
 QoS 0 is rejected (`ErrQoS0NotQueueable`), as is a message that could
 never be sent (invalid topic, Topic Alias): the error comes from
@@ -84,6 +88,10 @@ continue after a reconnect or restart.
 
 Use `mqttv5.NewMemoryPublisherQueue()` for in-process buffering without
 crash safety. A custom `PublisherQueue` can be checked against the
-contract with `github.com/ashtonian/mqttv5/queue/queuetest`; its `Ack`
+contract with `github.com/ashtonian/mqttv5/queue/queuetest`. Its `Ack`
 takes the sequence numbers of several entries and removes all of them
-or, with an error, none.
+or, with an error, none. Entries must become visible to `Peek` in
+sequence order however many `Enqueue` calls run at once: assign the
+sequence number and store the entry in one atomic step. The drain peeks
+after the last sequence number it took while producers enqueue, and
+would never see an entry that appeared behind it.

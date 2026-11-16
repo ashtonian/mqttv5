@@ -75,8 +75,10 @@ type QueuePublisher struct {
 	clk    clock.Clock
 
 	// claimMu keeps DropOldest from evicting an entry the drain has
-	// claimed: Publish holds it shared around Enqueue, the drain
-	// exclusively while it peeks and advances claimed.
+	// claimed: when the queue can evict (see queueConfig.evicts), Publish
+	// holds it shared around Enqueue, and the drain holds it exclusively
+	// while it peeks and advances claimed. Without eviction Publish leaves
+	// it alone, so the drain never waits for an Enqueue's write.
 	claimMu sync.RWMutex
 	claimed uint64 // highest Seq handed to pending
 
@@ -136,6 +138,9 @@ type queueConfig struct {
 	backoff     Backoff
 	idempotency bool
 }
+
+// evicts reports whether Enqueue may remove entries to make room.
+func (c queueConfig) evicts() bool { return c.maxSize > 0 && c.dropPolicy == DropOldest }
 
 // QueueOption customises a QueuePublisher.
 type QueueOption func(*queueConfig)
@@ -310,9 +315,16 @@ func (p *QueuePublisher) Publish(ctx context.Context, opts PublishOptions) error
 	opts.MessageExpiryInterval = nil
 	e.Publish = opts
 
-	p.claimMu.RLock()
-	_, evicted, err := p.queue.Enqueue(ctx, e, QueueLimit{Max: p.cfg.maxSize, Policy: p.cfg.dropPolicy, Keep: p.claimed})
-	p.claimMu.RUnlock()
+	limit := QueueLimit{Max: p.cfg.maxSize, Policy: p.cfg.dropPolicy}
+	var evicted []QueueEntry
+	if p.cfg.evicts() {
+		p.claimMu.RLock()
+		limit.Keep = p.claimed
+		_, evicted, err = p.queue.Enqueue(ctx, e, limit)
+		p.claimMu.RUnlock()
+	} else {
+		_, evicted, err = p.queue.Enqueue(ctx, e, limit)
+	}
 	for _, ev := range evicted {
 		p.deadLetter(ev, ErrQueueFull)
 	}
@@ -813,7 +825,12 @@ type PublisherQueue interface {
 	// ErrQueueFull or, under DropOldest, removes the oldest entries above
 	// limit.Keep and returns them; the check, the removal and the insert
 	// are one atomic step. It returns ErrQueueFull when there is nothing
-	// it may remove.
+	// it may remove. Entries become visible to Peek in Seq order: once
+	// Peek returns an entry, every stored entry with a lower Seq is
+	// visible as well, however many Enqueue calls run at once. The
+	// QueuePublisher peeks after the last Seq it took while other
+	// goroutines enqueue, and would never see an entry that appeared
+	// behind it.
 	Enqueue(ctx context.Context, e QueueEntry, limit QueueLimit) (seq uint64, evicted []QueueEntry, err error)
 
 	// Peek returns up to n entries with Seq above after, oldest first.
