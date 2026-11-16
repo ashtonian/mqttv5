@@ -203,6 +203,7 @@ func (e *Engine) failLocked(err error) (dropped []func(context.Context, error) e
 	}
 	e.failure = err
 	e.epoch++
+	e.ids.wake()
 	for _, in := range e.in {
 		in.dead = true
 	}

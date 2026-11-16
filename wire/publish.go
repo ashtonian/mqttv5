@@ -437,22 +437,43 @@ func WithMessageExpiry(frame []byte, seconds uint32) []byte {
 	return out
 }
 
+// PublishPacketIDOffset is where the 2-byte Packet Identifier of an
+// encoded QoS 1 or 2 PUBLISH frame starts, for a caller that chooses the
+// identifier after encoding. ok is false for any other frame.
+func PublishPacketIDOffset(frame []byte) (off int, ok bool) {
+	off, qos, ok := afterPublishTopic(frame)
+	if !ok || qos == 0 || len(frame) < off+2 {
+		return 0, false
+	}
+	return off, true
+}
+
+// afterPublishTopic parses an encoded PUBLISH frame's fixed header and
+// Topic Name, and returns the offset just past the topic and the
+// frame's QoS.
+func afterPublishTopic(frame []byte) (off int, qos byte, ok bool) {
+	if len(frame) < 2 || PacketType(frame[0]>>4) != PUBLISH {
+		return 0, 0, false
+	}
+	qos = (frame[0] >> 1) & 0x03
+	_, n, err := DecodeVarint(frame[1:])
+	if err != nil {
+		return 0, 0, false
+	}
+	off = 1 + n
+	if len(frame) < off+2 {
+		return 0, 0, false
+	}
+	return off + 2 + int(binary.BigEndian.Uint16(frame[off:])), qos, true
+}
+
 // messageExpiryOffset locates the 4-byte Message Expiry Interval value
 // inside an encoded PUBLISH frame.
 func messageExpiryOffset(frame []byte) (int, bool) {
-	if len(frame) < 2 || PacketType(frame[0]>>4) != PUBLISH {
+	off, qos, ok := afterPublishTopic(frame)
+	if !ok {
 		return 0, false
 	}
-	qos := (frame[0] >> 1) & 0x03
-	_, n, err := DecodeVarint(frame[1:])
-	if err != nil {
-		return 0, false
-	}
-	off := 1 + n
-	if len(frame) < off+2 {
-		return 0, false
-	}
-	off += 2 + int(binary.BigEndian.Uint16(frame[off:]))
 	if qos > 0 {
 		off += 2
 	}

@@ -99,6 +99,30 @@ func records(t *testing.T, st session.Store) []session.Record {
 	return recs
 }
 
+// A Register waiting for a packet identifier returns the failure when
+// the session fails meanwhile.
+func TestFailureEndsAnIdentifierWait(t *testing.T) {
+	st := newFaultStore()
+	h := newHarness(t, Config{Store: st})
+	h.e.ids = newIDTable(1)
+	h.connect(false, 10)
+	o := h.publish(2, "durable")
+	h.collect()
+	st.failPut = phaseIs(session.AwaitPubcomp)
+
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+	returned := make(chan error, 1)
+	h.whileWaitingForID(func() {
+		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil)
+		returned <- err
+	})
+	h.e.HandlePubrec(o.PacketID(), 0, nil)
+	h.drain()
+	if err := <-returned; !errors.Is(err, ErrStoreFailed) || !errors.Is(err, errDiskFull) {
+		t.Fatalf("Register waiting through the failure: %v", err)
+	}
+}
+
 // A PUBREL never goes out unless the AwaitPubcomp phase it depends on is
 // stored: when that write fails the session ends instead, and the next
 // process (or Restore) continues from the phase the store holds.
@@ -125,7 +149,8 @@ func TestFailedPhaseWriteEndsTheSession(t *testing.T) {
 			t.Fatalf("flow %d completed with %v, want the store failure", f.PacketID(), err)
 		}
 	}
-	if _, _, err := h.e.Register(context.Background(), Message{ID: 999, QoS: 1, Packet: []byte{0x32, 0}}); !errors.Is(err, ErrStoreFailed) {
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+	if _, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil); !errors.Is(err, ErrStoreFailed) {
 		t.Fatalf("Register after the failure: %v", err)
 	}
 	if _, _, err := h.e.Connected(ConnInfo{Link: &fakeLink{}}); !errors.Is(err, ErrStoreFailed) {
@@ -356,14 +381,13 @@ func TestFailedSettleKeepsTheRecord(t *testing.T) {
 	st := session.NewMemoryStore()
 	h := newHarness(t, Config{Store: st})
 	h.connect(false, 10)
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	attempts := make(chan error, 1)
-	o, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("entry"),
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
 		Settle: func(_ context.Context, outcome error) error {
 			attempts <- outcome
 			return errors.New("queue unavailable")
-		}})
+		}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +400,7 @@ func TestFailedSettleKeepsTheRecord(t *testing.T) {
 	if recs := records(t, st); len(recs) != 1 {
 		t.Fatalf("record not kept after a failed settle: %+v", recs)
 	}
-	if h.e.ids.owner[id] != OwnerPublish || !h.e.HasState() {
+	if h.e.ids.owner[o.PacketID()] != OwnerPublish || !h.e.HasState() {
 		t.Fatal("identifier or state released before the outcome was recorded")
 	}
 
@@ -391,7 +415,7 @@ func TestFailedSettleKeepsTheRecord(t *testing.T) {
 	if recs := records(t, st); len(recs) != 0 {
 		t.Fatalf("record left after the outcome was recorded: %+v", recs)
 	}
-	if h.e.ids.owner[id] != OwnerNone {
+	if h.e.ids.owner[o.PacketID()] != OwnerNone {
 		t.Fatal("identifier not released")
 	}
 }
@@ -458,16 +482,15 @@ func TestAdoptWhileSettling(t *testing.T) {
 	st := session.NewMemoryStore()
 	h := newHarness(t, Config{Store: st})
 	h.connect(false, 10)
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	retried := make(chan error, 1)
-	o, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("entry"),
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
 		Settle: func(context.Context, error) error {
 			if !h.e.Adopt([]byte("entry"), func(_ context.Context, outcome error) error { retried <- outcome; return nil }) {
 				t.Error("the flow was not adoptable while its Settle ran")
 			}
 			return errors.New("queue unavailable")
-		}})
+		}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +503,7 @@ func TestAdoptWhileSettling(t *testing.T) {
 	if recs := records(t, st); len(recs) != 0 {
 		t.Fatalf("record left after the second Settle recorded the outcome: %+v", recs)
 	}
-	if h.e.ids.owner[id] != OwnerNone || h.e.HasState() {
+	if h.e.ids.owner[o.PacketID()] != OwnerNone || h.e.HasState() {
 		t.Fatal("identifier or orphan kept after the outcome was recorded")
 	}
 }
@@ -541,12 +564,13 @@ func TestAcceptedOutcomeSurvivesRestart(t *testing.T) {
 			st := session.NewMemoryStore()
 			h := newHarness(t, Config{Store: st})
 			h.connect(false, 10)
-			id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-			pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: id})
-			if _, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
-				Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}); err != nil {
+			pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: 1})
+			o, _, err := h.e.Register(context.Background(), Message{QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
+				Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}, nil)
+			if err != nil {
 				t.Fatal(err)
 			}
+			id := o.PacketID()
 			h.collect()
 			if tc.qos == 1 {
 				h.e.HandlePuback(id, 0, nil)
@@ -590,13 +614,12 @@ func TestFailureDuringRegisterCompletesOnce(t *testing.T) {
 	st.failMeta.Store(true)
 	h := newHarness(t, Config{Store: st, OnFailure: func(error) {}})
 	h.connect(false, 10)
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	settles := make(chan error, 2)
 	registered := make(chan error, 1)
 	go func() {
-		_, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("entry"),
-			Settle: func(_ context.Context, err error) error { settles <- err; return nil }})
+		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
+			Settle: func(_ context.Context, err error) error { settles <- err; return nil }}, nil)
 		registered <- err
 	}()
 	<-st.held
@@ -644,11 +667,10 @@ func TestFailedFirstPutCancelsLaterWrites(t *testing.T) {
 	st := &putGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
 	h := newHarness(t, Config{Store: st})
 	h.connect(false, 10)
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	returned := make(chan error, 1)
 	go func() {
-		_, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt})
+		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil)
 		returned <- err
 	}()
 	<-st.held
@@ -710,14 +732,14 @@ func TestEveryOutcomeSurvivesRestart(t *testing.T) {
 				cfg := Config{Store: st, Refusal: func(t wire.PacketType, rc wire.ReasonCode) error { return refusalErr{t, rc} }}
 				h := newHarness(t, cfg)
 				h.connect(false, 10)
-				id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-				pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: id})
-				if _, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
-					Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}); err != nil {
+				pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: 1})
+				o, _, err := h.e.Register(context.Background(), Message{QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
+					Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}, nil)
+				if err != nil {
 					t.Fatal(err)
 				}
 				h.collect()
-				tc.end(h, id)
+				tc.end(h, o.PacketID())
 				h.drain()
 
 				restarted := newHarness(t, cfg)
@@ -779,13 +801,12 @@ func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
 	st := &putGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
 	h := newHarness(t, Config{Store: st, SessionLoss: Fail})
 	h.connect(false, 10)
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	settled := make(chan error, 2)
 	returned := make(chan error, 1)
 	go func() {
-		_, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("entry"),
-			Settle: func(_ context.Context, err error) error { settled <- err; return nil }})
+		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
+			Settle: func(_ context.Context, err error) error { settled <- err; return nil }}, nil)
 		returned <- err
 	}()
 	<-st.held
@@ -804,7 +825,7 @@ func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
 		t.Fatalf("a rejected registration settled with %v", err)
 	default:
 	}
-	if h.e.HasState() || h.e.ids.owner[id] != OwnerNone {
+	if h.e.HasState() || h.e.ids.used != 0 {
 		t.Fatal("a rejected registration left state behind")
 	}
 }

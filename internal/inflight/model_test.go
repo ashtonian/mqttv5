@@ -214,30 +214,26 @@ func (m *model) drop() {
 }
 
 func (m *model) appPublish() error {
+	msg := m.nextMsg
+	qos := byte(1 + m.rng.IntN(2))
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, uint64(msg))
+	packet, err := wire.MarshalPublish(wire.PublishOpts{Topic: "m", Payload: payload, QoS: qos, PacketID: 1})
+	if err != nil {
+		return err
+	}
 	exhausted, cancel := context.WithCancel(context.Background())
 	cancel()
-	id, err := m.e.AllocateID(exhausted, OwnerPublish, nil)
+	o, _, err := m.e.Register(exhausted, Message{QoS: qos, Packet: packet}, nil)
 	if errors.Is(err, ErrIDsExhausted) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	msg := m.nextMsg
 	m.nextMsg++
-	qos := byte(1 + m.rng.IntN(2))
-	payload := make([]byte, 8)
-	binary.BigEndian.PutUint64(payload, uint64(msg))
-	packet, err := wire.MarshalPublish(wire.PublishOpts{Topic: "m", Payload: payload, QoS: qos, PacketID: id})
-	if err != nil {
-		return err
-	}
-	o, _, err := m.e.Register(context.Background(), Message{ID: id, QoS: qos, Packet: packet})
-	if err != nil {
-		return err
-	}
 	m.pending[o] = msg
-	m.logf("app publish msg=%d id=%d qos=%d", msg, id, qos)
+	m.logf("app publish msg=%d id=%d qos=%d", msg, o.PacketID(), qos)
 	return nil
 }
 

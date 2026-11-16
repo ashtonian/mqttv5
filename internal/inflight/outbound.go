@@ -3,7 +3,9 @@ package inflight
 import (
 	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -76,9 +78,11 @@ func (o *Out) wake(err error) {
 
 // Message is an outbound QoS 1/2 PUBLISH to register.
 type Message struct {
-	ID        uint16 // from AllocateID(OwnerPublish)
-	QoS       byte
-	Packet    []byte    // encoded with DUP=0
+	QoS byte
+	// Packet is the PUBLISH, encoded with DUP=0. Register writes the
+	// identifier it allocates into it, so the one it was encoded with is
+	// a placeholder.
+	Packet    []byte
 	ExpiresAt time.Time // zero: never
 	// Ref identifies the message to its producer across restarts and is
 	// stored with its record; see Adopt.
@@ -98,17 +102,24 @@ type Message struct {
 	Settle func(ctx context.Context, err error) error
 }
 
-// Register adds an outbound flow for m. The record is stored before the
-// flow can be sent; if that fails the flow is removed, the identifier
-// released, and a [*StoreError] returned. An error means the flow does
-// not exist and m.Settle is never called; otherwise the flow completes
-// through Done and Settle, also when the session fails meanwhile. The
-// returned Link, when non-nil, is the live connection: the caller passes
-// out.Seq() to its SendOrdered so the PUBLISH keeps its place relative
-// to other writes.
-func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
+// Register allocates a packet identifier for m, writes it into m.Packet
+// and adds an outbound flow for it, in one critical section. While every
+// identifier is in use it waits for one, until ctx ends
+// ([ErrIDsExhausted]) or stop closes ([ErrStopped]; nil never does).
+// The record is stored before the flow can be sent; if that fails the
+// flow is removed, the identifier released, and a [*StoreError]
+// returned. An error means the flow does not exist and m.Settle is never
+// called; otherwise the flow completes through Done and Settle, also
+// when the session fails meanwhile. The returned Link, when non-nil, is
+// the live connection: the caller passes out.Seq() to its SendOrdered so
+// the PUBLISH keeps its place relative to other writes.
+func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) (*Out, Link, error) {
+	idAt, ok := wire.PublishPacketIDOffset(m.Packet)
+	if !ok || m.QoS > 2 || m.Packet[0]>>1&0x03 != m.QoS {
+		return nil, nil, fmt.Errorf("mqttv5: register outbound publish: want a PUBLISH encoded with QoS %d, got % .8x", m.QoS, m.Packet)
+	}
 	o := &Out{
-		id: m.ID, qos: m.QoS, packet: m.Packet, expiresAt: m.ExpiresAt,
+		qos: m.QoS, packet: m.Packet, expiresAt: m.ExpiresAt,
 		ref: m.Ref, settle: m.Settle,
 		phase: session.AwaitPuback,
 		done:  make(chan struct{}),
@@ -118,11 +129,18 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 	}
 
 	e.mu.Lock()
+	for e.failure == nil && e.ids.full() {
+		if err := e.awaitIDLocked(ctx, stop); err != nil {
+			e.mu.Unlock()
+			return nil, nil, err
+		}
+	}
 	if e.failure != nil {
-		e.ids.release(m.ID, OwnerPublish)
 		defer e.mu.Unlock()
 		return nil, nil, e.failure
 	}
+	o.id = e.ids.take(OwnerPublish)
+	binary.BigEndian.PutUint16(o.packet[idAt:], o.id)
 	if !o.expiresAt.IsZero() {
 		o.expiry = secondsUntil(o.expiresAt, e.cfg.Now())
 	}

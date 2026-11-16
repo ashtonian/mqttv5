@@ -3,6 +3,7 @@ package wire
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -58,6 +59,41 @@ func TestMarshalPublishIsExactAndOwned(t *testing.T) {
 	}
 	if !bytes.Equal(got, keep) {
 		t.Fatal("MarshalPublish result was overwritten by a later encode")
+	}
+}
+
+func TestPublishPacketIDOffset(t *testing.T) {
+	mei := uint32(60)
+	for _, opts := range []PublishOpts{
+		{Topic: "a", Payload: []byte("p"), QoS: 1, PacketID: 1},
+		{Topic: "a/b/c", QoS: 2, PacketID: 1, MessageExpiryInterval: &mei, UserProperties: []UserProperty{{"k", "v"}}},
+		{Topic: strings.Repeat("t", 300), Payload: make([]byte, 200), QoS: 1, PacketID: 1},
+	} {
+		frame, err := MarshalPublish(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		off, ok := PublishPacketIDOffset(frame)
+		if !ok {
+			t.Fatalf("QoS %d, %d-byte topic: no offset", opts.QoS, len(opts.Topic))
+		}
+		frame[off], frame[off+1] = 0xBE, 0xEF
+		p, err := NewDecoder(bytes.NewReader(frame)).ReadPacket()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub := p.(*Publish)
+		if pub.PacketID != 0xBEEF || pub.Topic != opts.Topic || !bytes.Equal(pub.Payload, opts.Payload) {
+			t.Fatalf("frame with the identifier set decodes as id %#x, %d-byte topic", pub.PacketID, len(pub.Topic))
+		}
+		p.Release()
+	}
+
+	qos0, _ := MarshalPublish(PublishOpts{Topic: "a", Payload: []byte("payload")})
+	for _, b := range [][]byte{nil, {0x32}, {0x32, 0x04, 0x00, 0x02, 'a', 'b'}, {0x40, 0x02, 0x00, 0x01}, qos0} {
+		if off, ok := PublishPacketIDOffset(b); ok {
+			t.Fatalf("% x: offset %d, want none", b, off)
+		}
 	}
 }
 

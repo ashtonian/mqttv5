@@ -841,12 +841,13 @@ const (
 	OwnerUnsubscribe
 )
 
-// ErrIDsExhausted is returned by AllocateID when all 65,535 packet
-// identifiers are in use and ctx ends before one is released.
+// ErrIDsExhausted is returned by AllocateID and Register when all
+// 65,535 packet identifiers are in use and ctx ends before one is
+// released.
 var ErrIDsExhausted = errors.New("mqttv5: all packet identifiers in use")
 
-// ErrStopped is returned by AllocateID when its stop channel closes while
-// it waits for an identifier.
+// ErrStopped is returned by AllocateID and Register when their stop
+// channel closes while they wait for an identifier.
 var ErrStopped = errors.New("mqttv5: stopped waiting for a packet identifier")
 
 // idTable hands out packet identifiers 1..65535 and remembers each
@@ -857,9 +858,9 @@ type idTable struct {
 	max   uint16 // highest identifier handed out; 65535 outside tests
 	used  int
 	// freed is closed at the next release, or when the table is
-	// replaced, to wake the AllocateID calls waiting for an identifier.
-	// It exists only while one waits, so an allocation or release
-	// touches no channel.
+	// replaced or the session fails, to wake the callers waiting for an
+	// identifier. It exists only while one waits, so an allocation or
+	// release touches no channel.
 	freed chan struct{}
 }
 
@@ -909,7 +910,7 @@ func (t *idTable) release(id uint16, o Owner) bool {
 	return true
 }
 
-// wake lets the AllocateID calls waiting for an identifier try again.
+// wake lets the callers waiting for an identifier try again.
 func (t *idTable) wake() {
 	if t.freed != nil {
 		close(t.freed)
@@ -917,28 +918,38 @@ func (t *idTable) wake() {
 	}
 }
 
+// awaitIDLocked waits, without e.mu, for the identifier table to change:
+// a release, Restore replacing it, or the session failing. It returns
+// with e.mu held again, and an error once ctx ends or stop closes.
+func (e *Engine) awaitIDLocked(ctx context.Context, stop <-chan struct{}) error {
+	if e.ids.freed == nil {
+		e.ids.freed = make(chan struct{})
+	}
+	freed := e.ids.freed
+	e.mu.Unlock()
+	defer e.mu.Lock()
+	select {
+	case <-freed:
+		return nil
+	case <-ctx.Done():
+		return errors.Join(ErrIDsExhausted, ctx.Err())
+	case <-stop:
+		return ErrStopped
+	}
+}
+
 // AllocateID reserves a packet identifier for o, blocking while all are
-// in use until ctx ends or stop closes (nil never does).
+// in use until ctx ends or stop closes (nil never does). A PUBLISH gets
+// its identifier from Register instead.
 func (e *Engine) AllocateID(ctx context.Context, o Owner, stop <-chan struct{}) (uint16, error) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	for e.ids.full() {
-		if e.ids.freed == nil {
-			e.ids.freed = make(chan struct{})
+		if err := e.awaitIDLocked(ctx, stop); err != nil {
+			return 0, err
 		}
-		freed := e.ids.freed
-		e.mu.Unlock()
-		select {
-		case <-freed:
-		case <-ctx.Done():
-			return 0, errors.Join(ErrIDsExhausted, ctx.Err())
-		case <-stop:
-			return 0, ErrStopped
-		}
-		e.mu.Lock()
 	}
-	id := e.ids.take(o)
-	e.mu.Unlock()
-	return id, nil
+	return e.ids.take(o), nil
 }
 
 // ReleaseID frees id if o owns it and reports whether it did.
