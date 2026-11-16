@@ -1,6 +1,7 @@
 package mqttv5
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1717,5 +1719,360 @@ func TestPublishWaitForConnectionAfterDisconnect(t *testing.T) {
 	defer cancel()
 	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1}); !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("Publish after Disconnect = %v, want ErrNotConnected", err)
+	}
+}
+
+// One goroutine keeps many QoS 1 and 2 publishes in flight: the broker
+// gets them in order, every result reports its acknowledgement, and
+// Stats counts each once acknowledged.
+func TestPublishAsyncPipelines(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		if c.AcceptConnect(wire.ConnackOpts{}) == nil {
+			return
+		}
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b, WithStats())
+	const n = 200
+	results := make([]*PublishResult, n)
+	for i := range n {
+		r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", QoS: byte(1 + i%2), Payload: []byte(strconv.Itoa(i))})
+		if err != nil {
+			t.Fatalf("PublishAsync %d: %v", i, err)
+		}
+		results[i] = r
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i, r := range results {
+		if err := r.Wait(ctx); err != nil {
+			t.Fatalf("result %d: %v", i, err)
+		}
+	}
+	var order []string
+	for _, p := range b.Conn(0, time.Second).Log() {
+		if p.Type == wire.PUBLISH {
+			order = append(order, string(p.Payload))
+		}
+	}
+	if len(order) != n {
+		t.Fatalf("broker got %d PUBLISHes, want %d", len(order), n)
+	}
+	for i, payload := range order {
+		if payload != strconv.Itoa(i) {
+			t.Fatalf("PUBLISH %d carries message %s", i, payload)
+		}
+	}
+	if s := cli.Stats().PublishesSent; s != n {
+		t.Errorf("PublishesSent = %d, want %d", s, n)
+	}
+}
+
+// A result is pending until the broker answers: Err is nil, and Wait
+// ends with its ctx while the publish goes on. The broker's refusal then
+// completes it, uncounted in PublishesSent.
+func TestPublishAsyncResultFollowsTheAck(t *testing.T) {
+	got := make(chan struct{})
+	release := make(chan struct{})
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		if c.AcceptConnect(wire.ConnackOpts{}) == nil {
+			return
+		}
+		p, ok := c.Await(wire.PUBLISH, 0)
+		if !ok {
+			return
+		}
+		close(got)
+		select {
+		case <-release:
+		case <-c.Gone():
+			return
+		}
+		_ = c.Puback(p.PacketID, wire.ReasonQuotaExceeded)
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b, WithStats())
+	r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", QoS: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-got
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err before the broker answered = %v, want nil", err)
+	}
+	select {
+	case <-r.Done():
+		t.Fatal("Done closed before the broker answered")
+	default:
+	}
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.Wait(ended); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait with an ended ctx = %v, want context.Canceled", err)
+	}
+
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.Wait(ctx); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("Wait = %v, want the broker's refusal", err)
+	}
+	if err := r.Err(); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("Err after Done = %v, want the broker's refusal", err)
+	}
+	if s := cli.Stats().PublishesSent; s != 0 {
+		t.Errorf("PublishesSent = %d after a refusal, want 0", s)
+	}
+}
+
+// PublishAsync leaves the write to the writer goroutine: it returns
+// although the broker reads nothing, where writing on the calling
+// goroutine would block it. Disconnect then completes the result with
+// ErrClosed, and the message stays in the session.
+func TestPublishAsyncNeverWritesOnTheCaller(t *testing.T) {
+	url, accepted := stalledBroker(t)
+	cli, err := New(WithBroker(url), WithClientID("stalled"), WithLogger(quietLogger()),
+		WithoutKeepAlive(), WithDisconnectFlushTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-accepted
+
+	// Larger than the socket buffers on both ends, so its write blocks
+	// while the broker does not read.
+	payload := bytes.Repeat([]byte{'a'}, 32<<20)
+	type started struct {
+		r   *PublishResult
+		err error
+	}
+	returned := make(chan started, 1)
+	go func() {
+		r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "big", QoS: 1, Payload: payload})
+		returned <- started{r, err}
+	}()
+	var r *PublishResult
+	select {
+	case s := <-returned:
+		if s.err != nil {
+			t.Fatal(s.err)
+		}
+		r = s.r
+	case <-time.After(5 * time.Second):
+		t.Fatal("PublishAsync is blocked writing on the calling goroutine")
+	}
+
+	if err := cli.Disconnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-r.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect left the result unfinished")
+	}
+	if err := r.Err(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("result after Disconnect = %v, want ErrClosed", err)
+	}
+	if n := cli.engine.OutboundLen(); n != 1 {
+		t.Fatalf("%d messages in the session after Disconnect, want the unacknowledged one", n)
+	}
+}
+
+// A QoS 0 message has no acknowledgement: its result is complete when
+// PublishAsync returns.
+func TestPublishAsyncQoS0IsCompleteAtOnce(t *testing.T) {
+	b := testbroker.New(t)
+	b.SetFallback(func(c *testbroker.Conn) {
+		if c.AcceptConnect(wire.ConnackOpts{}) == nil {
+			return
+		}
+		c.ServeAuto()
+	})
+	cli := tbClient(t, b, WithStats())
+	r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", Payload: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-r.Done():
+	default:
+		t.Fatal("QoS 0 result not complete")
+	}
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err = %v", err)
+	}
+	if err := r.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait = %v", err)
+	}
+	if s := cli.Stats().PublishesSent; s != 1 {
+		t.Errorf("PublishesSent = %d, want 1", s)
+	}
+}
+
+// A message PublishAsync does not accept has no result.
+func TestPublishAsyncRejects(t *testing.T) {
+	cli, err := New(WithBroker("mqtt://127.0.0.1:1"), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", QoS: 1}); !errors.Is(err, ErrNotConnected) || r != nil {
+		t.Fatalf("PublishAsync without a connection = %v, %v; want ErrNotConnected and no result", r, err)
+	}
+	if r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", QoS: 3}); err == nil || r != nil {
+		t.Fatalf("PublishAsync with QoS 3 = %v, %v; want an error and no result", r, err)
+	}
+}
+
+// Disconnect waits for a PublishAsync result unfinished on a pool member,
+// as for a running Publish call: the member has no session to finish it
+// later.
+func TestDisconnectDrainsPooledAsyncPublishes(t *testing.T) {
+	got := make(chan uint16, 1)
+	release := make(chan struct{})
+	cli := tbClient(t, heldPubackBroker(t, got, release), WithPublisherPool(1), WithStats())
+	waitForPoolReady(t, cli, 1, 3*time.Second)
+
+	r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", QoS: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pooled publish never reached the broker")
+	}
+	discErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		discErr <- cli.Disconnect(ctx)
+	}()
+	select {
+	case err := <-discErr:
+		t.Fatalf("Disconnect returned (%v) while a pooled result was unfinished", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.Wait(ctx); err != nil {
+		t.Errorf("pooled result = %v, want its PUBACK", err)
+	}
+	if err := <-discErr; err != nil {
+		t.Errorf("Disconnect = %v", err)
+	}
+	if s := cli.Stats().PublishesSent; s != 1 {
+		t.Errorf("PublishesSent = %d, want 1", s)
+	}
+}
+
+// A PublishAsync no pool member could take falls back to the main
+// connection and leaves nothing for Disconnect to wait for.
+func TestPoolAsyncFallbackLeavesNoDrain(t *testing.T) {
+	b, publishes := countingBroker(t, wire.ReasonSuccess, func(id string) bool { return strings.Contains(id, "-pub-") })
+	cli := tbClient(t, b, WithPublisherPool(1), WithStats())
+	r, err := cli.PublishAsync(context.Background(), PublishOptions{Topic: "t", QoS: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := publishes.Load(); n != 1 {
+		t.Fatalf("broker saw %d PUBLISHes, want 1", n)
+	}
+	if f := cli.Stats().PoolFallbacks; f != 1 {
+		t.Fatalf("PoolFallbacks = %d, want 1", f)
+	}
+	dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dcancel()
+	if err := cli.Disconnect(dctx); err != nil {
+		t.Fatalf("Disconnect = %v; the fallback left the pool draining", err)
+	}
+}
+
+// A PublishAsync whose ctx ends while the write queue is full takes its
+// message back: it returns ctx's error and the session does not hold
+// the message, which no later marker would otherwise release.
+func TestPublishAsyncWithdrawsWhatItCannotQueue(t *testing.T) {
+	url, accepted := stalledBroker(t)
+	cli, err := New(WithBroker(url), WithClientID("stalled"), WithLogger(quietLogger()),
+		WithoutKeepAlive(), WithWriteQueueSize(1), WithDisconnectFlushTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Disconnect(context.Background()) })
+	<-accepted
+
+	// The writer takes the first and blocks writing it to a broker that
+	// does not read; the second, queued once the writer has the first,
+	// fills the queue.
+	if err := cli.Publish(context.Background(), PublishOptions{Topic: "big", Payload: bytes.Repeat([]byte{'a'}, 32<<20)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Publish(context.Background(), PublishOptions{Topic: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r, err := cli.PublishAsync(ctx, PublishOptions{Topic: "t", QoS: 1})
+	if !errors.Is(err, context.Canceled) || r != nil {
+		t.Fatalf("PublishAsync = %v, %v; want context.Canceled and no result", r, err)
+	}
+	if n := cli.engine.OutboundLen(); n != 0 {
+		t.Fatalf("%d messages in the session, want none", n)
+	}
+}
+
+// BenchmarkPublishAsyncRTT publishes from one goroutine through a broker
+// that answers each PUBLISH one round trip after receiving it, keeping
+// up to window results outstanding, and reports messages per second.
+// Window 1 is Publish one at a time; a window of W approaches W/RTT.
+func BenchmarkPublishAsyncRTT(b *testing.B) {
+	const rtt = 25 * time.Millisecond
+	for _, window := range []int{1, 16, 64} {
+		b.Run(fmt.Sprintf("rtt=%v/window=%d", rtt, window), func(b *testing.B) {
+			broker := rttBroker(b, rtt)
+			cli, err := New(WithBroker(broker.URL()), WithClientID("rtt"), WithLogger(quietLogger()))
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := cli.Connect(context.Background()); err != nil {
+				b.Fatal(err)
+			}
+			defer cli.Disconnect(context.Background())
+			ctx := context.Background()
+			outstanding := make([]*PublishResult, window)
+			n := max(b.N, 2*window)
+			b.ResetTimer()
+			start := time.Now()
+			for i := range n {
+				if r := outstanding[i%window]; r != nil {
+					if err := r.Wait(ctx); err != nil {
+						b.Fatal(err)
+					}
+				}
+				r, err := cli.PublishAsync(ctx, PublishOptions{Topic: "rtt", QoS: 1, Payload: []byte{byte(i)}})
+				if err != nil {
+					b.Fatal(err)
+				}
+				outstanding[i%window] = r
+			}
+			for _, r := range outstanding {
+				if err := r.Wait(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(n)/time.Since(start).Seconds(), "msg/s")
+		})
 	}
 }

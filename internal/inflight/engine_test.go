@@ -644,6 +644,74 @@ func TestInterruptEndsWaitsNotFlows(t *testing.T) {
 	}
 }
 
+// OnDone is told once, when the wait on the flow ends: with the
+// broker's answer, or with ErrInterrupted when Interrupt or
+// InterruptWait ended it first. Withdraw, whose caller takes the flow
+// back, does not call it.
+func TestOnDoneReportsTheEndOfTheWait(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.connect(false, 0)
+	type call struct {
+		flow string
+		err  error
+	}
+	var calls []call
+	register := func(name string) *Out {
+		pkt, err := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// OnDone runs with the engine's mutex held, which serializes the
+		// appends.
+		o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt,
+			OnDone: func(err error) { calls = append(calls, call{name, err}) }}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	acked := register("acked")
+	interrupted := register("interrupted")
+	h.collect()
+	h.e.HandlePuback(acked.PacketID(), 0, nil)
+	h.e.Interrupt()
+	h.e.HandlePuback(interrupted.PacketID(), 0, nil)
+	late := register("late")
+	h.e.InterruptWait(late)
+	h.e.InterruptWait(late)
+	if !h.e.Withdraw(register("withdrawn")) {
+		t.Fatal("a flow never sent was not withdrawn")
+	}
+
+	h.e.mu.Lock()
+	defer h.e.mu.Unlock()
+	wantCalls := []call{{"acked", nil}, {"interrupted", ErrInterrupted}, {"late", ErrInterrupted}}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("OnDone calls %v, want %v", calls, wantCalls)
+	}
+	for i, c := range calls {
+		if c.flow != wantCalls[i].flow || !errors.Is(c.err, wantCalls[i].err) {
+			t.Fatalf("OnDone call %d = %v, want %v", i, c, wantCalls[i])
+		}
+	}
+}
+
+// InterruptWait ends the wait on its flow alone.
+func TestInterruptWaitEndsOneWait(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.connect(false, 0)
+	one := h.publish(1, "one")
+	other := h.publish(1, "other")
+	h.e.InterruptWait(one)
+	if err := done(t, one); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("interrupted flow err = %v, want ErrInterrupted", err)
+	}
+	notDone(t, other)
+	if h.e.OutboundLen() != 2 {
+		t.Fatal("InterruptWait ended a flow, not only the wait on it")
+	}
+}
+
 func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 	h := newHarness(t, Config{})
 	for i := 0; i < 65535; i++ {

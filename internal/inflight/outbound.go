@@ -44,10 +44,12 @@ type Out struct {
 
 	err error // the outcome, once finished
 	// done is closed, once, when the flow finishes or when Interrupt ends
-	// the wait on it first; waitErr is what Err reports from then on.
+	// the wait on it first; waitErr is what Err reports from then on, and
+	// onDone is told it then.
 	done    chan struct{}
 	woken   bool
 	waitErr error
+	onDone  func(err error)
 }
 
 // PacketID returns the flow's packet identifier.
@@ -74,6 +76,9 @@ func (o *Out) wake(err error) {
 	o.woken = true
 	o.waitErr = err
 	close(o.done)
+	if o.onDone != nil {
+		o.onDone(err)
+	}
 }
 
 // Message is an outbound QoS 1/2 PUBLISH to register.
@@ -100,6 +105,11 @@ type Message struct {
 	// (see [Config.OnFailure]) Settle gets the [*StoreError]; the record
 	// is kept and Adopt finds the flow again after Restore.
 	Settle func(ctx context.Context, err error) error
+	// OnDone, when set, is called once when the flow's Done closes, with
+	// what Err reports from then on, unless Withdraw closes it: the
+	// caller that takes the flow back knows. It runs with the engine's
+	// mutex held, so it must return quickly and must not call the engine.
+	OnDone func(err error)
 }
 
 // Register allocates a packet identifier for m, writes it into m.Packet
@@ -120,7 +130,7 @@ func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) 
 	}
 	o := &Out{
 		qos: m.QoS, packet: m.Packet, expiresAt: m.ExpiresAt,
-		ref: m.Ref, settle: m.Settle,
+		ref: m.Ref, settle: m.Settle, onDone: m.OnDone,
 		phase: session.AwaitPuback,
 		done:  make(chan struct{}),
 	}
@@ -217,6 +227,7 @@ func (e *Engine) Withdraw(o *Out) bool {
 		e.mu.Unlock()
 		return false
 	}
+	o.onDone = nil
 	e.unlinkLocked(o)
 	e.finishLocked(o, context.Canceled)
 	j := e.retireLocked(o)

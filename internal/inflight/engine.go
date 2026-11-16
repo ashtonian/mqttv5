@@ -668,6 +668,14 @@ func (e *Engine) Interrupt() {
 	}
 }
 
+// InterruptWait is Interrupt for o alone, for a flow registered after
+// the Interrupt that should have ended its wait.
+func (e *Engine) InterruptWait(o *Out) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	o.wake(ErrInterrupted)
+}
+
 // Disconnected unbinds the engine from l's connection. State is kept
 // for the next connection.
 func (e *Engine) Disconnected(l Link) {

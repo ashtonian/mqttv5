@@ -593,8 +593,8 @@ func WithRetryInitialConnect() Option {
 	}
 }
 
-// WithPublishWaitForConnection makes [Client.Publish] wait for a
-// connection when the client has none — before Connect's first
+// WithPublishWaitForConnection makes [Client.Publish] and
+// [Client.PublishAsync] wait for a connection when the client has none — before Connect's first
 // connection is up, and between a drop and the reconnect — instead of
 // returning [ErrNotConnected]. The message then goes out on the
 // connection that comes up, so a publish made during a failover reaches
@@ -603,7 +603,7 @@ func WithRetryInitialConnect() Option {
 // waits for as long as the client keeps reconnecting. After
 // [Client.Disconnect], or once a reconnect limit
 // ([WithMaxReconnectAttempts], [WithMaxReconnectTime]) has stopped the
-// client, Publish returns ErrNotConnected at once.
+// client, they return ErrNotConnected at once.
 func WithPublishWaitForConnection() Option {
 	return func(c *Config) error {
 		c.PublishWaitForConnection = true
@@ -652,8 +652,9 @@ func WithReceiveMaximum(n uint16) Option {
 // and not had acknowledged at n, when n is below the broker's Receive
 // Maximum (CONNACK, §3.2.2.3.3), which caps them otherwise; a send
 // quota may be lower than the Receive Maximum but never higher
-// [MQTT-4.9.0-1], so a larger n changes nothing. Publishes beyond it
-// wait for an acknowledgement, bounded by their ctx. It bounds what an
+// [MQTT-4.9.0-1], so a larger n changes nothing. Publish calls beyond
+// it wait for an acknowledgement, bounded by their ctx; PublishAsync
+// messages beyond it wait in the session. It bounds what an
 // unacknowledged burst costs the broker and the time a message waits
 // behind it on the wire. Each connection has its own quota, so a
 // publisher pool member also sends up to n. [WithReceiveMaximum] is the

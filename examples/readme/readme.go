@@ -37,6 +37,37 @@ func publish() {
 	_ = err
 }
 
+// reading is a message the pipelining snippet publishes.
+type reading struct {
+	Topic string
+	JSON  []byte
+}
+
+func publishPipelined(readings []reading) error {
+	const window = 64
+	outstanding := make([]*mqttv5.PublishResult, window)
+	for i, reading := range readings {
+		if r := outstanding[i%window]; r != nil {
+			if err := r.Wait(ctx); err != nil {
+				return err // refused, or Disconnect ended the run
+			}
+		}
+		r, err := cli.PublishAsync(ctx, mqttv5.PublishOptions{Topic: reading.Topic, QoS: 1, Payload: reading.JSON})
+		if err != nil {
+			return err // not accepted: the session does not hold it
+		}
+		outstanding[i%window] = r
+	}
+	for _, r := range outstanding {
+		if r != nil {
+			if err := r.Wait(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func publisherPool() {
 	cli, _ := mqttv5.New(
 		mqttv5.WithBroker("mqtts://mqtt.example.com:8883"),

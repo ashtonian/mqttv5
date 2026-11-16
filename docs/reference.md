@@ -90,7 +90,7 @@
 | `WithReconnectBackoff(b)` | `ExponentialBackoff{Initial: 1s, Max: 30s, Jitter: 0.5}` | Delay before reconnect attempt n; see [Backoff policies](#backoff-policies). The attempt count carries over connections that drop sooner than the delay before them. `New` rejects an invalid policy. |
 | `WithMaxReconnectAttempts(n)` | 0 (no limit) | Stop the client after n failed reconnect attempts in one outage (from the lost connection, or with `WithRetryInitialConnect` from `Connect`'s failed attempt, to the next connection). Under `FailoverPriority` an attempt is a pass over the list. See [Reconnect limits](#reconnect-limits). Negative rejected. |
 | `WithMaxReconnectTime(d)` | 0 (no limit) | Stop the client once the next reconnect attempt would start more than d after the connection was lost. It stops as soon as the backoff shows that, without waiting out the delay; an attempt under way is not cut short. Negative rejected. |
-| `WithPublishWaitForConnection()` | off | `Publish` with no connection up waits, bounded by its ctx, for the next one — before the first connection, and between a drop and the reconnect — instead of returning `ErrNotConnected`. After `Disconnect` it still returns `ErrNotConnected` at once. |
+| `WithPublishWaitForConnection()` | off | `Publish` and `PublishAsync` with no connection up wait, bounded by their ctx, for the next one — before the first connection, and between a drop and the reconnect — instead of returning `ErrNotConnected`. After `Disconnect` they still return `ErrNotConnected` at once. |
 | `WithRetryInitialConnect()` | off | A failed first CONNECT is retried in the background like a reconnect and `Connect` returns nil; `Client.AwaitConnection(ctx)` waits for the connection. Without it `Connect` returns the failure: with `WithBrokers`, once every broker has failed. |
 | `WithFollowServerRedirects()` | off | Connect where a `0x9C`/`0x9D` redirect points (see [Changing brokers at runtime](multi-broker.md#changing-brokers-at-runtime)). |
 
@@ -115,14 +115,15 @@ Without limits the client reconnects for as long as it runs. With
 `WithMaxReconnectAttempts` or `WithMaxReconnectTime`, an outage that
 runs out of either stops the client as `Disconnect` would:
 
-- a QoS 1/2 `Publish` still waiting, and `AwaitConnection`, return a
+- a QoS 1/2 `Publish` still waiting and `AwaitConnection` return, and
+  an outstanding `PublishResult` completes with, a
   `*ReconnectLimitError` (`errors.Is(err, ErrReconnectLimit)` and
   `errors.Is(err, ErrClosed)`), whose `Attempts`, `Elapsed` and `Err`
   (the last attempt's failure, one error per broker) say what happened;
   `Err` is not in the error's chain, so a classifier does not take the
   client stopping for one CONNACK refusal;
-- `Publish`, with or without `WithPublishWaitForConnection`, returns
-  `ErrNotConnected`;
+- `Publish` and `PublishAsync`, with or without
+  `WithPublishWaitForConnection`, return `ErrNotConnected`;
 - `WithOnReconnectLimit` fires once, with the error;
 - `Connect` starts the client again, with a fresh budget.
 
@@ -143,7 +144,7 @@ the main connection stands and stop with it.
 | `WithPublisherPoolRouting(p)` | `PoolRoutingRoundRobin` | `PoolRoutingHashByTopic` preserves per-topic ordering. |
 | `WithPublisherPoolClientIDFn(fn)` | `"%s-pub-%d"`; empty (broker-assigned) when the parent ClientID is | Each member's ClientID from the parent's and a 1-based index, e.g. to fit a broker ACL pattern. IDs must be unique across every client of the broker. |
 | `WithEncoding(e)` | none | The `Encoding` of the typed calls (`PublishValue`, `SubscribeAs` and their variants), e.g. `jsoncodec.Encoding{}`; without one they return `ErrNoEncoding` ([Typed publish / subscribe](typed-payloads.md#typed-publish--subscribe)). |
-| `WithMaxInflight(n)` | 0 (the broker's Receive Maximum) | QoS 1/2 publishes in flight at once, per connection: the lower of n and the broker's Receive Maximum. The spec lets a client send fewer than the Receive Maximum, never more ([MQTT-4.9.0-1]), so an n above it changes nothing. Further publishes wait, bounded by their ctx. Publisher pool members inherit it. |
+| `WithMaxInflight(n)` | 0 (the broker's Receive Maximum) | QoS 1/2 publishes in flight at once, per connection: the lower of n and the broker's Receive Maximum. The spec lets a client send fewer than the Receive Maximum, never more ([MQTT-4.9.0-1]), so an n above it changes nothing. Further `Publish` calls wait, bounded by their ctx; further `PublishAsync` messages wait in the session. Publisher pool members inherit it. |
 | `WithQoSDowngrade()` | off | Send a publish whose QoS exceeds the broker's Maximum QoS at that maximum instead of failing it with `ErrQoSNotSupported`. Weakens the guarantee (QoS 2 becomes at-least-once). |
 
 > **Broker limits.** Checked before a packet is written; see
@@ -155,7 +156,9 @@ the main connection stands and stop with it.
 > - `WriteDropNewest` returns `ErrWriteQueueFull` immediately when the
 >   writer queue is full. Use it for telemetry, where head-of-line
 >   latency on the producer is worse than occasional loss.
-> - QoS 1/2 always block on the broker ack regardless.
+> - QoS 1/2 messages always wait for room: a `Publish` then waits for
+>   the broker's acknowledgement, and `PublishAsync` reports it through
+>   its result.
 
 #### Subscription defaults
 
@@ -267,10 +270,10 @@ them with `errors.As`.
 
 | Error | Source | Meaning |
 |---|---|---|
-| `ErrNotConnected` | `Publish`, `Reauthenticate` | No live connection; from `Publish` it also guarantees the message was not sent. Retry / wait for reconnect (`AwaitConnection`), or let `Publish` wait (`WithPublishWaitForConnection`). |
+| `ErrNotConnected` | `Publish`, `PublishAsync`, `Reauthenticate` | No live connection; from `Publish` and `PublishAsync` it also guarantees the message was not sent. Retry / wait for reconnect (`AwaitConnection`), or let `Publish` wait (`WithPublishWaitForConnection`). |
 | `ErrAlreadyConnected` | `Connect` | Connect called twice. |
 | `ErrClosed` | any after `Disconnect` | Client torn down. Also matched by `*ReconnectLimitError`. |
-| `ErrReconnectLimit` | QoS 1/2 `Publish`, `AwaitConnection`, `WithOnReconnectLimit` | A reconnect limit ran out and the client stopped; the error is a `*ReconnectLimitError` with `Attempts`, `Elapsed` and the last attempt's failure in `Err` (see [Reconnect limits](#reconnect-limits)). `Connect` starts again. |
+| `ErrReconnectLimit` | QoS 1/2 `Publish` and `PublishResult`, `AwaitConnection`, `WithOnReconnectLimit` | A reconnect limit ran out and the client stopped; the error is a `*ReconnectLimitError` with `Attempts`, `Elapsed` and the last attempt's failure in `Err` (see [Reconnect limits](#reconnect-limits)). `Connect` starts again. |
 | `ErrConnectRefused` | `Connect` | Broker non-success CONNACK reason; the error is a `*ReasonCodeError` carrying the code, reason string and server reference. |
 | joined errors | `Connect` with `WithBrokers` | No broker accepted: one error per broker, each prefixed with its URL; `errors.Is` / `errors.As` see every one. |
 | `*ProtocolError` | `Connect`, connection drops | The broker broke MQTT v5 (e.g. Session Present for CleanStart=1, a packet above the client's Maximum Packet Size, more in-flight messages than the client's Receive Maximum). The client sent DISCONNECT with `Reason` and reconnects; counted in `Stats().ProtocolErrors`. |
@@ -301,6 +304,12 @@ them with `errors.As`.
 | `*RejectedByDisconnectError` | `Subscribe*`, `Unsubscribe` | Instead of answering, the broker closed the connection with a DISCONNECT blaming the packet (0x81 Malformed Packet, 0x82 Protocol Error, …) each of the 3 times it was sent — e.g. mosquitto for a filter deeper than 200 levels. The client gives up on it and stays connected; the subscription is closed. |
 
 ### Publish
+
+`PublishAsync` returns the errors `Publish` returns before the session
+holds the message — every row below but the broker's answer and what
+happens to a held message afterwards. A `PublishResult` reports those:
+`*ReasonCodeError`, `ErrSessionLost`, `ErrMessageExpired`, and
+`ErrClosed` or `*ReconnectLimitError` when the run ends first.
 
 | Error | Source | Meaning |
 |---|---|---|

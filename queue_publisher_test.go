@@ -580,21 +580,7 @@ func BenchmarkQueuePublisherRTT(b *testing.B) {
 	for _, rtt := range []time.Duration{25 * time.Millisecond, 300 * time.Millisecond} {
 		for _, window := range []int{1, 16, 32} {
 			b.Run(fmt.Sprintf("rtt=%v/window=%d", rtt, window), func(b *testing.B) {
-				broker := testbroker.New(b, func(c *testbroker.Conn) {
-					c.AcceptConnect(wire.ConnackOpts{})
-					for {
-						p, ok, err := c.Next(time.Minute)
-						if !ok {
-							if errors.Is(err, testbroker.ErrTimeout) {
-								continue
-							}
-							return
-						}
-						if p.Type == wire.PUBLISH {
-							time.AfterFunc(rtt, func() { c.Puback(p.PacketID, wire.ReasonSuccess) })
-						}
-					}
-				})
+				broker := rttBroker(b, rtt)
 				cli, err := New(WithBroker(broker.URL()), WithClientID("rtt"), WithLogger(quietLogger()))
 				if err != nil {
 					b.Fatal(err)
@@ -627,6 +613,26 @@ func BenchmarkQueuePublisherRTT(b *testing.B) {
 			})
 		}
 	}
+}
+
+// rttBroker acknowledges each QoS 1 PUBLISH one round trip after
+// receiving it.
+func rttBroker(b *testing.B, rtt time.Duration) *testbroker.Broker {
+	return testbroker.New(b, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		for {
+			p, ok, err := c.Next(time.Minute)
+			if !ok {
+				if errors.Is(err, testbroker.ErrTimeout) {
+					continue
+				}
+				return
+			}
+			if p.Type == wire.PUBLISH {
+				time.AfterFunc(rtt, func() { c.Puback(p.PacketID, wire.ReasonSuccess) })
+			}
+		}
+	})
 }
 
 // A bounded queue whose head stays unacknowledged keeps memory for what

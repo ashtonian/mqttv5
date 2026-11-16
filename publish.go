@@ -24,7 +24,9 @@ import (
 // QoS 1/2 messages belong to the session once registered: a dropped
 // connection resends them (DUP=1) when the session resumes, and callers
 // stay blocked on the acknowledgement across the drop. A refusal (reason
-// code 0x80 or above) is returned as a [*ReasonCodeError].
+// code 0x80 or above) is returned as a [*ReasonCodeError]. Each QoS 1/2
+// call holds its goroutine until the acknowledgement arrives;
+// [Client.PublishAsync] keeps many in flight from one goroutine.
 //
 // A call that waits for its packet to be written — QoS 1/2, or QoS 0
 // with [PublishWaitForFlush] — writes it on the calling goroutine when
@@ -80,6 +82,166 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 		return err
 	}
 	return nil
+}
+
+// PublishAsync starts a publish and returns without waiting for the
+// broker's answer, which the [PublishResult] reports. One goroutine can
+// so keep many QoS 1/2 messages in flight, where [Client.Publish] needs
+// a goroutine for each, parked until its acknowledgement arrives.
+//
+// An error means the message was not accepted: the session does not
+// hold it. Once accepted, a QoS 1/2 message belongs to the session as
+// with Publish (a dropped connection resends it) and every outcome comes
+// through the result, a refusal as a [*ReasonCodeError] included. When
+// Disconnect ends the client's run first, the result completes with
+// [ErrClosed], or with what ended the run, and the message stays in the
+// session for the next Connect.
+//
+// ctx bounds the start only: the wait for a connection
+// ([WithPublishWaitForConnection]), for a packet identifier, for the
+// session store's write and for room in the write queue. Once the
+// message is accepted ctx neither bounds nor withdraws it;
+// [PublishResult.Wait] takes a ctx of its own. Each unfinished message
+// holds a packet identifier, so at most 65,535 are unfinished at once
+// and a further call waits for one.
+//
+// A QoS 1/2 message is never written on the calling goroutine: the
+// writer sends those started meanwhile together, in one write. How many
+// are in flight is bounded by the send quota (see [WithMaxInflight]);
+// the rest wait in the session for acknowledgements to make room.
+//
+// A QoS 0 message, or one [WithQoSDowngrade] lowers to QoS 0, has no
+// acknowledgement: it is sent as Publish sends it, per [PublishMode]
+// (with PublishWaitForFlush PublishAsync waits for the write), and its
+// result is complete when PublishAsync returns.
+//
+// With [WithPublisherPool] the message goes to a pool member as with
+// Publish, and Disconnect waits for unfinished results as it waits for
+// running Publish calls.
+func (c *Client) PublishAsync(ctx context.Context, po PublishOptions) (*PublishResult, error) {
+	if po.QoS > 2 {
+		return nil, fmt.Errorf("mqttv5: invalid QoS %d (must be 0, 1, or 2)", po.QoS)
+	}
+	if c.pool != nil {
+		r, err := c.pool.publishAsync(ctx, po)
+		if !errors.Is(err, errNoHealthyPublishers) {
+			return r, err
+		}
+		c.stats.addPoolFallback()
+	}
+	return c.publishAsync(ctx, po, nil)
+}
+
+// publishAsync is PublishAsync on c's own connection. done, when set,
+// runs once when the returned result completes, for a QoS 1/2 message
+// with the session engine's mutex held, and never when an error is
+// returned.
+func (c *Client) publishAsync(ctx context.Context, po PublishOptions, done func()) (*PublishResult, error) {
+	cs, err := c.publishConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	opts := po.wire()
+	if err = c.applyServerLimits(cs, &opts); err != nil {
+		return nil, err
+	}
+	if opts.QoS == 0 {
+		if err = c.publishQoS0(ctx, cs, opts); err != nil {
+			return nil, err
+		}
+		c.stats.addPublishSent()
+		if done != nil {
+			done()
+		}
+		return &PublishResult{}, nil
+	}
+	life := c.life.Load()
+	flow, link, err := c.startReliable(ctx, opts, exchange{onDone: func(err error) {
+		if err == nil {
+			c.stats.addPublishSent()
+		}
+		if done != nil {
+			done()
+		}
+	}})
+	if err != nil {
+		return nil, err
+	}
+	if link != nil {
+		// Through the writer, which sends the flows released meanwhile in
+		// one write. A flow left without a marker when ctx ends would wait
+		// for some later one, so it is withdrawn unless already sent; a
+		// marker the connection's end refused leaves it to the next.
+		if err = link.QueueOrdered(ctx, flow.Seq()); err != nil && ctx.Err() != nil && c.engine.Withdraw(flow) {
+			return nil, ctx.Err()
+		}
+	}
+	if life.endedErr() != nil {
+		// The span ended before the flow was registered, so its end did
+		// not end this wait.
+		c.engine.InterruptWait(flow)
+	}
+	return &PublishResult{flow: flow, life: life}, nil
+}
+
+// PublishResult is the outcome of a publish started with
+// [Client.PublishAsync].
+type PublishResult struct {
+	flow *inflight.Out // nil: complete when PublishAsync returned
+	life *lifecycle    // the span the publish was started in
+}
+
+// closedChan is the Done of a result that is complete from the start.
+var closedChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+// Done is closed when the publish completes: for QoS 1 when the PUBACK
+// arrives, for QoS 2 the PUBCOMP, or when Disconnect ends the client's
+// run first.
+func (r *PublishResult) Done() <-chan struct{} {
+	if r.flow == nil {
+		return closedChan
+	}
+	return r.flow.Done()
+}
+
+// Err returns nil until Done is closed, and then the publish's outcome:
+// nil when the broker accepted the message, otherwise the error
+// [Client.Publish] would have returned.
+func (r *PublishResult) Err() error {
+	if r.flow == nil {
+		return nil
+	}
+	select {
+	case <-r.flow.Done():
+		return flowOutcome(r.life, r.flow)
+	default:
+		return nil
+	}
+}
+
+// Wait waits for Done and returns Err, or returns ctx's error when ctx
+// ends first. The publish goes on either way.
+func (r *PublishResult) Wait(ctx context.Context) error {
+	if r.flow == nil {
+		return nil
+	}
+	// A completed result returns without the select below, which would
+	// lock ctx's channel: one every waiter may share.
+	select {
+	case <-r.flow.Done():
+		return flowOutcome(r.life, r.flow)
+	default:
+	}
+	select {
+	case <-r.flow.Done():
+		return flowOutcome(r.life, r.flow)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // publishConnection is the connection a Publish sends on, once it has
@@ -141,7 +303,7 @@ func (c *Client) publishTracked(ctx context.Context, po PublishOptions, ref []by
 		// acknowledgement would ever settle the message.
 		return fmt.Errorf("%w: the broker's Maximum QoS is 0 and a tracked publish needs an acknowledgement", ErrQoSNotSupported)
 	}
-	flow, link, err := c.startReliable(ctx, opts, ref, settle)
+	flow, link, err := c.startReliable(ctx, opts, exchange{ref: ref, settle: settle})
 	if err != nil {
 		return err
 	}
@@ -296,7 +458,7 @@ func assignOutboundAlias(cs *connState, opts *wire.PublishOpts) (topic string, r
 // waiting publisher lock that one channel, twice per publish.
 func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) error {
 	life := c.life.Load()
-	flow, link, err := c.startReliable(ctx, opts, nil, nil)
+	flow, link, err := c.startReliable(ctx, opts, exchange{})
 	if err != nil {
 		return err
 	}
@@ -314,14 +476,33 @@ func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) 
 	}
 	select {
 	case <-flow.Done():
-		if err = flow.Err(); errors.Is(err, inflight.ErrInterrupted) {
-			return life.closedErr()
-		}
-		return err
+		return flowOutcome(life, flow)
 	case <-ctx.Done():
 		c.engine.Withdraw(flow)
 		return ctx.Err()
 	}
+}
+
+// flowOutcome is what a QoS 1/2 publish reports once flow's Done has
+// closed: the broker's answer, or, when the end of the span the flow was
+// started in ended the wait first (see endSpan), what that end gives.
+func flowOutcome(life *lifecycle, flow *inflight.Out) error {
+	err := flow.Err()
+	if errors.Is(err, inflight.ErrInterrupted) {
+		return life.closedErr()
+	}
+	return err
+}
+
+// exchange is what a QoS 1/2 publish is started with besides its packet.
+type exchange struct {
+	// ref and settle make the exchange durable for a QueuePublisher; see
+	// [inflight.Message].
+	ref    []byte
+	settle func(context.Context, error) error
+	// onDone runs when the wait on the flow ends; see
+	// [inflight.Message.OnDone].
+	onDone func(error)
 }
 
 // placeholderPacketID is the identifier a QoS 1/2 PUBLISH is encoded
@@ -336,7 +517,7 @@ const placeholderPacketID = 1
 // when there is none), the flow is sent once the caller's marker, from
 // SendOrdered or QueueOrdered, releases it behind the caller's earlier
 // writes.
-func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref []byte, settle func(context.Context, error) error) (*inflight.Out, inflight.Link, error) {
+func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, x exchange) (*inflight.Out, inflight.Link, error) {
 	// A QoS 1/2 message may be resent on a later connection, where the
 	// broker no longer knows any alias, so it always carries its topic.
 	if opts.TopicAlias != 0 {
@@ -363,7 +544,8 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref [
 	}
 
 	flow, link, err := c.engine.Register(ctx, inflight.Message{
-		QoS: opts.QoS, Packet: packet, ExpiresAt: expiresAt, Ref: ref, Settle: settle,
+		QoS: opts.QoS, Packet: packet, ExpiresAt: expiresAt,
+		Ref: x.ref, Settle: x.settle, OnDone: x.onDone,
 	}, c.done())
 	switch {
 	case errors.Is(err, inflight.ErrStopped):
@@ -587,7 +769,8 @@ func (p *publisherPool) connect(ctx context.Context) error {
 	}
 }
 
-// enter admits a Publish call unless the pool is closing. It counts the
+// enter admits a Publish or PublishAsync call unless the pool is
+// closing. It counts the
 // call first and backs out when closing is set, so admission costs one
 // atomic add however many goroutines publish.
 func (p *publisherPool) enter() bool {
@@ -609,10 +792,11 @@ func (p *publisherPool) exit() {
 	}
 }
 
-// drain stops admitting Publish calls and waits, bounded by ctx, for
-// those running to return. A member's session ends with its connection,
-// so a publish it still awaits an acknowledgement for has nothing to
-// finish it once the member disconnects.
+// drain stops admitting calls and waits, bounded by ctx, for the
+// Publish calls running to return and the PublishAsync results to
+// complete. A member's session ends with its connection, so a publish it
+// still awaits an acknowledgement for has nothing to finish it once the
+// member disconnects.
 func (p *publisherPool) drain(ctx context.Context) error {
 	done := make(chan struct{})
 	p.drained.Store(&done)
@@ -627,23 +811,48 @@ func (p *publisherPool) drain(ctx context.Context) error {
 	}
 }
 
-// publish picks a starting member per the routing policy and tries
-// members from there until one sends the message. It moves on only
-// when a member could not send it at all (see notSent): any other
-// outcome, a broker refusal or ctx ending included, is the caller's, so
-// one Publish never puts the message on two connections. Returns
-// errNoHealthyPublishers when no member could send it.
+// publish sends a Publish call's message through a member (see route).
 func (p *publisherPool) publish(ctx context.Context, opts PublishOptions) error {
 	if !p.enter() {
 		return ErrClosed
 	}
 	defer p.exit()
+	return p.route(opts, func(m *Client) error { return m.Publish(ctx, opts) })
+}
+
+// publishAsync starts a PublishAsync call's message on a member (see
+// route). The call counts as running until its result completes, so
+// drain waits for it.
+func (p *publisherPool) publishAsync(ctx context.Context, opts PublishOptions) (*PublishResult, error) {
+	if !p.enter() {
+		return nil, ErrClosed
+	}
+	var r *PublishResult
+	err := p.route(opts, func(m *Client) error {
+		var err error
+		r, err = m.publishAsync(ctx, opts, p.exit)
+		return err
+	})
+	if err != nil {
+		p.exit()
+		return nil, err
+	}
+	return r, nil
+}
+
+// route picks a starting member per the routing policy and tries
+// members from there until send reports an outcome. It moves on only
+// when a member could not send the message at all (see notSent): any
+// other outcome, a broker refusal or ctx ending included, is the
+// caller's, so one message never goes out on two connections. Returns
+// errNoHealthyPublishers when no member could send it.
+func (p *publisherPool) route(opts PublishOptions, send func(m *Client) error) error {
 	n := len(p.members)
 	start := p.startIndex(opts)
 	var lastErr error
 	for i := range n {
 		m := p.members[(start+uint64(i))%uint64(n)]
-		err := m.Publish(ctx, opts)
+		err := send(m)
 		if !notSent(err) {
 			return err
 		}
