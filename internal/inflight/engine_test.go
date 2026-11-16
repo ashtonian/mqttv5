@@ -34,6 +34,10 @@ func (l *fakeLink) SendOrdered(_ context.Context, seq uint64) error {
 	return nil
 }
 
+func (l *fakeLink) QueueOrdered(ctx context.Context, seq uint64) error {
+	return l.SendOrdered(ctx, seq)
+}
+
 // frame is a decoded packet from a Collect batch.
 type frame struct {
 	typ wire.PacketType

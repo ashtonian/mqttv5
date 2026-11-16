@@ -29,9 +29,10 @@ queued: a QoS 0 header and its payload in one `writev`, without copying
 the payload; a QoS 1/2 publish the packet the session keeps for
 retransmission. If the caller's ctx ends mid-write, a deadline stops
 the write and the writer goroutine sends the rest before anything else.
-Otherwise — TLS, WebSocket and QUIC connections, a busy writer, and
-fire-and-forget QoS 0 — one writer goroutine per connection drains an
-MPSC channel of encoded packets to the socket. The QoS 1/2 publishes
+Otherwise — TLS, WebSocket and QUIC connections, a busy writer,
+fire-and-forget QoS 0, and the QoS 1/2 publishes of `QueuePublisher`,
+whose drain does not wait for the write — one writer goroutine per
+connection drains an MPSC channel of encoded packets to the socket. The QoS 1/2 publishes
 queued behind a write go out together in one write, and queued QoS 0
 packets do when `WithWriteBatch` is set; a write lock
 keeps the two paths from interleaving, and a publish never overtakes a

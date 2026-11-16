@@ -80,9 +80,15 @@ type Link interface {
 	// Wake asks the writer to Collect. It never blocks.
 	Wake()
 	// SendOrdered queues a marker in the connection's write order; when
-	// the writer reaches it, flows up to seq may be sent. It blocks
-	// while the write queue is full.
+	// the writer reaches it, flows up to seq may be sent. With nothing
+	// queued the connection may write them on the caller's goroutine,
+	// for a caller about to wait for its flow. It blocks while the write
+	// queue is full.
 	SendOrdered(ctx context.Context, seq uint64) error
+	// QueueOrdered is SendOrdered for a caller that does not wait for
+	// its flow: the marker always goes to the writer, which sends the
+	// flows released meanwhile together.
+	QueueOrdered(ctx context.Context, seq uint64) error
 }
 
 // Config configures an Engine.

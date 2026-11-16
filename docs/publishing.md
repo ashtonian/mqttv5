@@ -51,6 +51,8 @@ the caller stays blocked until the broker acknowledges it. A refusal
   uncopied.
 - If ctx ends during a write, the writer goroutine finishes the packet,
   so it may still reach the broker after `Publish` returned ctx's error.
+- `QueuePublisher` hands its window's messages to the writer goroutine,
+  so they share writes.
 
 ## Broker limits
 

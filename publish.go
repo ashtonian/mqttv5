@@ -141,8 +141,17 @@ func (c *Client) publishTracked(ctx context.Context, po PublishOptions, ref []by
 		// acknowledgement would ever settle the message.
 		return fmt.Errorf("%w: the broker's Maximum QoS is 0 and a tracked publish needs an acknowledgement", ErrQoSNotSupported)
 	}
-	_, err := c.startReliable(ctx, opts, ref, settle)
-	return err
+	flow, link, err := c.startReliable(ctx, opts, ref, settle)
+	if err != nil {
+		return err
+	}
+	if link != nil {
+		// The writer sends the window's flows released meanwhile in one
+		// write. A failed marker leaves the flow to the next marker or
+		// connection: it is stored with its Ref, and Adopt finds it.
+		_ = link.QueueOrdered(ctx, flow.Seq())
+	}
+	return nil
 }
 
 // applyServerLimits checks opts against what the broker granted in
@@ -287,9 +296,16 @@ func assignOutboundAlias(cs *connState, opts *wire.PublishOpts) (topic string, r
 // waiting publisher lock that one channel, twice per publish.
 func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) error {
 	life := c.life.Load()
-	flow, err := c.startReliable(ctx, opts, nil, nil)
+	flow, link, err := c.startReliable(ctx, opts, nil, nil)
 	if err != nil {
 		return err
+	}
+	if link != nil {
+		// The caller waits for its write anyway, so it may make it
+		// itself. A failed marker is harmless: a flow nothing sent is
+		// withdrawn below when ctx ends, and the next connection sends
+		// any other.
+		_ = link.SendOrdered(ctx, flow.Seq())
 	}
 	// A span that ended before the flow was registered ended the waits
 	// before this one began.
@@ -312,18 +328,20 @@ func (c *Client) publishQoSReliable(ctx context.Context, opts wire.PublishOpts) 
 // with before the session engine writes the one it allocates into it.
 const placeholderPacketID = 1
 
-// startReliable encodes the PUBLISH once, registers the flow with the
+// startReliable encodes the PUBLISH once and registers the flow with the
 // session engine, which allocates its packet identifier and stores it
-// first when a Store is configured, and queues an ordered marker so the
-// writer sends it behind earlier writes. The flow belongs to the session
-// from registration on: a dropped connection resends it, and a session
-// loss applies the [SessionLossPolicy].
-func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref []byte, settle func(context.Context, error) error) (*inflight.Out, error) {
+// first when a Store is configured. The flow belongs to the session from
+// registration on: a dropped connection resends it, and a session loss
+// applies the [SessionLossPolicy]. On the live connection, link (nil
+// when there is none), the flow is sent once the caller's marker, from
+// SendOrdered or QueueOrdered, releases it behind the caller's earlier
+// writes.
+func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref []byte, settle func(context.Context, error) error) (*inflight.Out, inflight.Link, error) {
 	// A QoS 1/2 message may be resent on a later connection, where the
 	// broker no longer knows any alias, so it always carries its topic.
 	if opts.TopicAlias != 0 {
 		if opts.Topic == "" {
-			return nil, fmt.Errorf("%w: QoS %d needs a topic name, not only an alias", ErrTopicAliasInvalid, opts.QoS)
+			return nil, nil, fmt.Errorf("%w: QoS %d needs a topic name, not only an alias", ErrTopicAliasInvalid, opts.QoS)
 		}
 		opts.TopicAlias = 0
 	}
@@ -332,11 +350,11 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref [
 
 	packet, err := wire.MarshalPublish(opts)
 	if err != nil {
-		return nil, fmt.Errorf("mqttv5: encode PUBLISH: %w", err)
+		return nil, nil, fmt.Errorf("mqttv5: encode PUBLISH: %w", err)
 	}
 	if cs := c.cur.Load(); cs != nil {
 		if err = checkPacketSize(cs, len(packet)); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	var expiresAt time.Time
@@ -349,18 +367,13 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, ref [
 	}, c.done())
 	switch {
 	case errors.Is(err, inflight.ErrStopped):
-		return nil, ErrClosed
+		return nil, nil, ErrClosed
 	case errors.Is(err, inflight.ErrIDsExhausted):
-		return nil, fmt.Errorf("mqttv5: allocate packet id: %w", err)
+		return nil, nil, fmt.Errorf("mqttv5: allocate packet id: %w", err)
 	case err != nil:
-		return nil, fmt.Errorf("mqttv5: store outbound publish: %w", err)
+		return nil, nil, fmt.Errorf("mqttv5: store outbound publish: %w", err)
 	}
-	if link != nil {
-		// A failed marker is harmless: the next connection sends every
-		// registered flow.
-		_ = link.SendOrdered(ctx, flow.Seq())
-	}
-	return flow, nil
+	return flow, link, nil
 }
 
 // errNoHealthyPublishers is the pool's signal that no member could send

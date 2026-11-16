@@ -187,6 +187,18 @@ func (cs *connState) SendOrdered(ctx context.Context, seq uint64) error {
 	return cs.sendOrdered(ctx, seq)
 }
 
+// QueueOrdered implements inflight.Link: SendOrdered for a publish
+// nobody waits for, which always goes through the writer goroutine. A
+// caller that goes on publishing would otherwise find the writer idle
+// each time and write every PUBLISH on its own, one syscall each,
+// where the writer sends the ones released meanwhile in one write.
+func (cs *connState) QueueOrdered(ctx context.Context, seq uint64) error {
+	if err := cs.awaitResumed(ctx); err != nil {
+		return err
+	}
+	return cs.queue(ctx, writeReq{mark: seq}, true)
+}
+
 // sendOrdered is SendOrdered without waiting for the connection to
 // resume its subscriptions.
 func (cs *connState) sendOrdered(ctx context.Context, seq uint64) error {
