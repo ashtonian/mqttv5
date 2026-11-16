@@ -3,7 +3,8 @@
 Runnable programs for [`github.com/ashtonian/mqttv5`](../README.md), one
 usage pattern each, plus the README's code snippets kept as compiled
 code. They share `examples/go.mod`, so the dependencies they need
-(`codec/json`, `transport/ws`, `store/file`, `queue/file`) are pulled in
+(`codec/json`, `transport/ws`, `transport/quic`, `store/file`,
+`queue/file`) are pulled in
 here and never by the core module.
 
 ## Overview
@@ -24,7 +25,8 @@ here and never by the core module.
 | `stats/` | `WithStats` counters printed every second | MQTT on 1883 |
 | `disconnect/` | `DisconnectWith`: reason code, reason string, Session Expiry override | MQTT on 1883 |
 | `oauth/` | `WithConnectPacketBuilder` refreshing a bearer token on every connection attempt | MQTT on 1883 (accepts any password) |
-| `ws/` | MQTT over WebSocket with `transport/ws` | a WebSocket listener (EMQX's, on 8083, in `conformance/docker-compose.yml`) |
+| `ws/` | MQTT over WebSocket with `transport/ws`: a message to itself over `ws://` or `wss://` | a WebSocket listener (EMQX's, on 8083 and `wss://` on 8084, in `conformance/docker-compose.yml`) |
+| `quic/` | MQTT over QUIC with `transport/quic`: a message to itself, and the graceful close waited for on shutdown | an MQTT-over-QUIC listener (EMQX's, on 14567/udp, in `conformance/docker-compose.yml`) |
 | `readme/` | Every Go snippet of the repository README and `docs/*.md` guides, as code that compiles; `TestREADMESnippets` fails when the documentation and these files disagree | none |
 
 Each program runs until it is done or interrupted (Ctrl-C), disconnects
@@ -34,11 +36,13 @@ cleanly, and exits 1 with the error on failure.
 
 | Variable | Used by | Default | Description |
 |---|---|---|---|
-| `MQTT_BROKER` | all but `group`, `failover`, `bridge` and `readme/quickstart` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`) | Broker URL. |
+| `MQTT_BROKER` | all but `group`, `failover`, `bridge` and `readme/quickstart` | `mqtt://127.0.0.1:1883` (`ws`: `ws://127.0.0.1:8083/mqtt`; `quic`: `mqtt-quic://127.0.0.1:14567`) | Broker URL. |
 | `MQTT_BROKERS` | `group`, `failover`, `durable` | `mqtt://127.0.0.1:1883,mqtt://127.0.0.1:1884` (`durable`: `MQTT_BROKER`) | Comma-separated broker URLs: one cluster (group member) each for `group`, the failover list for the others. |
 | `MQTT_SOURCE` | `bridge` | `mqtt://127.0.0.1:1883` | Broker the bridge copies from. |
 | `MQTT_DESTINATION` | `bridge` | `mqtt://127.0.0.1:1884` | Broker the bridge copies to. |
 | `MQTT_DATA_DIR` | `durable` | `$TMPDIR/mqttv5-durable` | Directory of the queue and session files; delete it to start over. |
+| `MQTT_CA_FILE` | `quic`, `ws` (for `wss://`) | none (system roots) | PEM CA bundle the broker's certificate is verified against, relative to `examples/`. The conformance EMQX's is `../conformance/tls/pki/root.pem`. |
+| `MQTT_FALLBACK` | `quic` | none (no fallback) | An `mqtts://` URL to fall back to when QUIC cannot reach the broker. |
 
 ## External dependencies
 
@@ -71,16 +75,20 @@ go -C examples run ./group
 go -C examples run ./failover      # then: docker stop the broker it reports
 go -C examples run ./bridge        # then: stop mq2, or the bridge, and start it again
 
-# WebSocket: a mosquitto with a "listener 8083" + "protocol websockets"
-# configuration, then:
-MQTT_BROKER=ws://127.0.0.1:8083/mqtt go -C examples run ./ws
+# WebSocket and QUIC: the conformance EMQX, whose TLS certificate the
+# compose file generates, then:
+docker compose -f conformance/docker-compose.yml up -d --wait emqx
+go -C examples run ./ws
+MQTT_BROKER=wss://127.0.0.1:8084/mqtt MQTT_CA_FILE=../conformance/tls/pki/root.pem go -C examples run ./ws
+MQTT_CA_FILE=../conformance/tls/pki/root.pem go -C examples run ./quic
 
 # Compile everything and check the README snippets:
 go -C examples vet ./...
 go -C examples test ./...
 
 # Run every example against the conformance brokers (mosquitto on 1883,
-# EMQX on 1884 with WebSocket on 8083), as CI does: each must finish, or
+# EMQX on 1884 with WebSocket on 8083 and QUIC on 14567/udp), as CI
+# does: each must finish, or
 # stop cleanly when interrupted after a few seconds, with exit status 0.
 docker compose -f conformance/docker-compose.yml up -d --wait
 go -C examples test -tags smoke -v -run TestExamplesRun .
@@ -110,6 +118,8 @@ needs nothing from this repository.
 | `connection refused` | `docker ps`; the port in `MQTT_BROKER` | Start the broker or point `MQTT_BROKER` at one. |
 | `ErrConnectRefused` (0x87 Not authorized) | the broker's `allow_anonymous` setting | Allow anonymous clients or add credentials to the example. |
 | `ws` example: `unexpected HTTP response status` | the broker's WebSocket listener and path | Configure a `protocol websockets` listener; most brokers serve it on `/mqtt`. |
+| `quic` example: `context deadline exceeded` | `docker compose ps emqx`; the `127.0.0.1:14567/udp` port mapping | Start the conformance EMQX; set `MQTT_FALLBACK` where UDP is blocked. |
+| `quic` or `wss://` example: `x509: certificate signed by unknown authority` | `MQTT_CA_FILE` | Point it at the broker's CA; for the conformance EMQX, `../conformance/tls/pki/root.pem`. |
 | `TestREADMESnippets` fails | the documentation snippet it names | Change the Markdown and the matching file in `readme/` together. |
 | `failover` never moves | which broker `UP` names; whether you stopped that one | Stop the broker it reports; with one broker up it stays there. |
 | `durable` or `bridge` repeats old messages at start | `MQTT_DATA_DIR`, and the brokers' sessions for the example's ClientID | They resume earlier runs on purpose; delete `MQTT_DATA_DIR` or let the sessions expire to start over. |
@@ -118,8 +128,8 @@ needs nothing from this repository.
 ## Security
 
 The examples connect without TLS to a local broker. For anything else
-use `mqtts://` or `wss://` (verified against the system roots by
-default) and real credentials; `oauth/` shows where per-attempt
+use `mqtts://`, `wss://` or `mqtt-quic://` (verified against the system
+roots by default) and real credentials; `oauth/` shows where per-attempt
 credentials belong. The OAuth token source in that example is a stub.
 
 ## Code map
@@ -128,6 +138,6 @@ credentials belong. The OAuth token source in that example is a stub.
 |---|---|
 | `*/main.go` | one program per folder |
 | `readme/readme.go`, `readme/brokers.go` | Documentation snippets that show no imports; `brokers.go` holds those of Multiple brokers and Recipes |
-| `readme/typed.go`, `readme/queue.go`, `readme/websocket.go` | snippets whose import block the documentation shows, so each keeps a file of its own |
+| `readme/typed.go`, `readme/queue.go`, `readme/websocket.go`, `readme/quic.go` | snippets whose import block the documentation shows, so each keeps a file of its own |
 | `readme/quickstart/main.go` | the quick start, a program of its own |
 | `readme/readme_test.go` | `TestREADMESnippets` |

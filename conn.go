@@ -28,6 +28,10 @@ import (
 type connState struct {
 	clk  clock.Clock
 	conn transport.Conn
+	// out writes packets to conn under wmu: in one writev on a TCP or
+	// Unix socket, and gathered into one Write per packet or batch on a
+	// connection without vectored writes.
+	out *packetWriter
 	// connectedAt is when the CONNACK arrived; the supervisor compares
 	// how long the connection lasted with its reconnect delay.
 	connectedAt time.Time
@@ -90,14 +94,11 @@ type connState struct {
 	// and UNSUBSCRIBEs it re-issues; every PUBLISH made on it waits for
 	// that, so a broker that kept no session has the subscriptions
 	// before it gets any message.
-	resumed chan struct{}
-	// writerDone is closed once the writer goroutine has exited and
-	// answered every request it took.
-	writerDone chan struct{}
-	dyingOnce  sync.Once
-	done       chan struct{}
-	doneOnce   sync.Once
-	wg         sync.WaitGroup
+	resumed   chan struct{}
+	dyingOnce sync.Once
+	done      chan struct{}
+	doneOnce  sync.Once
+	wg        sync.WaitGroup
 
 	// reads counts packets read on this connection; the keep-alive
 	// treats any packet read after a PINGREQ as the broker's answer.
@@ -238,28 +239,39 @@ func (cs *connState) queue(ctx context.Context, req writeReq, block bool) error 
 }
 
 func (cs *connState) send(ctx context.Context, req writeReq, block bool) error {
-	if !block {
+	// The span's end is left out: it ends the connection too, and a
+	// channel every sender shares would be one more lock for each to take.
+	if block {
 		select {
 		case cs.writeQueue <- req:
 			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-cs.dying:
-			return ErrNotConnected
-		case <-cs.life.shutdown:
-			return cs.life.closedErr()
-		default:
-			return ErrWriteQueueFull
+			return cs.notConnected()
 		}
 	}
 	select {
 	case cs.writeQueue <- req:
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-cs.dying:
-		return ErrNotConnected
-	case <-cs.life.shutdown:
-		return cs.life.closedErr()
+	default:
 	}
+	select {
+	case <-cs.dying:
+		return cs.notConnected()
+	default:
+		return ErrWriteQueueFull
+	}
+}
+
+// notConnected is the error for a request the connection did not take:
+// what the span's end gives the calls it cuts short, once it has ended,
+// and otherwise ErrNotConnected.
+func (cs *connState) notConnected() error {
+	if err := cs.life.endedErr(); err != nil {
+		return err
+	}
+	return ErrNotConnected
 }
 
 // closeQueue stops admitting requests; queue fails with ErrNotConnected
@@ -393,7 +405,7 @@ const writeSlice = 20 * time.Millisecond
 // ends the connection.
 func (cs *connState) writeDirect(ctx context.Context, bufs *net.Buffers, must bool) (started bool, err error) {
 	if ctx.Done() == nil {
-		_, err = bufs.WriteTo(cs.conn)
+		_, err = cs.out.WriteBuffers(bufs)
 		return cs.wrote(err)
 	}
 	if err = ctx.Err(); err != nil && !must {
@@ -406,7 +418,7 @@ func (cs *connState) writeDirect(ctx context.Context, bufs *net.Buffers, must bo
 			deadline = d
 		}
 		_ = cs.conn.SetWriteDeadline(deadline)
-		n, werr := bufs.WriteTo(cs.conn)
+		n, werr := cs.out.WriteBuffers(bufs)
 		written += n
 		if werr == nil || !errors.Is(werr, os.ErrDeadlineExceeded) {
 			_ = cs.conn.SetWriteDeadline(time.Time{})
@@ -490,12 +502,24 @@ func supportsDirectWrites(conn transport.Conn) bool {
 
 var _ inflight.Link = (*connState)(nil)
 
-// signalDown marks this connection as dying. Idempotent.
+// signalDown marks this connection as dying and closes it. Idempotent.
 func (cs *connState) signalDown() {
+	cs.down(transport.Conn.Close)
+}
+
+// abortDown is signalDown over a broker protocol violation with reason:
+// the connection ends through transport.Abort.
+func (cs *connState) abortDown(reason wire.ReasonCode) {
+	cs.down(func(conn transport.Conn) error { return transport.Abort(conn, byte(reason)) })
+}
+
+// down marks this connection as dying and ends it with end; the first
+// call wins.
+func (cs *connState) down(end func(transport.Conn) error) {
 	cs.dyingOnce.Do(func() {
 		close(cs.dying)
 		if cs.conn != nil {
-			_ = cs.conn.Close()
+			_ = end(cs.conn)
 		}
 	})
 }
@@ -580,6 +604,7 @@ func (c *Client) dispatch(cs *connState, pkt wire.Packet) {
 		info := disconnectInfoOf(p)
 		cs.serverDisconnect.Store(&info)
 		c.cfg.Logger.Warn("mqttv5: broker DISCONNECT", slog.Int("reason", int(p.ReasonCode)))
+		transport.ObserveDisconnect(cs.conn, byte(p.ReasonCode))
 		pkt.Release()
 		cs.signalDown()
 	default:
@@ -788,15 +813,15 @@ func (c *Client) resolveTopicAlias(cs *connState, pub *wire.Publish) *ProtocolEr
 }
 
 // protocolViolation handles a broker packet that breaks MQTT v5:
-// DISCONNECT with the error's reason code, then close. The supervisor
-// reconnects.
+// DISCONNECT with the error's reason code, then transport.Abort. The
+// supervisor reconnects.
 func (c *Client) protocolViolation(cs *connState, perr *ProtocolError) {
 	c.stats.addProtocolError()
 	c.cfg.Logger.Error("mqttv5: broker protocol violation; disconnecting",
 		slog.String("packet", perr.Packet.String()),
 		slog.Int("reason", int(perr.Reason)),
 		slog.String("detail", perr.Detail))
-	c.writeDisconnectAndClose(cs, wire.DisconnectOpts{ReasonCode: perr.Reason})
+	c.writeDisconnectAndAbort(cs, wire.DisconnectOpts{ReasonCode: perr.Reason})
 }
 
 // handlePubResp routes PUBACK/PUBREC/PUBREL/PUBCOMP to the session
@@ -847,12 +872,13 @@ func writeBytes(b []byte) writeFn {
 // A mark lets the writer send QoS 1/2 PUBLISH packets held by the
 // session engine up to that sequence number. Queuing the mark, rather
 // than writing the packet directly, keeps a QoS 1/2 publish behind any
-// write its caller queued before it.
+// write its caller queued before it. A mark is never answered: its
+// caller waits for the broker's acknowledgement instead.
 type writeReq struct {
 	fn   writeFn
 	pkt  *[]byte // pre-encoded packet; writer releases after Write
 	mark uint64
-	done chan<- error // nil for fire-and-forget
+	done chan<- error // nil for fire-and-forget, and for a mark
 }
 
 // writeBatchHardCap caps any user-supplied WithWriteBatch(n) to avoid
@@ -862,7 +888,7 @@ type writeReq struct {
 const writeBatchHardCap = 64
 
 // writeBatch accumulates pre-encoded packets to coalesce into one
-// net.Buffers.WriteTo (= one writev syscall on *net.TCPConn). Lives
+// write (see packetWriter: one writev on a TCP socket). Lives
 // on the writer goroutine's stack frame and reuses the same backing
 // arrays across batches — zero alloc per batch. cap is set at
 // construction time from Config.WriteBatchMax (clamped to
@@ -898,7 +924,7 @@ func (b *writeBatch) add(req writeReq) {
 	b.n++
 }
 
-// flush coalesces every queued pkt into one writev. Updates
+// flush coalesces every queued pkt into one write. Updates
 // lastWriteUnixNano on success, releases every buffer, and signals
 // every done channel (with err for failures, nil for success). Resets
 // the batch to empty.
@@ -919,7 +945,7 @@ func (b *writeBatch) flush(cs *connState) error {
 		// WriteTo advances the slice it writes from; keep the full one so
 		// the next batch reuses its array.
 		b.bufs = full
-		_, err = b.bufs.WriteTo(cs.conn)
+		_, err = cs.out.WriteBuffers(&b.bufs)
 		clear(full)
 		b.bufs = full[:0]
 	}
@@ -949,13 +975,13 @@ func (b *writeBatch) flush(cs *connState) error {
 // answers the requests left in it with ErrNotConnected, so callers
 // waiting on req.done never orphan.
 //
-// Batching: pkt-mode reqs coalesce into one writev when WithWriteBatch
+// Batching: pkt-mode reqs coalesce into one write when WithWriteBatch
 // is set; engine packets (QoS 1/2 PUBLISH, PUBREL and the PUBACK /
 // PUBREC / PUBCOMP owed to the broker) always go out as one batch per
-// collection. Channel FIFO order is preserved across all request kinds.
+// collection, and a run of queued marks collects once. Channel FIFO
+// order is preserved across all request kinds.
 func (c *Client) writeLoop(cs *connState) {
 	defer cs.wg.Done()
-	defer close(cs.writerDone)
 	defer drainWriteQueue(cs)
 	batch := newWriteBatch(c.cfg.WriteBatchMax)
 	for {
@@ -990,48 +1016,105 @@ func (c *Client) writeLoop(cs *connState) {
 	}
 }
 
-// processWrite handles one writeReq received from the queue; the caller
-// holds cs.wmu. For pkt-mode reqs it drains any further pkt-mode reqs
-// into the batch (bounded by writeBatchMax) and flushes once via writev.
-// For fn-mode reqs it flushes any pending batch first, then invokes
-// req.fn directly. Every request taken from the queue is uncounted once
-// it is written or failed.
+// processWrite handles one writeReq received from the queue, and the
+// requests queued behind it that go out with it; the caller holds
+// cs.wmu. A run of pkt-mode requests goes out in one write, up to the
+// batch's capacity. A run of marks releases the session engine's
+// publishes up to the highest of them, which go out together rather than
+// one write per mark. The request that ends a run is handled next, so
+// queue order holds. Every request taken from the queue is uncounted
+// once it is written or failed.
 func (c *Client) processWrite(cs *connState, batch *writeBatch, req writeReq) error {
 	for {
-		if req.mark != 0 || req.fn != nil {
-			if err := batch.flush(cs); err != nil {
-				c.failRequest(cs, req, err)
-				return err
-			}
+		var (
+			next writeReq
+			more bool
+			err  error
+		)
+		switch {
+		case req.pkt != nil:
+			next, more, err = writePackets(cs, batch, req)
+		case req.mark != 0:
+			next, more, err = writeMarks(cs, req)
+		default:
 			return c.writeOne(cs, req)
 		}
-		batch.add(req)
-		if batch.n == batch.cap {
-			return batch.flush(cs)
-		}
-		select {
-		case more, ok := <-cs.writeQueue:
-			if !ok {
-				return batch.flush(cs)
+		if err != nil {
+			if more {
+				c.failRequest(cs, next, err)
 			}
-			req = more
-		default:
-			return batch.flush(cs)
+			return err
 		}
+		if !more {
+			return nil
+		}
+		req = next
 	}
 }
 
-// writeOne writes a mark (the engine's packets up to it) or a fn-mode
-// request and answers it.
-func (c *Client) writeOne(cs *connState, req writeReq) error {
-	var err error
-	if req.mark != 0 {
-		_, err = cs.flushEngine(context.Background(), req.mark)
-	} else {
-		_, err = req.fn(cs.conn)
-		if err == nil {
-			cs.lastWriteUnixNano.Store(cs.clk.Now().UnixNano())
+// writePackets writes req and the pkt-mode requests queued behind it, up
+// to the batch's capacity, in one write. more reports next: a request
+// of another kind, taken from the queue, that ended the run.
+func writePackets(cs *connState, batch *writeBatch, req writeReq) (next writeReq, more bool, err error) {
+	batch.add(req)
+	for batch.n < batch.cap {
+		r, ok := cs.dequeue()
+		if !ok {
+			break
 		}
+		if r.pkt == nil {
+			next, more = r, true
+			break
+		}
+		batch.add(r)
+	}
+	return next, more, batch.flush(cs)
+}
+
+// maxMarkRun bounds the marks writeMarks takes before it writes: one
+// Collect's worth, as each mark usually releases one publish.
+const maxMarkRun = 64
+
+// writeMarks writes the session engine's publishes up to req's mark and
+// the marks queued right behind it. Each mark releases its caller's
+// publish once the writes queued ahead of it are written; releasing up
+// to the highest mark of a run keeps that, as only marks lie between
+// them. more reports next: a request of another kind, taken from the
+// queue, that ended the run.
+func writeMarks(cs *connState, req writeReq) (next writeReq, more bool, err error) {
+	upTo, n := req.mark, int64(1)
+	for n < maxMarkRun {
+		r, ok := cs.dequeue()
+		if !ok {
+			break
+		}
+		if r.mark == 0 {
+			next, more = r, true
+			break
+		}
+		upTo = max(upTo, r.mark)
+		n++
+	}
+	_, err = cs.flushEngine(context.Background(), upTo)
+	cs.queued.Add(-n)
+	return next, more, err
+}
+
+// dequeue takes the next request from the queue without waiting.
+func (cs *connState) dequeue() (writeReq, bool) {
+	select {
+	case req, ok := <-cs.writeQueue:
+		return req, ok
+	default:
+		return writeReq{}, false
+	}
+}
+
+// writeOne writes a fn-mode request and answers it.
+func (c *Client) writeOne(cs *connState, req writeReq) error {
+	_, err := cs.out.WritePacket(req.fn)
+	if err == nil {
+		cs.lastWriteUnixNano.Store(cs.clk.Now().UnixNano())
 	}
 	cs.queued.Add(-1)
 	if req.done != nil {
@@ -1091,27 +1174,23 @@ func (c *Client) enqueueFireAndForget(cs *connState, fn writeFn) {
 }
 
 // awaitWrite waits for the writer's answer to a queued request: nil once
-// it was written, ErrNotConnected when it never will be, or ctx's error,
-// in which case it may still be written.
+// it was written, otherwise why it was not (what the span's end gives
+// calls it cuts short, when it has ended), or ctx's error, in which case
+// it may still be written. The writer answers every request it admits,
+// also as it exits, which it does once the connection dies; so the wait
+// needs no channel for the connection's or the span's end, which every
+// waiter would share.
 func awaitWrite(ctx context.Context, cs *connState, done <-chan error) error {
 	select {
 	case err := <-done:
+		if err != nil {
+			if ended := cs.life.endedErr(); ended != nil {
+				return ended
+			}
+		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-cs.dying:
-		// The writer answers every request it takes, also when it
-		// drains the queue on exit; once it is gone, no answer means
-		// the packet was never written.
-		<-cs.writerDone
-		select {
-		case err := <-done:
-			return err
-		default:
-			return ErrNotConnected
-		}
-	case <-cs.life.shutdown:
-		return cs.life.closedErr()
 	}
 }
 

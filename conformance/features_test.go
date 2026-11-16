@@ -5,7 +5,6 @@ package conformance
 import (
 	"bytes"
 	"context"
-	"net"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -78,7 +77,7 @@ func TestReceiveMaximumHonoured(t *testing.T) {
 func connectTo(t *testing.T, url string, opts ...mqttv5.Option) *mqttv5.Client {
 	t.Helper()
 	all := append([]mqttv5.Option{
-		mqttv5.WithBroker(url),
+		withBroker(url),
 		mqttv5.WithClientID(t.Name() + "-" + randSuffix()),
 		mqttv5.WithConnectTimeout(5 * time.Second),
 	}, opts...)
@@ -430,20 +429,27 @@ func TestSubscribe_RetainHandling(t *testing.T) {
 // This mirrors the existing fake-broker tests, which already drive raw
 // connections via wire.NewDecoder(conn).ReadPacket() (see auth_test.go).
 type rawSub struct {
-	conn net.Conn
+	conn transport.Conn
 	dec  *wire.Decoder
 	// subIDsAvail is the broker's CONNACK SubscriptionIdentifiersAvailable
 	// (§3.2.2.3.12): true unless the broker explicitly advertised 0.
 	subIDsAvail bool
 }
 
-// dialRawSub opens a raw TCP MQTT v5 connection, sends CONNECT, and
-// reads CONNACK — capturing the SubscriptionIdentifiersAvailable
-// capability. The caller drives SUBSCRIBE / acks directly.
+// dialRawSub opens a raw MQTT v5 connection, over the broker's
+// transport, sends CONNECT, and reads CONNACK — capturing the
+// SubscriptionIdentifiersAvailable capability. The caller drives
+// SUBSCRIBE / acks directly.
 func dialRawSub(t *testing.T) *rawSub {
 	t.Helper()
 
-	conn, err := net.DialTimeout("tcp", stripScheme(brokerURL()), 5*time.Second)
+	u, err := url.Parse(brokerURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := brokerDial(brokerURL())(ctx, u)
 	if err != nil {
 		t.Fatalf("dial broker %s: %v", brokerURL(), err)
 	}
@@ -700,14 +706,11 @@ type connWatcher struct {
 	conn transport.Conn
 }
 
-// dialFunc returns a transport.DialFunc that dials the real broker via
-// the default TCP/TLS path and records the live connection. It matches
-// the transport.DialFunc signature exactly:
-//
-//	func(ctx context.Context, brokerURL *url.URL) (transport.Conn, error)
+// dialFunc returns a transport.DialFunc that dials the real broker over
+// its transport and records the live connection.
 func (w *connWatcher) dialFunc() transport.DialFunc {
 	return func(ctx context.Context, u *url.URL) (transport.Conn, error) {
-		c, err := transport.Dial(ctx, u.String(), transport.DialOpts{})
+		c, err := brokerDial(u.String())(ctx, u)
 		if err != nil {
 			return nil, err
 		}
@@ -732,7 +735,7 @@ func (w *connWatcher) closeConn() bool {
 }
 
 // newWillClient builds and connects a client carrying the supplied
-// will, wired so that (a) its raw net.Conn is captured for an
+// will, wired so that (a) its transport.Conn is captured for an
 // ungraceful close and (b) its supervisor does NOT reconnect — a
 // reconnect would re-arm the will and race the observer. The returned
 // client is NOT registered for a graceful Disconnect cleanup; the
@@ -747,7 +750,7 @@ func newWillClient(t *testing.T, will *mqttv5.WillOptions, sessionExpiry uint32)
 
 	w := &connWatcher{}
 	cli, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
+		withBrokerDial(brokerURL(), w.dialFunc()),
 		mqttv5.WithClientID(t.Name()+"-will-"+randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5*time.Second),
@@ -756,7 +759,6 @@ func newWillClient(t *testing.T, will *mqttv5.WillOptions, sessionExpiry uint32)
 		// close is terminal — no reconnect, no re-armed will.
 		mqttv5.WithOnConnectionDown(func() bool { return false }),
 		mqttv5.WithWill(will),
-		mqttv5.WithDialFunc(w.dialFunc()),
 	)
 	if err != nil {
 		t.Fatalf("New will client: %v", err)

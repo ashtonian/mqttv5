@@ -195,6 +195,60 @@ func stalledBroker(t *testing.T) (url string, accepted <-chan net.Conn) {
 	return "mqtt://" + ln.Addr().String(), ch
 }
 
+// Disconnect behind a write stalled by a broker that stopped reading
+// gives up on its DISCONNECT after the flush timeout, and a QoS 0
+// publish waiting for that write returns ErrClosed: closing the
+// connection ends the write, and the writer answers.
+func TestDisconnectEndsAWaitForAWrite(t *testing.T) {
+	brokerURL, accepted := stalledBroker(t)
+	dial := func(ctx context.Context, u *url.URL) (transport.Conn, error) {
+		nc, err := (&net.Dialer{}).DialContext(ctx, "tcp", u.Host)
+		if err != nil {
+			return nil, err
+		}
+		return opaqueConn{nc}, nil
+	}
+	cli, err := New(WithBroker(brokerURL), WithDialFunc(dial), WithClientID("stalled"), WithLogger(quietLogger()),
+		WithoutKeepAlive(), WithPublishMode(PublishWaitForFlush), WithDisconnectFlushTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-accepted
+	cs := cli.cur.Load()
+
+	// Larger than the socket buffers on both ends, so the write blocks
+	// while the broker does not read.
+	payload := bytes.Repeat([]byte{'a'}, 32<<20)
+	returned := make(chan error, 1)
+	go func() { returned <- cli.Publish(context.Background(), PublishOptions{Topic: "big", Payload: payload}) }()
+	for deadline := time.Now().Add(3 * time.Second); cs.queued.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the publish never reached the writer")
+		}
+	}
+	disconnected := make(chan error, 1)
+	go func() { disconnected <- cli.Disconnect(context.Background()) }()
+	select {
+	case err := <-disconnected:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect waited past its flush timeout for a DISCONNECT stalled behind a write")
+	}
+	select {
+	case err := <-returned:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("publish waiting for its write = %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect left the publish waiting for its write")
+	}
+}
+
 // A Publish writing on its own goroutine returns when ctx ends, although
 // the broker has stopped reading; the writer goroutine finishes the
 // interrupted packet, so the stream stays whole and the next packet
@@ -347,7 +401,7 @@ func TestTeardownAnswersEveryQueuedRequest(t *testing.T) {
 	stop()
 	wg.Wait()
 	for _, cs := range dead[:len(dead)-1] {
-		<-cs.writerDone
+		<-cs.done
 		if n := cs.queued.Load(); n != 0 {
 			t.Fatalf("a closed connection still counts %d queued writes", n)
 		}
@@ -441,7 +495,7 @@ func TestClosedWriteQueueAdmitsNothing(t *testing.T) {
 		t.Fatal("not connected")
 	}
 	drop()
-	<-cs.writerDone
+	<-cs.done
 	done := make(chan error, 1)
 	if err := cs.queue(context.Background(), writeReq{fn: writeBytes(nil), done: done}, true); !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("queue after the writer exited: %v", err)

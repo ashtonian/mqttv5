@@ -2,9 +2,9 @@
 
 [Documentation](README.md) · [API reference](https://pkg.go.dev/github.com/ashtonian/mqttv5) · [Examples](../examples/README.md)
 
-- **TLS.** `mqtts://`, `ssl://`, `tls://` and `wss://` verify the
-  broker against the system roots by default; `WithTLSConfig` supplies
-  CAs, client certificates or a server name. Never set
+- **TLS.** `mqtts://`, `ssl://`, `tls://`, `wss://` and `mqtt-quic://`
+  verify the broker against the system roots by default; `WithTLSConfig`
+  supplies CAs, client certificates or a server name. Never set
   `InsecureSkipVerify` outside tests. See
   [Certificate management](#certificate-management).
 - **Credentials.** `WithCredentials` and `WithConnectPacketBuilder`
@@ -101,7 +101,7 @@ both ends during reconnect storms. It applies to the config of
 `WithTLSConfig` or `WithTLSConfigFunc` when that config sets no
 `ClientSessionCache` and presents no client certificate; a config
 returned fresh on each dial resumes too. `ws.DialFunc` does the same
-for `wss://`.
+for `wss://`, and `quic.DialFunc` for `mqtt-quic://`.
 
 - **Client certificates.** A resumed session does not present the
   client certificate again ([RFC 8446, section

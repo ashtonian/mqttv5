@@ -8,7 +8,7 @@ Outbound, a publish takes the shortest path the connection allows:
 flowchart LR
     pub["Publish"] -- "QoS 1/2: packet ID,<br/>send quota, record" --> engine["session engine"] --> store[("session.Store")]
     pub -- "idle TCP or Unix socket" --> direct["caller's goroutine,<br/>direct write"] --> sock(("socket"))
-    pub -- "busy writer, TLS, WebSocket,<br/>fire-and-forget QoS 0" --> writer["writer goroutine<br/>queue, writev batches"] --> sock
+    pub -- "busy writer, TLS, WebSocket, QUIC,<br/>fire-and-forget QoS 0" --> writer["writer goroutine<br/>queue, batched writes"] --> sock
 ```
 
 Inbound, acknowledgements leave in arrival order, from the read loop
@@ -29,12 +29,18 @@ queued: a QoS 0 header and its payload in one `writev`, without copying
 the payload; a QoS 1/2 publish the packet the session keeps for
 retransmission. If the caller's ctx ends mid-write, a deadline stops
 the write and the writer goroutine sends the rest before anything else.
-Otherwise — TLS and WebSocket connections, a busy writer, and
+Otherwise — TLS, WebSocket and QUIC connections, a busy writer, and
 fire-and-forget QoS 0 — one writer goroutine per connection drains an
-MPSC channel of encoded packets to the socket, coalescing queued
-packets into one `writev` when `WithWriteBatch` is set; a write lock
+MPSC channel of encoded packets to the socket. The QoS 1/2 publishes
+queued behind a write go out together in one write, and queued QoS 0
+packets do when `WithWriteBatch` is set; a write lock
 keeps the two paths from interleaving, and a publish never overtakes a
-packet its caller queued earlier. Before the read loop waits for more
+packet its caller queued earlier. A TCP or Unix socket takes a batch in
+one `writev`. TLS, WebSocket and QUIC have no vectored write, and each
+write is a TLS record, a WebSocket frame or a stream write of its own,
+so the client copies a packet's header and body, or a batch, into one
+write of up to 16 KiB; a larger payload goes out on its own, uncopied.
+Before the read loop waits for more
 input, it writes the acknowledgements and PUBRELs it has made ready
 itself — on an idle TCP or Unix connection, on unix systems — as far as
 the socket takes them without waiting; the writer goroutine sends the
@@ -96,7 +102,7 @@ control queue that survives reconnects.
 | `session`, `session/storetest` | `Store` interface, memory store, conformance tests for stores |
 | `queue/queuetest` | conformance tests for `PublisherQueue` implementations |
 | `wire` | MQTT v5 codec (unstable API) |
-| `transport`, `transport/ws` | TCP/TLS dialing and the TLS config each dial uses (server name, session resumption); WebSocket |
+| `transport`, `transport/ws`, `transport/quic` | TCP/TLS dialing, the TLS config each dial uses (server name, session resumption) and the optional interfaces a transport implements (`Aborter`, `DisconnectObserver`); WebSocket; QUIC |
 | `tlsrevocation`, `tlsrevocation/storetest` | OCSP and CRL revocation checks of the broker's chain, for `WithTLSVerifier`; conformance tests for its `Store` |
 | `store/file`, `queue/file` | durable session store and publish queue |
 | `codec/json`, `codec/msgpack` | `Encoding` implementations |

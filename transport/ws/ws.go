@@ -30,11 +30,13 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gws "github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 
+	"github.com/ashtonian/mqttv5/internal/clock"
 	"github.com/ashtonian/mqttv5/transport"
 )
 
@@ -42,9 +44,13 @@ import (
 // used when DialOpts.HandshakeTimeout is zero.
 const DefaultHandshakeTimeout = 10 * time.Second
 
-// DefaultCloseFrameTimeout bounds the Close frame Conn.Close sends, when
-// DialOpts.CloseFrameTimeout is zero.
+// DefaultCloseFrameTimeout bounds the closing handshake Conn.Close
+// starts, when DialOpts.CloseFrameTimeout is zero.
 const DefaultCloseFrameTimeout = time.Second
+
+// readBufferSize is the read window over the socket: frame headers and
+// small frames come out of it, not one read each.
+const readBufferSize = 4096
 
 // DialOpts customises a Dial call. Zero value is valid.
 type DialOpts struct {
@@ -72,13 +78,17 @@ type DialOpts struct {
 	// DefaultHandshakeTimeout.
 	HandshakeTimeout time.Duration
 
-	// CloseFrameTimeout bounds the Close frame sent when the connection
-	// is closed. Defaults to DefaultCloseFrameTimeout.
+	// CloseFrameTimeout bounds the closing handshake: writing the Close
+	// frame, then waiting for the broker's before the TCP connection is
+	// closed. Defaults to DefaultCloseFrameTimeout.
 	CloseFrameTimeout time.Duration
 
 	// NetDial overrides the underlying TCP dial. Use this to inject a
 	// SOCKS / HTTP CONNECT proxy or a custom net.Dialer.
 	NetDial func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// clock paces the closing handshake; nil is the wall clock.
+	clock clock.Clock
 }
 
 // DialFunc binds opts and returns a [transport.DialFunc] that's
@@ -148,15 +158,25 @@ func dial(ctx context.Context, brokerURL *url.URL, opts DialOpts, sessions tls.C
 		dialer.Header = gws.HandshakeHeaderHTTP(opts.HTTPHeaders)
 	}
 
-	conn, buffered, _, err := dialer.Dial(ctx, brokerURL.String())
+	conn, buffered, hs, err := dialer.Dial(ctx, brokerURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("mqttv5/transport/ws: dial %s: %w", brokerURL.String(), err)
+	}
+	// The dialer has checked that a selected subprotocol is one offered;
+	// one must be selected [MQTT-6.0.0-4].
+	if hs.Protocol == "" {
+		_ = conn.Close()
+		return nil, fmt.Errorf("mqttv5/transport/ws: dial %s: %w", brokerURL.String(), ErrNoSubprotocol)
 	}
 	closeTimeout := opts.CloseFrameTimeout
 	if closeTimeout == 0 {
 		closeTimeout = DefaultCloseFrameTimeout
 	}
-	return newConn(conn, buffered, closeTimeout), nil
+	clk := opts.clock
+	if clk == nil {
+		clk = clock.Real{}
+	}
+	return newConn(conn, buffered, closeTimeout, clk), nil
 }
 
 // tlsConfig resolves the TLS config for one dial of brokerURL.
@@ -186,25 +206,60 @@ var ErrConflictingTLSConfig = errors.New("mqttv5/transport/ws: DialOpts sets bot
 
 // ErrTextFrame reports a WebSocket text frame from the broker. MQTT
 // travels only in binary frames; any other data frame must close the
-// connection [MQTT-6.0.0-1].
+// connection [MQTT-6.0.0-1], which the client does with status 1003.
 var ErrTextFrame = errors.New("mqttv5/transport/ws: text frame from the broker")
+
+// ErrNoSubprotocol is returned by [Dial] when the broker's handshake
+// response selects no WebSocket subprotocol: an MQTT broker selects
+// "mqtt" [MQTT-6.0.0-4], so the endpoint is not one.
+var ErrNoSubprotocol = errors.New("mqttv5/transport/ws: the broker selected no WebSocket subprotocol")
+
+// CloseError is the status of a Close frame the broker ended the
+// connection with, when that is not Normal Closure (1000) or no status.
+// Read returns io.EOF for those.
+type CloseError struct {
+	Code   uint16
+	Reason string
+}
+
+func (e *CloseError) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("mqttv5/transport/ws: broker closed the WebSocket with status %d", e.Code)
+	}
+	return fmt.Sprintf("mqttv5/transport/ws: broker closed the WebSocket with status %d: %s", e.Code, e.Reason)
+}
 
 // Conn wraps a websocket connection so every Write is one WebSocket
 // frame holding one MQTT control packet. It is created by Dial; callers
 // should treat the returned transport.Conn as opaque.
 type Conn struct {
-	raw     net.Conn
-	reader  *wsutil.Reader
-	control wsutil.FrameHandlerFunc
+	raw    net.Conn
+	reader *wsutil.Reader
+
+	// rmu serialises Read with the wait for the broker's Close after
+	// Close: both read frames.
+	rmu sync.Mutex
 
 	// wmu keeps frames whole: the client's writer and the pongs and
-	// close replies Read sends write to the same connection.
-	wmu sync.Mutex
+	// Close frames Read sends write to the same connection. closeSent,
+	// which it guards, ends writing: no frame follows a Close (RFC 6455
+	// §5.5.1).
+	wmu       sync.Mutex
+	closeSent bool
+
+	// closing is set by Close or Abort; peerClosed once the broker's
+	// Close frame has arrived.
+	closing    atomic.Bool
+	peerClosed atomic.Bool
 
 	closeTimeout time.Duration
+	clock        clock.Clock
 }
 
-var _ transport.ConnectionStater = (*Conn)(nil)
+var (
+	_ transport.ConnectionStater = (*Conn)(nil)
+	_ transport.Aborter          = (*Conn)(nil)
+)
 
 // ConnectionState returns the TLS state of a wss:// connection. For
 // ws:// it returns the zero state, which [transport.TLSState] reports as
@@ -219,15 +274,14 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 // newConn wraps raw. buffered, when not nil, holds frames the server
 // sent right behind its handshake response, read along with it; they
 // come first.
-func newConn(raw net.Conn, buffered *bufio.Reader, closeTimeout time.Duration) *Conn {
-	c := &Conn{raw: raw, closeTimeout: closeTimeout}
-	c.control = wsutil.ControlFrameHandler(frameWriter{c}, gws.StateClientSide)
+func newConn(raw net.Conn, buffered *bufio.Reader, closeTimeout time.Duration, clk clock.Clock) *Conn {
+	c := &Conn{raw: raw, closeTimeout: closeTimeout, clock: clk}
 	src := io.Reader(raw)
 	if buffered != nil {
 		src = io.MultiReader(buffered, raw)
 	}
 	c.reader = &wsutil.Reader{
-		Source: src,
+		Source: bufio.NewReaderSize(src, readBufferSize),
 		State:  gws.StateClientSide,
 		// Control frames between the fragments of a message.
 		OnIntermediate: c.control,
@@ -236,21 +290,37 @@ func newConn(raw net.Conn, buffered *bufio.Reader, closeTimeout time.Duration) *
 }
 
 // frameWriter writes what the control-frame handler produces — one
-// Write per frame — under the connection's write lock.
+// Write per frame — under the connection's write lock, and nothing once
+// a Close frame has gone.
 type frameWriter struct{ c *Conn }
 
 func (w frameWriter) Write(p []byte) (int, error) {
 	w.c.wmu.Lock()
 	defer w.c.wmu.Unlock()
+	if w.c.closeSent {
+		return len(p), nil
+	}
 	return w.c.raw.Write(p)
 }
 
 // Read returns the next available bytes from the MQTT byte stream.
 // Each underlying WebSocket binary frame is one MQTT control packet,
 // but the MQTT decoder reads field-at-a-time — so Read may be called
-// many times per frame. Between frames it answers Ping with Pong and
-// Close with Close (then reports io.EOF); a text frame is an error.
+// many times per frame. Between frames it answers Ping with Pong and a
+// Close with Close, then reports io.EOF, or a [*CloseError] when the
+// broker's status is not Normal Closure. A text frame is
+// [ErrTextFrame]. After Close or Abort, Read reports net.ErrClosed.
 func (c *Conn) Read(p []byte) (int, error) {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	if c.closing.Load() {
+		return 0, net.ErrClosed
+	}
+	return c.read(p)
+}
+
+// read is Read under rmu.
+func (c *Conn) read(p []byte) (int, error) {
 	for {
 		n, err := c.reader.Read(p)
 		if n > 0 {
@@ -264,21 +334,79 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 		h, err := c.reader.NextFrame()
 		if err != nil {
+			if perr, ok := errors.AsType[gws.ProtocolError](err); ok {
+				c.sendClose(gws.StatusProtocolError, perr.Error())
+			}
 			return 0, err
 		}
 		switch {
 		case h.OpCode.IsControl():
 			if err := c.control(h, c.reader); err != nil {
-				var closed wsutil.ClosedError
-				if errors.As(err, &closed) {
-					return 0, io.EOF
-				}
 				return 0, err
 			}
 		case h.OpCode == gws.OpText:
+			c.sendClose(gws.StatusUnsupportedData, "MQTT travels in binary frames")
 			return 0, ErrTextFrame
 		}
 	}
+}
+
+// control handles the control frame h, whose payload r holds.
+func (c *Conn) control(h gws.Header, r io.Reader) error {
+	if h.OpCode == gws.OpClose {
+		return c.brokerClose(h, r)
+	}
+	return wsutil.ControlHandler{Src: r, Dst: frameWriter{c}, State: gws.StateClientSide}.Handle(h)
+}
+
+// brokerClose handles the broker's Close frame: it answers one the
+// client did not start, echoing its status (RFC 6455 §5.5.1), and ends
+// the stream.
+func (c *Conn) brokerClose(h gws.Header, r io.Reader) error {
+	payload := make([]byte, h.Length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return err
+	}
+	c.peerClosed.Store(true)
+	if len(payload) == 0 {
+		c.sendClose(gws.StatusNoStatusRcvd, "")
+		return io.EOF
+	}
+	code, reason := gws.ParseCloseFrameData(payload)
+	if err := gws.CheckCloseFrameData(code, reason); err != nil {
+		c.sendClose(gws.StatusProtocolError, err.Error())
+		return fmt.Errorf("mqttv5/transport/ws: the broker's Close frame: %w", err)
+	}
+	c.sendClose(code, "")
+	if code == gws.StatusNormalClosure {
+		return io.EOF
+	}
+	return &CloseError{Code: uint16(code), Reason: reason}
+}
+
+// sendClose writes a Close frame with code, unless one has gone.
+func (c *Conn) sendClose(code gws.StatusCode, reason string) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.writeCloseLocked(code, reason)
+}
+
+// writeCloseLocked is sendClose under wmu. StatusNoStatusRcvd sends a
+// Close without a body. reason must fit a control frame (123 bytes).
+func (c *Conn) writeCloseLocked(code gws.StatusCode, reason string) {
+	if c.closeSent {
+		return
+	}
+	c.closeSent = true
+	var body []byte
+	if code != gws.StatusNoStatusRcvd {
+		body = gws.NewCloseFrameBody(code, reason)
+	}
+	frame, err := gws.CompileFrame(gws.MaskFrameInPlace(gws.NewCloseFrame(body)))
+	if err != nil {
+		return
+	}
+	_, _ = c.raw.Write(frame)
 }
 
 // framePool recycles frame buffers up to maxPooledFrame bytes.
@@ -287,7 +415,8 @@ var framePool = sync.Pool{New: func() any { return new([]byte) }}
 const maxPooledFrame = 64 << 10
 
 // Write emits p as one masked WebSocket binary frame in a single write
-// to the connection. p is not modified.
+// to the connection. p is not modified. After Close or Abort, Write
+// reports net.ErrClosed.
 func (c *Conn) Write(p []byte) (int, error) {
 	h := gws.Header{Fin: true, OpCode: gws.OpBinary, Masked: true, Mask: gws.NewMask(), Length: int64(len(p))}
 	size := gws.HeaderSize(h) + len(p)
@@ -304,7 +433,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 	gws.Cipher(frame[len(frame)-len(p):], h.Mask, 0)
 
 	c.wmu.Lock()
-	_, err := c.raw.Write(frame)
+	err := net.ErrClosed
+	if !c.closeSent {
+		_, err = c.raw.Write(frame)
+	}
 	c.wmu.Unlock()
 
 	*bp = frame[:0]
@@ -317,19 +449,70 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close closes the underlying connection, first sending a Close frame
-// when no write is in progress, within DialOpts.CloseFrameTimeout. A
-// write in progress is not waited for: it may be stalled behind a peer
-// that stopped reading, and closing the connection is what ends it.
+// Close starts the closing handshake (RFC 6455 §7.1.2) and returns: it
+// sends a Close frame with Normal Closure, and the TCP connection closes
+// once the broker's Close arrives, the broker closes it, or
+// DialOpts.CloseFrameTimeout passes, whichever is first. A write in
+// progress is not waited for: it may be stalled behind a broker that
+// stopped reading, and closing the TCP connection at once is what ends
+// it.
 func (c *Conn) Close() error {
+	if !c.closing.CompareAndSwap(false, true) {
+		return net.ErrClosed
+	}
+	if !c.wmu.TryLock() {
+		return c.raw.Close()
+	}
+	_ = c.raw.SetWriteDeadline(time.Now().Add(c.closeTimeout))
+	c.writeCloseLocked(gws.StatusNormalClosure, "")
+	c.wmu.Unlock()
+	if c.peerClosed.Load() {
+		return c.raw.Close()
+	}
+	go c.awaitBrokerClose()
+	return nil
+}
+
+// awaitBrokerClose reads, discarding data frames, until the broker's
+// Close frame or the end of the connection, for at most closeTimeout;
+// then it closes the TCP connection. The broker closes its side first,
+// as RFC 6455 §7.1.1 has it, unless it is late.
+func (c *Conn) awaitBrokerClose() {
+	timer := c.clock.NewTimer(c.closeTimeout)
+	defer timer.Stop()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.rmu.Lock()
+		defer c.rmu.Unlock()
+		buf := make([]byte, 512)
+		for !c.peerClosed.Load() {
+			if _, err := c.read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-timer.C():
+		// A deadline in the past ends the read in progress, this one's or
+		// a Read that started before Close.
+		_ = c.raw.SetReadDeadline(time.Unix(1, 0))
+		<-done
+	}
+	_ = c.raw.Close()
+}
+
+// Abort ends the connection over a protocol violation, after the
+// client's DISCONNECT: a Close frame with Protocol Error (1002) naming
+// the MQTT reason code, then the TCP connection closes at once.
+func (c *Conn) Abort(reason byte) error {
+	if !c.closing.CompareAndSwap(false, true) {
+		return net.ErrClosed
+	}
 	if c.wmu.TryLock() {
 		_ = c.raw.SetWriteDeadline(time.Now().Add(c.closeTimeout))
-		_ = gws.WriteHeader(c.raw, gws.Header{
-			Fin:    true,
-			OpCode: gws.OpClose,
-			Masked: true,
-			Mask:   gws.NewMask(),
-		})
+		c.writeCloseLocked(gws.StatusProtocolError, fmt.Sprintf("MQTT reason code 0x%02X", reason))
 		c.wmu.Unlock()
 	}
 	return c.raw.Close()

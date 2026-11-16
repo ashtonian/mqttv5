@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -147,11 +148,7 @@ func decodeAll(t *testing.T, b []byte) []frame {
 // publish allocates an identifier and registers a flow.
 func (h *harness) publish(qos byte, payload string, opts ...func(*wire.PublishOpts)) *Out {
 	h.t.Helper()
-	id, err := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	po := wire.PublishOpts{Topic: "t", Payload: []byte(payload), QoS: qos, PacketID: id}
+	po := wire.PublishOpts{Topic: "t", Payload: []byte(payload), QoS: qos, PacketID: 1}
 	for _, o := range opts {
 		o(&po)
 	}
@@ -163,7 +160,7 @@ func (h *harness) publish(qos byte, payload string, opts ...func(*wire.PublishOp
 	if po.MessageExpiryInterval != nil {
 		exp = h.now.Add(time.Duration(*po.MessageExpiryInterval) * time.Second)
 	}
-	o, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: qos, Packet: pkt, ExpiresAt: exp})
+	o, _, err := h.e.Register(context.Background(), Message{QoS: qos, Packet: pkt, ExpiresAt: exp}, nil)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -608,6 +605,41 @@ func TestWithdrawOnlyUnsentFlows(t *testing.T) {
 	}
 }
 
+// Interrupt ends the waits on unfinished flows and leaves the flows to
+// go on: a later connection resends them and their acknowledgement
+// finishes them.
+func TestInterruptEndsWaitsNotFlows(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.connect(false, 0)
+	acked := h.publish(1, "acked")
+	pending := h.publish(1, "pending")
+	h.collect()
+	h.e.HandlePuback(acked.PacketID(), 0, nil)
+
+	h.e.Interrupt()
+	if err := done(t, pending); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("interrupted flow err = %v, want ErrInterrupted", err)
+	}
+	if err := done(t, acked); err != nil {
+		t.Fatalf("finished flow err = %v after Interrupt, want its outcome", err)
+	}
+	later := h.publish(1, "later")
+	notDone(t, later)
+
+	h.disconnect()
+	h.connect(true, 0)
+	want(t, h.collect(),
+		fmt.Sprintf("PUBLISH#%d+dup", pending.PacketID()),
+		fmt.Sprintf("PUBLISH#%d", later.PacketID()))
+	h.e.HandlePuback(pending.PacketID(), 0, nil)
+	if err := done(t, pending); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("err = %v once acknowledged, want the ErrInterrupted its wait ended with", err)
+	}
+	if h.e.OutboundLen() != 1 || h.e.ids.owner[pending.PacketID()] != OwnerNone {
+		t.Fatal("the acknowledged flow, or its identifier, was left behind")
+	}
+}
+
 func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 	h := newHarness(t, Config{})
 	for i := 0; i < 65535; i++ {
@@ -615,8 +647,8 @@ func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	if _, err := h.e.AllocateID(ctx, OwnerPublish, nil); !errors.Is(err, ErrIDsExhausted) {
 		t.Fatalf("err = %v", err)
 	}
@@ -629,6 +661,130 @@ func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 	id, err := h.e.AllocateID(context.Background(), OwnerSubscribe, nil)
 	if err != nil || id != 4000 {
 		t.Fatalf("after release: id %d err %v", id, err)
+	}
+}
+
+// A call waiting for an identifier gets the next one released, or one
+// of the table Restore loads.
+func TestIdentifierWaitEnds(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.e.ids = newIDTable(3)
+	for range 3 {
+		if _, err := h.e.AllocateID(context.Background(), OwnerSubscribe, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wait := func() <-chan uint16 {
+		got := make(chan uint16, 1)
+		h.whileWaitingForID(func() {
+			id, err := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+			if err != nil {
+				t.Error(err)
+			}
+			got <- id
+		})
+		return got
+	}
+
+	got := wait()
+	h.e.ReleaseID(2, OwnerSubscribe)
+	if id := <-got; id != 2 {
+		t.Fatalf("after a release: id %d, want 2", id)
+	}
+
+	got = wait()
+	if err := h.e.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if id := <-got; id != 1 {
+		t.Fatalf("after Restore: id %d, want 1", id)
+	}
+	h.e.mu.Lock()
+	defer h.e.mu.Unlock()
+	if h.e.ids.used != 1 {
+		t.Fatalf("%d identifiers counted in use after Restore, want 1", h.e.ids.used)
+	}
+}
+
+// whileWaitingForID runs fn on its own goroutine and returns once fn
+// waits for a packet identifier.
+func (h *harness) whileWaitingForID(fn func()) {
+	go fn()
+	for {
+		h.e.mu.Lock()
+		waiting := h.e.ids.freed != nil
+		h.e.mu.Unlock()
+		if waiting {
+			return
+		}
+		runtime.Gosched()
+	}
+}
+
+// Register waits while every identifier is in use, and sends the
+// PUBLISH with the one it gets.
+func TestRegisterWaitsForAnIdentifier(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.e.ids = newIDTable(2)
+	h.connect(false, 0)
+	first := h.publish(1, "first")
+	h.publish(1, "second")
+	h.collect()
+	packet := func() []byte {
+		pkt, err := wire.MarshalPublish(wire.PublishOpts{Topic: "t", Payload: []byte("third"), QoS: 1, PacketID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pkt
+	}
+
+	registered := make(chan *Out, 1)
+	h.whileWaitingForID(func() {
+		o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: packet()}, nil)
+		if err != nil {
+			t.Error(err)
+		}
+		registered <- o
+	})
+	h.e.HandlePuback(first.PacketID(), 0, nil)
+	third := <-registered
+	if third.PacketID() != first.PacketID() {
+		t.Fatalf("registered with identifier %d, want the released %d", third.PacketID(), first.PacketID())
+	}
+	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", third.PacketID()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := h.e.Register(ctx, Message{QoS: 1, Packet: packet()}, nil); !errors.Is(err, ErrIDsExhausted) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ended ctx: err = %v", err)
+	}
+	stop := make(chan struct{})
+	close(stop)
+	if _, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: packet()}, stop); !errors.Is(err, ErrStopped) {
+		t.Fatalf("stopped wait: err = %v", err)
+	}
+	if n := h.e.OutboundLen(); n != 2 {
+		t.Fatalf("%d flows after the waits ended, want 2", n)
+	}
+}
+
+func TestRegisterRejectsAnythingButAQoS12Publish(t *testing.T) {
+	h := newHarness(t, Config{})
+	qos0, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", Payload: []byte("p")})
+	qos1, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+	for _, m := range []Message{
+		{QoS: 0, Packet: qos0},
+		{QoS: 1, Packet: qos0},
+		{QoS: 2, Packet: qos1},
+		{QoS: 1, Packet: qos1[:4]},
+		{QoS: 1},
+	} {
+		if _, _, err := h.e.Register(context.Background(), m, nil); err == nil {
+			t.Fatalf("Register accepted QoS %d with % x", m.QoS, m.Packet)
+		}
+	}
+	if h.e.OutboundLen() != 0 || h.e.ids.used != 0 {
+		t.Fatal("a rejected registration left state behind")
 	}
 }
 
@@ -676,9 +832,8 @@ func TestPacketsWaitForTheirRecords(t *testing.T) {
 
 	registered := make(chan *Out)
 	go func() {
-		id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-		pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 2, PacketID: id})
-		o, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 2, Packet: pkt})
+		pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 2, PacketID: 1})
+		o, _, err := h.e.Register(context.Background(), Message{QoS: 2, Packet: pkt}, nil)
 		if err != nil {
 			t.Error(err)
 		}
@@ -725,12 +880,11 @@ func TestRegisterFailsWhenStoreFails(t *testing.T) {
 	st.fail.Store(true)
 	h := newHarness(t, Config{Store: st})
 	h.connect(false, 0)
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
-	if _, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt}); err == nil {
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+	if _, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil); err == nil {
 		t.Fatal("Register succeeded although the store failed")
 	}
-	if h.e.OutboundLen() != 0 || h.e.ids.owner[id] != OwnerNone {
+	if h.e.OutboundLen() != 0 || h.e.ids.used != 0 {
 		t.Fatal("failed registration left state behind")
 	}
 	want(t, h.collect())
@@ -817,13 +971,8 @@ func TestConcurrentUse(t *testing.T) {
 	for w := 0; w < 8; w++ {
 		wg.Go(func() {
 			for i := 0; i < n/8; i++ {
-				id, err := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
-				o, _, err := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt})
+				pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+				o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil)
 				if err != nil {
 					t.Error(err)
 					return
@@ -944,11 +1093,10 @@ func (s *opLog) Delete(ctx context.Context, k session.RecordKey) error {
 // register publishes with a Ref and a Settle that logs into st.
 func (h *harness) register(st *opLog, qos byte, ref string) (*Out, chan error) {
 	h.t.Helper()
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: qos, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: qos, PacketID: 1})
 	settled := make(chan error, 1)
 	o, _, err := h.e.Register(context.Background(), Message{
-		ID: id, QoS: qos, Packet: pkt, Ref: []byte(ref),
+		QoS: qos, Packet: pkt, Ref: []byte(ref),
 		Settle: func(_ context.Context, err error) error {
 			if st != nil {
 				st.add("settle " + ref)
@@ -956,7 +1104,7 @@ func (h *harness) register(st *opLog, qos byte, ref string) (*Out, chan error) {
 			settled <- err
 			return nil
 		},
-	})
+	}, nil)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -1014,11 +1162,10 @@ func TestSettleNeverBlocksTheAck(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.connect(false, 0)
 	release := make(chan struct{})
-	id, _ := h.e.AllocateID(context.Background(), OwnerPublish, nil)
-	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: id})
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	done := make(chan struct{})
-	o, _, _ := h.e.Register(context.Background(), Message{ID: id, QoS: 1, Packet: pkt, Ref: []byte("r"),
-		Settle: func(context.Context, error) error { <-release; close(done); return nil }})
+	o, _, _ := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("r"),
+		Settle: func(context.Context, error) error { <-release; close(done); return nil }}, nil)
 	h.collect()
 	h.e.HandlePuback(o.PacketID(), 0, nil) // returns although Settle is blocked
 	close(release)

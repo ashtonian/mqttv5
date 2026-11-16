@@ -11,5 +11,6 @@ use (
 	./queue/file
 	./store/file
 	./tlsrevocation
+	./transport/quic
 	./transport/ws
 )

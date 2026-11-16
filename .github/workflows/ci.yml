@@ -39,6 +39,7 @@ jobs:
           - queue/file
           - internal/filedb
           - transport/ws
+          - transport/quic
           - tlsrevocation
           - examples
           - conformance
@@ -77,6 +78,7 @@ jobs:
           - queue/file
           - internal/filedb
           - transport/ws
+          - transport/quic
           - tlsrevocation
           - examples
           - benchmarks
@@ -160,7 +162,7 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
       - name: Scan every module
         run: |
-          for module in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws tlsrevocation examples conformance benchmarks; do
+          for module in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws transport/quic tlsrevocation examples conformance benchmarks; do
             echo "Scanning $module"
             (cd "$module" && govulncheck ./...)
           done

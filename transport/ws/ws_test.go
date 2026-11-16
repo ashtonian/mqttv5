@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -22,13 +24,20 @@ import (
 	"github.com/ashtonian/mqttv5/transport"
 )
 
+// upgradeMQTT upgrades r as an MQTT broker does, selecting the "mqtt"
+// subprotocol.
+func upgradeMQTT(r *http.Request, w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, gws.Handshake, error) {
+	u := gws.HTTPUpgrader{Protocol: func(p string) bool { return p == "mqtt" }}
+	return u.Upgrade(r, w)
+}
+
 // startEchoWS spins up an HTTP server that upgrades each connection
 // to a WebSocket and echoes every binary frame it receives. The
 // returned base URL has a ws:// scheme — callers append a path.
 func startEchoWS(t *testing.T) (base *url.URL, cleanup func()) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		conn, _, _, err := upgradeMQTT(r, w)
 		if err != nil {
 			t.Errorf("upgrade: %v", err)
 			return
@@ -89,7 +98,7 @@ func TestDialAndRoundTrip(t *testing.T) {
 // and one trusted through TLSConfig is accepted.
 func TestWssVerifiesByDefault(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		conn, _, _, err := upgradeMQTT(r, w)
 		if err == nil {
 			conn.Close()
 		}
@@ -115,7 +124,7 @@ func TestWssVerification(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.Name, func(t *testing.T) {
 			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				conn, _, _, err := gws.UpgradeHTTP(r, w)
+				conn, _, _, err := upgradeMQTT(r, w)
 				if err == nil {
 					conn.Close()
 				}
@@ -153,7 +162,7 @@ func TestWssVerification(t *testing.T) {
 // none.
 func TestConnectionState(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		conn, _, _, err := upgradeMQTT(r, w)
 		if err == nil {
 			conn.Close()
 		}
@@ -187,7 +196,7 @@ func TestConnectionState(t *testing.T) {
 func startWSS(t *testing.T, cert tls.Certificate) *url.URL {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		conn, _, _, err := upgradeMQTT(r, w)
 		if err == nil {
 			conn.Close()
 		}
@@ -335,7 +344,7 @@ func TestWssResumesSession(t *testing.T) {
 	resumed := make(chan bool, 8)
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resumed <- r.TLS.DidResume
-		conn, _, _, err := gws.UpgradeHTTP(r, w)
+		conn, _, _, err := upgradeMQTT(r, w)
 		if err == nil {
 			conn.Close()
 		}

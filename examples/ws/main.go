@@ -1,17 +1,23 @@
-// WebSocket example: connect via ws:// (or wss://) by composing
-// mqttv5.WithDialFunc with the transport/ws Dial. The core mqttv5
-// module stays stdlib-only; the gobwas/ws dependency lives only in
-// the transport/ws submodule, imported only here.
+// WebSocket example: connect over ws:// or wss:// by composing
+// mqttv5.WithDialFunc with transport/ws, publish a message to itself,
+// then wait for an interrupt. The core mqttv5 module stays stdlib-only;
+// the gobwas/ws dependency lives only in the transport/ws submodule,
+// imported only here.
 //
-// Run a broker with WebSocket listener (e.g., mosquitto configured
-// for port 8083 with listener "8083 protocol websockets") then:
+// Run a broker with a WebSocket listener (EMQX's ws:default on 8083 and
+// wss:default on 8084, in conformance/docker-compose.yml) then:
 //
-//	MQTT_BROKER=ws://127.0.0.1:8083/mqtt go -C examples run ./ws
+//	go -C examples run ./ws
+//	MQTT_BROKER=wss://127.0.0.1:8084/mqtt MQTT_CA_FILE=../conformance/tls/pki/root.pem go -C examples run ./ws
+//
+// MQTT_CA_FILE is resolved from the examples directory; empty verifies a
+// wss:// broker against the system roots.
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -43,10 +49,10 @@ func run(ctx context.Context) error {
 	broker := envOr("MQTT_BROKER", "ws://127.0.0.1:8083/mqtt")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	// For wss://, a nil *tls.Config verifies the broker against the
-	// system roots; set one for a private CA or client certificates.
-	var tlsCfg *tls.Config
-
+	tlsCfg, err := tlsConfig(os.Getenv("MQTT_CA_FILE"))
+	if err != nil {
+		return err
+	}
 	cli, err := mqttv5.New(
 		mqttv5.WithBroker(broker),
 		mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg})),
@@ -56,8 +62,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	if err := cli.Connect(ctx); err != nil {
+	if err = cli.Connect(ctx); err != nil {
 		return err
 	}
 	defer func() {
@@ -65,10 +70,45 @@ func run(ctx context.Context) error {
 		defer cancel()
 		_ = cli.Disconnect(shutdown)
 	}()
-
 	logger.Info("connected over websocket", "broker", broker)
+
+	topic := "mqttv5/examples/ws/" + time.Now().Format("150405.000")
+	msgs, _, err := cli.Subscribe(ctx, []mqttv5.TopicFilter{{Topic: topic, QoS: 1}}, mqttv5.SubBuffer(1))
+	if err != nil {
+		return err
+	}
+	if err = cli.Publish(ctx, mqttv5.PublishOptions{Topic: topic, QoS: 1, Payload: []byte("over WebSocket")}); err != nil {
+		return err
+	}
+	select {
+	case m := <-msgs:
+		logger.Info("round trip", "topic", m.Topic, "payload", string(m.Payload))
+		_ = m.Ack()
+	case <-time.After(5 * time.Second):
+		return errors.New("the published message did not come back")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	<-ctx.Done()
 	return nil
+}
+
+// tlsConfig trusts the PEM CA bundle at caFile, or the system roots when
+// caFile is empty.
+func tlsConfig(caFile string) (*tls.Config, error) {
+	if caFile == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("MQTT_CA_FILE: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("MQTT_CA_FILE %s holds no PEM certificate", caFile)
+	}
+	return &tls.Config{RootCAs: pool}, nil
 }
 
 func envOr(k, def string) string {

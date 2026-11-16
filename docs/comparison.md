@@ -46,8 +46,10 @@ supervisor:
   before a packet is sent. The [conformance suite](../conformance) runs
   against mosquitto and EMQX on every change, and nightly against HiveMQ
   CE, including one that announces tight CONNACK limits.
-- **WebSocket without a core dependency.** `transport/ws` plugs in
-  through `WithDialFunc` ([WebSocket](websocket.md#websocket)).
+- **WebSocket and QUIC without a core dependency.** `transport/ws` and
+  `transport/quic` plug in through `WithDialFunc`
+  ([WebSocket](websocket.md#websocket), [QUIC](quic.md#quic)). Neither
+  Paho client ships a QUIC transport.
 
 <!-- MQTT v5.0 citations -->
 

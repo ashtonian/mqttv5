@@ -242,7 +242,7 @@ func (c *Client) stop(ctx context.Context, life *lifecycle, opts wire.Disconnect
 func (c *Client) teardown(ctx context.Context, life *lifecycle, opts wire.DisconnectOpts, cause error) error {
 	life.disconnOnce.Do(func() {
 		c.sendDisconnectWith(ctx, opts)
-		life.endWith(cause)
+		c.endSpan(life, cause)
 		if cs := c.cur.Load(); cs != nil {
 			cs.signalDown()
 		}
@@ -298,6 +298,7 @@ func (c *Client) finish(ctx context.Context, life *lifecycle) error {
 type connectResult struct {
 	url     string
 	conn    transport.Conn
+	out     *packetWriter
 	decoder *wire.Decoder
 	info    ConnackInfo
 	// connectExpiry is the Session Expiry Interval the CONNECT carried.
@@ -344,12 +345,19 @@ func (c *Client) verifyTLS(ctx context.Context, conn transport.Conn, brokerURL *
 }
 
 // handshakeViolation answers a broker protocol violation during the
-// handshake: DISCONNECT 0x82, close, and the error to return.
-func (c *Client) handshakeViolation(conn transport.Conn, t wire.PacketType, detail string) *ProtocolError {
-	perr := &ProtocolError{Reason: wire.ReasonProtocolError, Packet: t, Detail: detail}
+// handshake: DISCONNECT 0x82, transport.Abort, and the error to return.
+func (c *Client) handshakeViolation(out *packetWriter, t wire.PacketType, detail string) *ProtocolError {
+	return c.abortHandshake(out, &ProtocolError{Reason: wire.ReasonProtocolError, Packet: t, Detail: detail})
+}
+
+// abortHandshake sends DISCONNECT with perr's reason code and ends the
+// connection through transport.Abort.
+func (c *Client) abortHandshake(out *packetWriter, perr *ProtocolError) *ProtocolError {
 	c.stats.addProtocolError()
-	_, _ = wire.WriteDisconnect(conn, wire.DisconnectOpts{ReasonCode: perr.Reason})
-	_ = conn.Close()
+	_, _ = out.WritePacket(func(w io.Writer) (int64, error) {
+		return wire.WriteDisconnect(w, wire.DisconnectOpts{ReasonCode: perr.Reason})
+	})
+	_ = transport.Abort(out.conn, byte(perr.Reason))
 	return perr
 }
 
@@ -409,7 +417,8 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 		return err
 	}
 
-	sent, err := c.writeConnect(dialCtx, conn, u, cleanStart)
+	out := newPacketWriter(conn)
+	sent, err := c.writeConnect(dialCtx, out, u, cleanStart)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mqttv5: write CONNECT: %w", ioErr(err))
@@ -421,10 +430,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 	for {
 		pkt, err := dec.ReadPacket()
 		if perr := decodeViolation(err); perr != nil {
-			c.stats.addProtocolError()
-			_, _ = wire.WriteDisconnect(conn, wire.DisconnectOpts{ReasonCode: perr.Reason})
-			_ = conn.Close()
-			return nil, perr
+			return nil, c.abortHandshake(out, perr)
 		}
 		if err != nil {
 			_ = conn.Close()
@@ -441,7 +447,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 			brokerData := authData(p.Properties)
 			p.Release()
 			if reason != wire.ReasonContinueAuthentication || !methodOK {
-				return nil, c.handshakeViolation(conn, wire.AUTH, fmt.Sprintf(
+				return nil, c.handshakeViolation(out, wire.AUTH, fmt.Sprintf(
 					"AUTH reason %#x method %q during CONNECT (method %q)", byte(reason), method, sent.AuthenticationMethod))
 			}
 			response, err := c.authContinue(dialCtx, brokerData)
@@ -449,10 +455,12 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				_ = conn.Close()
 				return nil, fmt.Errorf("mqttv5: Authenticator.Continue: %w", err)
 			}
-			if _, err := wire.WriteAuth(conn, wire.AuthOpts{
-				ReasonCode:           wire.ReasonContinueAuthentication,
-				AuthenticationMethod: sent.AuthenticationMethod,
-				AuthenticationData:   response,
+			if _, err := out.WritePacket(func(w io.Writer) (int64, error) {
+				return wire.WriteAuth(w, wire.AuthOpts{
+					ReasonCode:           wire.ReasonContinueAuthentication,
+					AuthenticationMethod: sent.AuthenticationMethod,
+					AuthenticationData:   response,
+				})
 			}); err != nil {
 				_ = conn.Close()
 				return nil, fmt.Errorf("mqttv5: write AUTH: %w", ioErr(err))
@@ -467,12 +475,12 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 			}
 			if sent.CleanStart && p.SessionPresent {
 				p.Release()
-				return nil, c.handshakeViolation(conn, wire.CONNACK, "Session Present set in reply to CleanStart=1")
+				return nil, c.handshakeViolation(out, wire.CONNACK, "Session Present set in reply to CleanStart=1")
 			}
 			if method, ok := p.Properties.String(wire.PropAuthMethod); ok && method != sent.AuthenticationMethod {
 				method = strings.Clone(method)
 				p.Release()
-				return nil, c.handshakeViolation(conn, wire.CONNACK, fmt.Sprintf(
+				return nil, c.handshakeViolation(out, wire.CONNACK, fmt.Sprintf(
 					"CONNACK authentication method %q, CONNECT used %q", method, sent.AuthenticationMethod))
 			}
 			// Enhanced-auth mutual verification (§4.12): an Authenticator
@@ -498,7 +506,7 @@ func (c *Client) connectOnce(ctx context.Context, brokerURL string, cleanStart b
 				return nil, fmt.Errorf("mqttv5: connect: %w", dialCtx.Err())
 			}
 			_ = conn.SetDeadline(time.Time{})
-			r := &connectResult{url: brokerURL, conn: conn, decoder: dec, info: info}
+			r := &connectResult{url: brokerURL, conn: conn, out: out, decoder: dec, info: info}
 			if sent.SessionExpiryInterval != nil {
 				r.connectExpiry = *sent.SessionExpiryInterval
 			}
@@ -524,6 +532,7 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		clk:           c.cfg.clock,
 		connectedAt:   c.cfg.clock.Now(),
 		conn:          r.conn,
+		out:           r.out,
 		decoder:       r.decoder,
 		writeQueue:    make(chan writeReq, c.cfg.WriteQueueSize),
 		direct:        supportsDirectWrites(r.conn),
@@ -533,7 +542,6 @@ func (c *Client) runConnection(life *lifecycle, r *connectResult) error {
 		life:          life,
 		dying:         make(chan struct{}),
 		resumed:       make(chan struct{}),
-		writerDone:    make(chan struct{}),
 		done:          make(chan struct{}),
 		aliasMap:      make(map[uint16]string),
 		outAliasMap:   make(map[string]uint16),
@@ -780,12 +788,24 @@ func (c *Client) supervisor(life *lifecycle, cleanStart bool, down *outage) {
 	}
 }
 
+// endSpan ends span life, recording cause as the reason when it is the
+// first to, and reports whether it was. The session engine then ends
+// the waits of the publishes still waiting for an acknowledgement, which
+// return what the span's end gives calls it cuts short.
+func (c *Client) endSpan(life *lifecycle, cause error) bool {
+	if !life.endWith(cause) {
+		return false
+	}
+	c.engine.Interrupt()
+	return true
+}
+
 // quit ends span life from its supervisor, which has no connection, as
 // Disconnect would: calls cut short return cause, or ErrClosed when it
 // is nil. It reports whether it ended the span; when a teardown ended it
 // first, that teardown finishes it once the supervisor has returned.
 func (c *Client) quit(life *lifecycle, cause error) bool {
-	if !life.endWith(cause) {
+	if !c.endSpan(life, cause) {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConnectTimeout)
@@ -929,9 +949,7 @@ func (c *Client) tryBroker(life *lifecycle, attempt int, brokerURL string, clean
 }
 
 // sendDisconnectWith best-effort writes a graceful DISCONNECT carrying
-// opts. cs.dying short-circuits the wait if the connection is going
-// down before the writer drains; combined with drainWriteQueue in
-// writeLoop's deferred exit, req.done is always signalled.
+// opts (see awaitDisconnect).
 func (c *Client) sendDisconnectWith(ctx context.Context, opts wire.DisconnectOpts) {
 	cs := c.cur.Load()
 	if cs == nil {
@@ -953,11 +971,22 @@ func (c *Client) sendDisconnectWith(ctx context.Context, opts wire.DisconnectOpt
 	if err != nil {
 		return
 	}
+	c.awaitDisconnect(ctx, cs, done, opts)
+}
+
+// awaitDisconnect waits for the writer to send a DISCONNECT it queued
+// with done: at most DisconnectFlushTimeout, as the packets ahead of it
+// may be stalled behind a broker that stopped reading, and no longer than
+// ctx or the connection lasts.
+func (c *Client) awaitDisconnect(ctx context.Context, cs *connState, done <-chan error, opts wire.DisconnectOpts) {
+	flush := c.cfg.clock.NewTimer(c.cfg.DisconnectFlushTimeout)
+	defer flush.Stop()
 	select {
 	case err := <-done:
 		if err != nil {
 			c.logDisconnectNotWritten(opts, err)
 		}
+	case <-flush.C():
 	case <-ctx.Done():
 	case <-cs.dying:
 	}
@@ -970,9 +999,9 @@ func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
 		slog.Int("reason", int(opts.ReasonCode)), slog.Any("error", err))
 }
 
-// writeConnect emits the CONNECT packet directly against w (used during
-// the handshake, before the writer goroutine has started) and returns
-// the options actually sent.
+// writeConnect writes the CONNECT packet to out (during the handshake,
+// before the writer goroutine has started) and returns the options
+// actually sent.
 //
 // The ClientID is the configured one or, when that is empty, the one the
 // broker assigned earlier, so the session can resume.
@@ -984,7 +1013,7 @@ func (c *Client) logDisconnectNotWritten(opts wire.DisconnectOpts, err error) {
 // If cfg.ConnectPacketBuilder is set, it runs after this method has
 // populated opts, is told brokerURL, and may change the credentials and
 // user properties. A non-nil error from the builder fails the attempt.
-func (c *Client) writeConnect(ctx context.Context, w io.Writer, brokerURL *url.URL, cleanStart bool) (wire.ConnectOpts, error) {
+func (c *Client) writeConnect(ctx context.Context, out *packetWriter, brokerURL *url.URL, cleanStart bool) (wire.ConnectOpts, error) {
 	cfg := c.cfg
 	opts := wire.ConnectOpts{
 		ClientID:          c.ClientID(),
@@ -1030,7 +1059,7 @@ func (c *Client) writeConnect(ctx context.Context, w io.Writer, brokerURL *url.U
 		}
 		opts.Username, opts.Password, opts.UserProperties = co.Username, co.Password, co.UserProperties
 	}
-	_, err := wire.WriteConnect(w, opts)
+	_, err := out.WritePacket(func(w io.Writer) (int64, error) { return wire.WriteConnect(w, opts) })
 	return opts, err
 }
 

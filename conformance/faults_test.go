@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -39,7 +38,7 @@ func TestSession_LostWhileDisconnected(t *testing.T) {
 			ch, cleanup := withSubscriber(t, topic, 4)
 			defer cleanup()
 
-			px := newFaultProxy(t, stripScheme(brokerURL()), true)
+			px := newFaultProxy(t, brokerURL(), true)
 			pub := connect(t,
 				mqttv5.WithBroker(px.url()),
 				mqttv5.WithSessionExpiry(1),
@@ -99,7 +98,7 @@ func TestQoS2_ResumesAfterPUBREC(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	px := newFaultProxy(t, stripScheme(brokerURL()), true)
+	px := newFaultProxy(t, brokerURL(), true)
 	pub := connect(t,
 		mqttv5.WithBroker(px.url()),
 		mqttv5.WithSessionExpiry(300),
@@ -196,24 +195,22 @@ func TestSubscribe_RefusedFilterReported(t *testing.T) {
 	}
 }
 
-// connCapture wraps the built-in dial path and records the most recent
-// net.Conn handed to the client, so a test can Close() it directly to
+// connCapture wraps the broker's dial and records the most recent
+// connection handed to the client, so a test can Close() it directly to
 // simulate an ungraceful network drop (no DISCONNECT). Each reconnect
 // dial overwrites the captured conn — Latest always points at the live
 // connection.
 type connCapture struct {
 	mu    sync.Mutex
-	conn  net.Conn
+	conn  transport.Conn
 	dials int
 }
 
-// DialFunc returns a transport.DialFunc that defers to the real TCP/TLS
-// dial (transport.Dial, via the *url.URL's string form, so the
-// default-port logic for mqtt:// is reused) and captures the resulting
-// connection.
+// DialFunc returns a transport.DialFunc that dials the broker over its
+// transport and captures the resulting connection.
 func (cc *connCapture) DialFunc() transport.DialFunc {
 	return func(ctx context.Context, u *url.URL) (transport.Conn, error) {
-		c, err := transport.Dial(ctx, u.String(), transport.DialOpts{})
+		c, err := brokerDial(u.String())(ctx, u)
 		if err != nil {
 			return nil, err
 		}
@@ -277,7 +274,7 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 	// whole test. It stays connected throughout; the QoS 1 publish must
 	// reach it once after P's reconnect+replay.
 	sub, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
+		withBroker(brokerURL()),
 		mqttv5.WithClientID("conformance-replay-sub-"+randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5*time.Second),
@@ -310,7 +307,7 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 	// connCapture DialFunc lets the test sever P's socket directly.
 	cc := &connCapture{}
 	pub, err := mqttv5.New(
-		mqttv5.WithBroker(brokerURL()),
+		withBrokerDial(brokerURL(), cc.DialFunc()),
 		mqttv5.WithClientID("conformance-replay-pub-"+randSuffix()),
 		mqttv5.WithKeepAlive(30),
 		mqttv5.WithConnectTimeout(5*time.Second),
@@ -318,7 +315,6 @@ func TestReconnect_QoS1SurvivesConnectionDrop(t *testing.T) {
 		mqttv5.WithCleanStartOnReconnect(false),
 		mqttv5.WithSessionExpiry(300),
 		mqttv5.WithReconnectBackoff(mqttv5.ConstantBackoff(100*time.Millisecond)),
-		mqttv5.WithDialFunc(cc.DialFunc()),
 	)
 	if err != nil {
 		t.Fatalf("New pub: %v", err)
@@ -454,7 +450,7 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 	var subTrace *packetTrace
 	subOpts := []mqttv5.Option{}
 	if os.Getenv("MQTTV5_SOAK_TRACE") != "" {
-		subPx := newFaultProxy(t, stripScheme(brokerURL()), true)
+		subPx := newFaultProxy(t, brokerURL(), true)
 		subTrace = subPx.trace
 		subOpts = append(subOpts, mqttv5.WithBroker(subPx.url()))
 	}
@@ -469,7 +465,7 @@ func TestSoak_DeliveryAcrossConnectionCuts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	px := newFaultProxy(t, stripScheme(brokerURL()), os.Getenv("MQTTV5_SOAK_TRACE") != "")
+	px := newFaultProxy(t, brokerURL(), os.Getenv("MQTTV5_SOAK_TRACE") != "")
 	pub := connect(t,
 		mqttv5.WithBroker(px.url()),
 		mqttv5.WithSessionExpiry(300),

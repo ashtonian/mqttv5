@@ -14,7 +14,7 @@
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`. Several URLs fail over in the `WithFailoverOrder` order ([Failover](multi-broker.md#failover-withbrokers)). |
+| `WithBroker(url)` / `WithBrokers(urls...)` | (required) | Broker URL(s). `mqtt`/`tcp`/`mqtts`/`tls`/`ssl` schemes; default ports filled in. `ws`/`wss` via `WithDialFunc(ws.DialFunc(opts))`, `mqtt-quic` via `WithDialFunc(quic.DialFunc(opts))`. Several URLs fail over in the `WithFailoverOrder` order ([Failover](multi-broker.md#failover-withbrokers)). |
 | `WithFailoverOrder(o)` | `FailoverRotate` | How several brokers are tried. `FailoverRotate`: each client starts at a random entry and each reconnect attempt moves on one. `FailoverPriority`: the list is a preference order; `Connect` and each reconnect start at the first entry, and one reconnect attempt is a pass over the list with no backoff between entries ([Primary and standby](multi-broker.md#primary-and-standby-failoverpriority)). |
 | `WithDialFunc(fn)` | — | Replaces the built-in TCP/TLS dial; configure TLS inside `fn`. `New` rejects it beside `WithDialer`, `WithTLSConfig` or `WithTLSConfigFunc`. Nil rejected. |
 | `WithTLSConfig(*tls.Config)` | system roots, server name from the URL | TLS for `mqtts://`/`tls://`/`ssl://`, the same config for every dial. Reconnects resume the TLS session unless the config presents a client certificate or sets its own `ClientSessionCache` ([Certificate management](security.md#certificate-management)). The config is never modified. `New` rejects it beside `WithTLSConfigFunc`. |
@@ -65,7 +65,7 @@
 | `WithoutKeepAlive()` | — | Request no keep-alive (no PINGREQ unless the broker sets a Server Keep Alive). Rarely correct in production. |
 | `WithConnectTimeout(d)` | 10 s | Dial + CONNECT/CONNACK budget. |
 | `WithPingTimeout(d)` | min(10 s, KeepAlive/2) | How long to wait for any packet after a PINGREQ before declaring the connection dead. Must be shorter than the keep-alive (`New` rejects it otherwise). |
-| `WithDisconnectFlushTimeout(d)` | 500 ms | Flush budget for the DISCONNECT write on graceful shutdown. |
+| `WithDisconnectFlushTimeout(d)` | 500 ms | How long `Disconnect`, or a protocol error the client disconnects over, waits for its DISCONNECT to be written before closing the connection; the packets ahead of it may be held up by a broker that stopped reading. |
 | `WithReadBufferSize(n)` | 16 KiB | Per-connection read window. Larger windows cut read syscalls for floods of small messages (`BenchmarkReceiveWindow`). |
 
 > **Keep-alive.** A PINGREQ goes out once either direction has been
@@ -136,7 +136,7 @@ the main connection stands and stop with it.
 | Option | Default | Effect |
 |---|---|---|
 | `WithWriteQueueSize(n)` | 256 | Internal MPSC write buffer. |
-| `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per writev syscall. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
+| `WithWriteBatch(n)` | 0 (off) | Coalesce up to n queued packets per write: one `writev` on TCP, one write of up to 16 KiB on TLS, WebSocket and QUIC. Saves syscalls when concurrent publishers queue packets behind the writer; with one publisher or large payloads there is little to coalesce. The benchmarks do not measure it: measure with your workload before enabling. |
 | `WithWriteOverflowPolicy(p)` | `WriteBlock` | QoS 0 only. See note below. |
 | `WithPublishMode(mode)` | `PublishFireAndForget` | `PublishWaitForFlush` makes QoS 0 wait until the packet is written; on an idle TCP or Unix connection the caller writes it itself, without copying the payload. ctx bounds the wait; a write it interrupts is finished by the writer goroutine. |
 | `WithPublisherPool(N)` | 0 (off) | N publish-only connections to the client's brokers, beside the main one, that `Publish` spreads over ([Publish pool](publisher-pool.md#publish-pool-withpublisherpool)). |

@@ -3,7 +3,9 @@ package inflight
 import (
 	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -40,8 +42,12 @@ type Out struct {
 	list       *flowList
 	prev, next *Out
 
-	done chan struct{}
-	err  error
+	err error // the outcome, once finished
+	// done is closed, once, when the flow finishes or when Interrupt ends
+	// the wait on it first; waitErr is what Err reports from then on.
+	done    chan struct{}
+	woken   bool
+	waitErr error
 }
 
 // PacketID returns the flow's packet identifier.
@@ -50,18 +56,33 @@ func (o *Out) PacketID() uint16 { return o.id }
 // Seq returns the flow's send sequence number, for Link.SendOrdered.
 func (o *Out) Seq() uint64 { return o.pubSeq }
 
-// Done is closed when the flow completes.
+// Done is closed when the flow completes, or when [Engine.Interrupt]
+// ends the wait on it before that.
 func (o *Out) Done() <-chan struct{} { return o.done }
 
-// Err is the flow's outcome once Done is closed: nil when the broker
-// accepted the message, otherwise why it did not.
-func (o *Out) Err() error { return o.err }
+// Err is why Done closed: the flow's outcome, nil when the broker
+// accepted the message and otherwise why it did not, or
+// [ErrInterrupted].
+func (o *Out) Err() error { return o.waitErr }
+
+// wake ends the wait on Done with err, unless it has ended already. The
+// caller holds the engine's mutex.
+func (o *Out) wake(err error) {
+	if o.woken {
+		return
+	}
+	o.woken = true
+	o.waitErr = err
+	close(o.done)
+}
 
 // Message is an outbound QoS 1/2 PUBLISH to register.
 type Message struct {
-	ID        uint16 // from AllocateID(OwnerPublish)
-	QoS       byte
-	Packet    []byte    // encoded with DUP=0
+	QoS byte
+	// Packet is the PUBLISH, encoded with DUP=0. Register writes the
+	// identifier it allocates into it, so the one it was encoded with is
+	// a placeholder.
+	Packet    []byte
 	ExpiresAt time.Time // zero: never
 	// Ref identifies the message to its producer across restarts and is
 	// stored with its record; see Adopt.
@@ -81,17 +102,24 @@ type Message struct {
 	Settle func(ctx context.Context, err error) error
 }
 
-// Register adds an outbound flow for m. The record is stored before the
-// flow can be sent; if that fails the flow is removed, the identifier
-// released, and a [*StoreError] returned. An error means the flow does
-// not exist and m.Settle is never called; otherwise the flow completes
-// through Done and Settle, also when the session fails meanwhile. The
-// returned Link, when non-nil, is the live connection: the caller passes
-// out.Seq() to its SendOrdered so the PUBLISH keeps its place relative
-// to other writes.
-func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
+// Register allocates a packet identifier for m, writes it into m.Packet
+// and adds an outbound flow for it, in one critical section. While every
+// identifier is in use it waits for one, until ctx ends
+// ([ErrIDsExhausted]) or stop closes ([ErrStopped]; nil never does).
+// The record is stored before the flow can be sent; if that fails the
+// flow is removed, the identifier released, and a [*StoreError]
+// returned. An error means the flow does not exist and m.Settle is never
+// called; otherwise the flow completes through Done and Settle, also
+// when the session fails meanwhile. The returned Link, when non-nil, is
+// the live connection: the caller passes out.Seq() to its SendOrdered so
+// the PUBLISH keeps its place relative to other writes.
+func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) (*Out, Link, error) {
+	idAt, ok := wire.PublishPacketIDOffset(m.Packet)
+	if !ok || m.QoS > 2 || m.Packet[0]>>1&0x03 != m.QoS {
+		return nil, nil, fmt.Errorf("mqttv5: register outbound publish: want a PUBLISH encoded with QoS %d, got % .8x", m.QoS, m.Packet)
+	}
 	o := &Out{
-		id: m.ID, qos: m.QoS, packet: m.Packet, expiresAt: m.ExpiresAt,
+		qos: m.QoS, packet: m.Packet, expiresAt: m.ExpiresAt,
 		ref: m.Ref, settle: m.Settle,
 		phase: session.AwaitPuback,
 		done:  make(chan struct{}),
@@ -101,11 +129,18 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 	}
 
 	e.mu.Lock()
+	for e.failure == nil && e.ids.full() {
+		if err := e.awaitIDLocked(ctx, stop); err != nil {
+			e.mu.Unlock()
+			return nil, nil, err
+		}
+	}
 	if e.failure != nil {
-		e.releaseLocked(m.ID, OwnerPublish)
 		defer e.mu.Unlock()
 		return nil, nil, e.failure
 	}
+	o.id = e.ids.take(OwnerPublish)
+	binary.BigEndian.PutUint16(o.packet[idAt:], o.id)
 	if !o.expiresAt.IsZero() {
 		o.expiry = secondsUntil(o.expiresAt, e.cfg.Now())
 	}
@@ -121,38 +156,40 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 	if e.cursor == nil {
 		e.cursor = o
 	}
-	var put *job
-	var putErr error
-	if e.store != nil {
-		r := o.record()
-		// A fresh flow has no earlier write, so this Put is first in line
-		// and runs below on the caller's goroutine, under its ctx.
-		put = e.queueLocked(outKey(o.id), o, &job{
-			op: "put outbound",
-			do: func(context.Context) error { return e.store.Put(ctx, r) },
-			after: func(err error) error {
-				if err == nil {
-					return nil
-				}
-				// Never stored: the caller learns it was not accepted, and
-				// writes queued for it since (a reconnect's) never run.
-				putErr = &StoreError{Op: "put outbound", Err: err}
-				e.cancelLocked(outKey(o.id), o)
-				e.unlinkLocked(o)
-				delete(e.out, o.id)
-				if len(o.ref) > 0 {
-					delete(e.refs, string(o.ref))
-					// A session loss may have ended it meanwhile.
-					if e.orphans[string(o.ref)] == o {
-						delete(e.orphans, string(o.ref))
-					}
-				}
-				o.finished = true
-				e.releaseLocked(o.id, OwnerPublish)
-				return nil
-			},
-		})
+	if e.store == nil {
+		link := e.link
+		e.mu.Unlock()
+		return o, link, nil
 	}
+	var putErr error
+	r := o.record()
+	// A fresh flow has no earlier write, so this Put is first in line
+	// and runs below on the caller's goroutine, under its ctx.
+	put := e.queueLocked(outKey(o.id), o, &job{
+		op: "put outbound",
+		do: func(context.Context) error { return e.store.Put(ctx, r) },
+		after: func(err error) error {
+			if err == nil {
+				return nil
+			}
+			// Never stored: the caller learns it was not accepted, and
+			// writes queued for it since (a reconnect's) never run.
+			putErr = &StoreError{Op: "put outbound", Err: err}
+			e.cancelLocked(outKey(o.id), o)
+			e.unlinkLocked(o)
+			delete(e.out, o.id)
+			if len(o.ref) > 0 {
+				delete(e.refs, string(o.ref))
+				// A session loss may have ended it meanwhile.
+				if e.orphans[string(o.ref)] == o {
+					delete(e.orphans, string(o.ref))
+				}
+			}
+			o.finished = true
+			e.ids.release(o.id, OwnerPublish)
+			return nil
+		},
+	})
 	e.mu.Unlock()
 
 	if put != nil {
@@ -315,7 +352,7 @@ func (e *Engine) finishLocked(o *Out, err error) {
 	delete(e.out, o.id)
 	o.finished = true
 	o.err = err
-	close(o.done)
+	o.wake(err)
 	if len(o.ref) > 0 {
 		delete(e.refs, string(o.ref))
 	}
@@ -335,7 +372,7 @@ func (e *Engine) retireLocked(o *Out) *job {
 			return e.completeLocked(o)
 		}
 	} else if e.store == nil && o.settle == nil {
-		e.releaseLocked(o.id, OwnerPublish)
+		e.ids.release(o.id, OwnerPublish)
 		return nil
 	}
 	return e.settleLocked(o)
@@ -454,7 +491,7 @@ func (e *Engine) settleLocked(o *Out) *job {
 				if len(o.ref) > 0 && e.orphans[string(o.ref)] == o {
 					delete(e.orphans, string(o.ref))
 				}
-				e.releaseLocked(o.id, OwnerPublish)
+				e.ids.release(o.id, OwnerPublish)
 			}
 			return nil
 		},

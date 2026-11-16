@@ -49,9 +49,9 @@ const (
 	// DefaultWriteQueueSize sizes the internal MPSC write channel.
 	DefaultWriteQueueSize = 256
 
-	// DefaultDisconnectFlushTimeout caps how long writeDisconnectAndClose
-	// will wait for the DISCONNECT packet to flush before the
-	// connection is forcibly torn down.
+	// DefaultDisconnectFlushTimeout caps how long the client waits for a
+	// DISCONNECT it sends, on Disconnect or over a protocol error, to be
+	// written before the connection is torn down.
 	DefaultDisconnectFlushTimeout = 500 * time.Millisecond
 
 	// DefaultReadBufferSize is the per-connection read window used when
@@ -198,7 +198,7 @@ type Config struct {
 	WriteOverflowPolicy WriteOverflowPolicy
 
 	// WriteBatchMax caps how many pre-encoded packets the writer
-	// goroutine coalesces into one writev. 0 disables batching. See
+	// goroutine coalesces into one write. 0 disables batching. See
 	// [WithWriteBatch].
 	WriteBatchMax int
 
@@ -347,7 +347,8 @@ type Option func(*Config) error
 
 // WithBroker sets a single broker URL. Supported schemes: mqtt://,
 // tcp://, mqtts://, tls://, ssl://; default ports 1883 / 8883 fill
-// in when missing. For ws:// or wss:// pair with [WithDialFunc].
+// in when missing. For ws://, wss:// or mqtt-quic:// pair with
+// [WithDialFunc].
 func WithBroker(url string) Option {
 	return func(c *Config) error {
 		c.BrokerURLs = []string{url}
@@ -784,11 +785,13 @@ func WithWriteQueueSize(n int) Option {
 	}
 }
 
-// WithWriteBatch coalesces up to n queued packets into one writev
-// syscall. Off by default (n=0 or 1). It saves syscalls when many
-// goroutines publish concurrently and packets queue behind the writer;
-// with one publisher or large payloads there is little to coalesce.
-// Measure with your workload before enabling it.
+// WithWriteBatch coalesces up to n queued packets into one write: one
+// writev on a TCP or Unix socket, and on TLS, WebSocket and QUIC one
+// write of up to 16 KiB (a TLS record, a WebSocket frame). Off by
+// default (n=0 or 1). It saves syscalls when many goroutines publish
+// concurrently and packets queue behind the writer; with one publisher
+// or large payloads there is little to coalesce. Measure with your
+// workload before enabling it.
 func WithWriteBatch(n int) Option {
 	return func(c *Config) error {
 		if n < 0 {
@@ -1345,18 +1348,25 @@ func WithDialer(d *net.Dialer) Option {
 // WithDialFunc replaces the built-in TCP/TLS dial path. The dial is
 // then entirely fn's, so New rejects it beside [WithDialer],
 // [WithTLSConfig] or [WithTLSConfigFunc]: configure TLS inside fn. Use
-// for SOCKS / HTTP proxies, WebSocket (transport/ws), or in-memory test
-// transports. ctx is bounded by ConnectTimeout. When set, broker URL
-// scheme validation is skipped. Nil rejected.
+// for SOCKS / HTTP proxies, WebSocket (transport/ws), QUIC
+// (transport/quic), or in-memory test transports. ctx is bounded by
+// ConnectTimeout. When set, broker URL scheme validation is skipped.
+// Nil rejected.
 //
-// The transport/ws sibling submodule exposes a [ws.DialFunc] helper
-// that bakes in DialOpts (TLS config, custom headers, etc.) and
-// returns a value directly usable here:
+// The transport/ws and transport/quic sibling submodules expose
+// [ws.DialFunc] and [quic.DialFunc] helpers that bake in their DialOpts
+// (TLS config, custom headers, fallback, etc.) and return a value
+// directly usable here:
 //
 //	mqttv5.WithDialFunc(ws.DialFunc(ws.DialOpts{TLSConfig: tlsCfg}))
+//	mqttv5.WithDialFunc(quic.DialFunc(quic.DialOpts{TLSConfig: tlsCfg}))
 //
 // A connection that implements [transport.ConnectionStater] reports its
-// TLS handshake in [ConnackInfo].TLS; transport/ws connections do.
+// TLS handshake in [ConnackInfo].TLS; transport/ws and transport/quic
+// connections do. One that implements [transport.Aborter] ends through
+// Abort, with the reason code, when the broker breaks the protocol; one
+// that implements [transport.DisconnectObserver] learns the reason code
+// of a DISCONNECT the broker sends.
 func WithDialFunc(fn transport.DialFunc) Option {
 	return func(c *Config) error {
 		if fn == nil {
@@ -1424,7 +1434,8 @@ var ErrMissingBroker = errors.New("mqttv5: missing broker URL (use WithBroker)")
 var ErrInvalidBrokerURL = errors.New("mqttv5: invalid broker URL")
 
 // builtinScheme reports whether transport.Dial handles scheme.
-// ws:// and wss:// need WithDialFunc(ws.DialFunc(...)).
+// ws:// and wss:// need WithDialFunc(ws.DialFunc(...)), mqtt-quic://
+// WithDialFunc(quic.DialFunc(...)).
 func builtinScheme(scheme string) bool {
 	return transport.IsTCPScheme(scheme) || transport.IsTLSScheme(scheme)
 }
@@ -1453,6 +1464,10 @@ func validateBrokerURLs(urls []string, dialFuncSet bool) error {
 		}
 		if u.Scheme == "ws" || u.Scheme == "wss" {
 			return fmt.Errorf("%w: urls[%d] = %q: WebSocket needs WithDialFunc (see the transport/ws submodule)",
+				ErrInvalidBrokerURL, i, raw)
+		}
+		if u.Scheme == "mqtt-quic" {
+			return fmt.Errorf("%w: urls[%d] = %q: QUIC needs WithDialFunc (see the transport/quic submodule)",
 				ErrInvalidBrokerURL, i, raw)
 		}
 		if !builtinScheme(u.Scheme) {

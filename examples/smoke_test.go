@@ -2,8 +2,8 @@
 
 // Package examples_test runs every example program against the brokers
 // conformance/docker-compose.yml starts — mosquitto on 1883, EMQX on
-// 1884 with its WebSocket listener on 8083 — so an example that compiles
-// but fails when run is caught:
+// 1884 with its WebSocket listener on 8083 and its QUIC listener on
+// 14567/udp — so an example that compiles but fails when run is caught:
 //
 //	docker compose -f conformance/docker-compose.yml up -d --wait
 //	go -C examples test -tags smoke -v -run TestExamplesRun .
@@ -23,7 +23,13 @@ import (
 // get the interrupt after runFor and must then stop cleanly.
 var examples = []string{
 	"readme/quickstart", "subscribe", "typed", "request", "durable", "reconnect",
-	"failover", "pool", "group", "bridge", "shared", "stats", "disconnect", "oauth", "ws",
+	"failover", "pool", "group", "bridge", "shared", "stats", "disconnect", "oauth", "ws", "quic",
+}
+
+// env is what an example needs beyond the defaults: the quic example
+// trusts the certificate the compose file generates for EMQX.
+var env = map[string][]string{
+	"quic": {"MQTT_CA_FILE=../conformance/tls/pki/root.pem"},
 }
 
 const (
@@ -42,6 +48,7 @@ func TestExamplesRun(t *testing.T) {
 			var out bytes.Buffer
 			cmd := exec.Command(exe)
 			cmd.Env = append(os.Environ(), "MQTT_DATA_DIR="+t.TempDir())
+			cmd.Env = append(cmd.Env, env[dir]...)
 			cmd.Stdout, cmd.Stderr = &out, &out
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)

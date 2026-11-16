@@ -40,9 +40,15 @@ the caller stays blocked until the broker acknowledges it. A refusal
   its own goroutine: no hand-off, and a QoS 0 header and payload go out
   in one `writev` without the payload being copied.
 - When publishers overlap, their packets queue for the connection's
-  writer goroutine, which writes them together; `WithWriteBatch(n)`
-  coalesces them into one `writev`. Fire-and-forget QoS 0 always goes
-  through the writer.
+  writer goroutine. The QoS 1/2 publishes in the queue go out together,
+  up to 64 in one write and as many as the send quota allows; queued
+  QoS 0 packets do with `WithWriteBatch(n)`, up to n in one write.
+  Fire-and-forget QoS 0 always goes through the writer.
+- TLS, WebSocket and QUIC connections have no `writev`: each write is
+  a TLS record or WebSocket frame and a syscall of its own. The writer
+  copies a packet's header and body, or a batch of packets, into one
+  write of up to 16 KiB; a larger payload goes out on its own,
+  uncopied.
 - If ctx ends during a write, the writer goroutine finishes the packet,
   so it may still reach the broker after `Publish` returned ctx's error.
 

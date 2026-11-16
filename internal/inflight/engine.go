@@ -58,6 +58,9 @@ var (
 	// ErrMessageExpired completes outbound messages whose Message Expiry
 	// Interval ran out before they could be republished.
 	ErrMessageExpired = errors.New("mqttv5: message expired before it could be sent again")
+	// ErrInterrupted is the Err of a flow whose wait [Engine.Interrupt]
+	// ended before the flow finished.
+	ErrInterrupted = errors.New("mqttv5: stopped waiting for the broker's acknowledgement")
 	// ErrReceiveMaximumExceeded is returned by Receive when the broker
 	// sends more unacknowledged QoS > 0 PUBLISHes than the client allows.
 	ErrReceiveMaximumExceeded = errors.New("mqttv5: broker exceeded the client's Receive Maximum")
@@ -290,6 +293,7 @@ func (e *Engine) Restore(ctx context.Context) error {
 		return errors.New("mqttv5: Restore over a live session")
 	}
 	e.failure = nil
+	e.ids.wake()
 	e.ids = newIDTable(e.ids.max)
 	clear(e.orphans)
 	e.meta = meta
@@ -313,7 +317,7 @@ func (e *Engine) Restore(ctx context.Context) error {
 					slog.Int("packet_id", int(r.Key.PacketID)), slog.Int("outcome", int(r.Outcome)))
 				continue
 			}
-			close(o.done)
+			o.wake(o.err)
 			e.orphans[string(o.ref)] = o
 			e.nextSeq = max(e.nextSeq, r.Seq+1)
 		case r.Key.Dir == session.Outbound:
@@ -621,13 +625,13 @@ func (e *Engine) Discard(ctx context.Context) error {
 	var settles []func(context.Context, error) error
 	for _, o := range e.drainFlowsLocked() {
 		e.finishLocked(o, ErrSessionLost)
-		e.releaseLocked(o.id, OwnerPublish)
+		e.ids.release(o.id, OwnerPublish)
 		if o.settle != nil {
 			settles = append(settles, o.settle)
 		}
 	}
 	for ref, o := range e.orphans {
-		e.releaseLocked(o.id, OwnerPublish)
+		e.ids.release(o.id, OwnerPublish)
 		delete(e.orphans, ref)
 		if o.settle != nil {
 			settles = append(settles, o.settle)
@@ -643,6 +647,19 @@ func (e *Engine) Discard(ctx context.Context) error {
 		_ = settle(ctx, ErrSessionLost)
 	}
 	return nil
+}
+
+// Interrupt ends the wait on every unfinished flow: Done closes and Err
+// reports ErrInterrupted. The flows themselves go on, and a later
+// connection sends them as before. It lets a caller waiting on Done also
+// stop when something ends that is not the flow, without selecting on a
+// channel every waiter shares.
+func (e *Engine) Interrupt() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, o := range e.out {
+		o.wake(ErrInterrupted)
+	}
 }
 
 // Disconnected unbinds the engine from l's connection. State is kept
@@ -824,31 +841,37 @@ const (
 	OwnerUnsubscribe
 )
 
-// ErrIDsExhausted is returned by AllocateID when all 65,535 packet
-// identifiers are in use and ctx ends before one is released.
+// ErrIDsExhausted is returned by AllocateID and Register when all
+// 65,535 packet identifiers are in use and ctx ends before one is
+// released.
 var ErrIDsExhausted = errors.New("mqttv5: all packet identifiers in use")
 
-// ErrStopped is returned by AllocateID when its stop channel closes while
-// it waits for an identifier.
+// ErrStopped is returned by AllocateID and Register when their stop
+// channel closes while they wait for an identifier.
 var ErrStopped = errors.New("mqttv5: stopped waiting for a packet identifier")
 
 // idTable hands out packet identifiers 1..65535 and remembers each
-// one's owner. It is guarded by the engine's mutex except for inUse,
-// whose buffered capacity counts allocated identifiers so a full table
-// blocks AllocateID without holding the mutex.
+// one's owner. It is guarded by the engine's mutex.
 type idTable struct {
 	owner [65536]Owner
 	next  uint16
 	max   uint16 // highest identifier handed out; 65535 outside tests
-	inUse chan struct{}
+	used  int
+	// freed is closed at the next release, or when the table is
+	// replaced or the session fails, to wake the callers waiting for an
+	// identifier. It exists only while one waits, so an allocation or
+	// release touches no channel.
+	freed chan struct{}
 }
 
 func newIDTable(max uint16) idTable {
-	return idTable{next: 1, max: max, inUse: make(chan struct{}, int(max))}
+	return idTable{next: 1, max: max}
 }
 
+func (t *idTable) full() bool { return t.used == int(t.max) }
+
 // take marks the first free identifier at or after the hint as owned.
-// The caller holds a reservation in inUse, so one is always free.
+// The table must not be full.
 func (t *idTable) take(o Owner) uint16 {
 	for {
 		id := t.next
@@ -859,6 +882,7 @@ func (t *idTable) take(o Owner) uint16 {
 		}
 		if t.owner[id] == OwnerNone {
 			t.owner[id] = o
+			t.used++
 			return id
 		}
 	}
@@ -870,50 +894,70 @@ func (t *idTable) claim(id uint16, o Owner) bool {
 	if id == 0 || id > t.max || t.owner[id] != OwnerNone {
 		return false
 	}
-	select {
-	case t.inUse <- struct{}{}:
-	default:
-		return false
-	}
 	t.owner[id] = o
+	t.used++
 	return true
 }
 
-// AllocateID reserves a packet identifier for o, blocking while all are
-// in use until ctx ends or stop closes (nil never does).
-func (e *Engine) AllocateID(ctx context.Context, o Owner, stop <-chan struct{}) (uint16, error) {
+// release frees id if o owns it and reports whether it did.
+func (t *idTable) release(id uint16, o Owner) bool {
+	if id == 0 || t.owner[id] != o {
+		return false
+	}
+	t.owner[id] = OwnerNone
+	t.used--
+	t.wake()
+	return true
+}
+
+// wake lets the callers waiting for an identifier try again.
+func (t *idTable) wake() {
+	if t.freed != nil {
+		close(t.freed)
+		t.freed = nil
+	}
+}
+
+// awaitIDLocked waits, without e.mu, for the identifier table to change:
+// a release, Restore replacing it, or the session failing. It returns
+// with e.mu held again, and an error once ctx ends or stop closes.
+func (e *Engine) awaitIDLocked(ctx context.Context, stop <-chan struct{}) error {
+	if e.ids.freed == nil {
+		e.ids.freed = make(chan struct{})
+	}
+	freed := e.ids.freed
+	e.mu.Unlock()
+	defer e.mu.Lock()
 	select {
-	case e.ids.inUse <- struct{}{}:
-	default:
-		select {
-		case e.ids.inUse <- struct{}{}:
-		case <-ctx.Done():
-			return 0, errors.Join(ErrIDsExhausted, ctx.Err())
-		case <-stop:
-			return 0, ErrStopped
+	case <-freed:
+		return nil
+	case <-ctx.Done():
+		return errors.Join(ErrIDsExhausted, ctx.Err())
+	case <-stop:
+		return ErrStopped
+	}
+}
+
+// AllocateID reserves a packet identifier for o, blocking while all are
+// in use until ctx ends or stop closes (nil never does). A PUBLISH gets
+// its identifier from Register instead.
+func (e *Engine) AllocateID(ctx context.Context, o Owner, stop <-chan struct{}) (uint16, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for e.ids.full() {
+		if err := e.awaitIDLocked(ctx, stop); err != nil {
+			return 0, err
 		}
 	}
-	e.mu.Lock()
-	id := e.ids.take(o)
-	e.mu.Unlock()
-	return id, nil
+	return e.ids.take(o), nil
 }
 
 // ReleaseID frees id if o owns it and reports whether it did.
 func (e *Engine) ReleaseID(id uint16, o Owner) bool {
 	e.mu.Lock()
-	ok := e.releaseLocked(id, o)
+	ok := e.ids.release(id, o)
 	e.mu.Unlock()
 	return ok
-}
-
-func (e *Engine) releaseLocked(id uint16, o Owner) bool {
-	if id == 0 || e.ids.owner[id] != o {
-		return false
-	}
-	e.ids.owner[id] = OwnerNone
-	<-e.ids.inUse
-	return true
 }
 
 // maxPublishesPerCollect bounds one Collect so a single writev stays
