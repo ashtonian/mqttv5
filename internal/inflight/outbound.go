@@ -27,7 +27,7 @@ type Out struct {
 	attempted bool // handed to a connection at least once
 	counted   bool // its PUBLISH holds one unit of this connection's send quota
 	finished  bool
-	// settling is set while a job gives the outcome to settle; adopted,
+	// settling is set while the producer records the outcome; adopted,
 	// when Adopt replaced settle meanwhile, so the new one gets it too.
 	settling bool
 	adopted  bool
@@ -37,7 +37,7 @@ type Out struct {
 	outcome byte
 
 	ref    []byte
-	settle func(context.Context, error) error
+	settle SettleFunc
 
 	list       *flowList
 	prev, next *Out
@@ -81,6 +81,20 @@ func (o *Out) wake(err error) {
 	}
 }
 
+// SettleFunc gives a finished flow's outcome to its producer, which
+// records it and then calls done, once, from any goroutine: with nil once
+// it has, and the session forgets the flow; or with the error that kept
+// it from recording the outcome, and the flow keeps its record and packet
+// identifier, the outcome offered again to the next Adopt of its Ref, in
+// this process or, from the stored record, after a restart. A
+// SettleFunc must not block: it may run on the connection's read
+// goroutine. For a flow a session failure or Discard drops, done changes
+// nothing.
+type SettleFunc func(outcome error, done func(error))
+
+// ignoreDone is the done of an outcome nothing waits for.
+func ignoreDone(error) {}
+
 // Message is an outbound QoS 1/2 PUBLISH to register.
 type Message struct {
 	QoS byte
@@ -92,24 +106,23 @@ type Message struct {
 	// Ref identifies the message to its producer across restarts and is
 	// stored with its record; see Adopt.
 	Ref []byte
-	// Settle, when set, is called with the flow's outcome after it
-	// finishes and before its record is deleted, so a producer that
-	// records the outcome first never loses it to a crash. It runs on an
-	// engine goroutine, or inside Connected or Discard when a session is
-	// lost, never on the caller's or the read goroutine otherwise.
-	//
-	// An error means the producer could not record the outcome: the
-	// record and the packet identifier are kept, and the outcome is
-	// offered again to the next Adopt of the Ref, in this process or,
-	// from the stored record, after a restart. When the session fails
-	// (see [Config.OnFailure]) Settle gets the [*StoreError]; the record
-	// is kept and Adopt finds the flow again after Restore.
-	Settle func(ctx context.Context, err error) error
+	// Settle, when set, is given the flow's outcome once it finishes. The
+	// record is deleted only after the producer has recorded the outcome
+	// (see [SettleFunc]), so a crash never loses it. When the session
+	// fails (see [Config.OnFailure]) Settle gets the [*StoreError]; the
+	// record is kept and Adopt finds the flow again after Restore.
+	Settle SettleFunc
 	// OnDone, when set, is called once when the flow's Done closes, with
 	// what Err reports from then on, unless Withdraw closes it: the
 	// caller that takes the flow back knows. It runs with the engine's
 	// mutex held, so it must return quickly and must not call the engine.
 	OnDone func(err error)
+	// BeforeWait, when set, is called once, without the engine's mutex,
+	// if Register has to wait for a packet identifier, before it waits. A
+	// caller that releases the flows it registers together, with one
+	// marker (see [Link.QueueOrdered]), queues that marker here: those
+	// flows' acknowledgements may be what frees an identifier.
+	BeforeWait func()
 }
 
 // Register allocates a packet identifier for m, writes it into m.Packet
@@ -140,6 +153,13 @@ func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) 
 
 	e.mu.Lock()
 	for e.failure == nil && e.ids.full() {
+		if before := m.BeforeWait; before != nil {
+			m.BeforeWait = nil
+			e.mu.Unlock()
+			before()
+			e.mu.Lock()
+			continue
+		}
 		if err := e.awaitIDLocked(ctx, stop); err != nil {
 			e.mu.Unlock()
 			return nil, nil, err
@@ -239,9 +259,9 @@ func (e *Engine) Withdraw(o *Out) bool {
 // Adopt makes settle the Settle of the flow whose Ref is ref — one
 // restored from the store, or one an earlier producer started and gave
 // up on — and reports whether there is such a flow. If it has finished
-// without its outcome being recorded, settle gets that outcome on an
-// engine goroutine. The Settle it replaces is never called.
-func (e *Engine) Adopt(ref []byte, settle func(context.Context, error) error) bool {
+// without its outcome being recorded, settle gets that outcome, possibly
+// before Adopt returns. The Settle it replaces is never called.
+func (e *Engine) Adopt(ref []byte, settle SettleFunc) bool {
 	e.mu.Lock()
 	if o := e.refs[string(ref)]; o != nil {
 		o.settle = settle
@@ -458,23 +478,18 @@ func (e *Engine) decodeOutcomeLocked(o *Out) bool {
 	return true
 }
 
-// settleLocked queues the job that gives o's outcome to its Settle and
-// then deletes its record. When the Settle fails o stays an orphan,
-// record and identifier kept; when Adopt gave o another Settle
-// meanwhile, that one gets the outcome next. It returns the job to
-// start, or nil.
+// settleLocked queues the job that gives o's outcome to its Settle and,
+// once the producer has recorded it, deletes its record. When the
+// producer could not, o stays an orphan, record and identifier kept;
+// when Adopt gave o another Settle meanwhile, that one gets the outcome
+// next. It returns the job to start, or nil.
 func (e *Engine) settleLocked(o *Out) *job {
 	o.settling = true
 	settle, outcome, ref := o.settle, o.err, o.ref
 	k := outKey(o.id)
-	return e.queueLocked(k, o, &job{
+	j := &job{
 		op: "delete outbound",
 		do: func(ctx context.Context) error {
-			if settle != nil {
-				if err := settle(ctx, outcome); err != nil && len(ref) > 0 {
-					return &settleError{err}
-				}
-			}
 			if e.store == nil {
 				return nil
 			}
@@ -506,8 +521,19 @@ func (e *Engine) settleLocked(o *Out) *job {
 			}
 			return nil
 		},
-		goroutine: settle != nil,
-	})
+	}
+	if settle != nil {
+		j.begin = func(finish func(error)) {
+			settle(outcome, func(err error) {
+				if err != nil && len(ref) > 0 {
+					finish(&settleError{err})
+					return
+				}
+				finish(nil)
+			})
+		}
+	}
+	return e.queueLocked(k, o, j)
 }
 
 // creditLocked returns the unit of send quota o's PUBLISH took on this

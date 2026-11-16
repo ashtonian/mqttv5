@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ashtonian/mqttv5/internal/clock"
+	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/internal/testbroker"
 	"github.com/ashtonian/mqttv5/session"
 	"github.com/ashtonian/mqttv5/wire"
@@ -304,6 +306,150 @@ func TestQueuePublisherOneExchangePerMessage(t *testing.T) {
 	waitQueueLen(t, q, 0)
 	if got := qb.payloads(); len(got) != 1 {
 		t.Fatalf("broker received %q", got)
+	}
+}
+
+// A window larger than the packet identifiers left free still drains:
+// the drain waits for an identifier while the outcomes that free one are
+// recorded apart from it.
+func TestQueuePublisherWindowBeyondFreeIdentifiers(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	cli := tbClient(t, b)
+	const free = 2
+	for range 65535 - free {
+		if _, err := cli.engine.AllocateID(t.Context(), inflight.OwnerSubscribe, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, cli, q, WithQueueWindow(8))
+	var payloads []string
+	for i := range 32 {
+		payloads = append(payloads, strconv.Itoa(i))
+	}
+	enqueueAll(t, p, 1, payloads...)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, payloads) {
+		t.Fatalf("broker received %q, want %q", got, payloads)
+	}
+}
+
+// ackLog holds the first Ack until release is closed and records the
+// seqs of every Ack.
+type ackLog struct {
+	*MemoryPublisherQueue
+	held, release chan struct{}
+	once          sync.Once
+	mu            sync.Mutex
+	acks          [][]uint64
+}
+
+func (q *ackLog) Ack(ctx context.Context, seqs ...uint64) error {
+	q.mu.Lock()
+	q.acks = append(q.acks, slices.Clone(seqs))
+	q.mu.Unlock()
+	q.once.Do(func() {
+		close(q.held)
+		<-q.release
+	})
+	return q.MemoryPublisherQueue.Ack(ctx, seqs...)
+}
+
+func (q *ackLog) get() [][]uint64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return slices.Clone(q.acks)
+}
+
+// The messages whose outcomes came in while the queue was busy leave it
+// together, in one Ack.
+func TestQueuePublisherRemovesFinishedMessagesTogether(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	q := &ackLog{MemoryPublisherQueue: NewMemoryPublisherQueue(), held: make(chan struct{}), release: make(chan struct{})}
+	const n = 16
+	p := newQueuePublisher(t, tbClient(t, b), q, WithQueueWindow(n))
+	var payloads []string
+	for i := range n {
+		payloads = append(payloads, strconv.Itoa(i))
+	}
+	enqueueAll(t, p, 1, payloads...)
+	<-q.held
+	first := len(q.get()[0])
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		p.mu.Lock()
+		waiting := len(p.outcomes)
+		p.mu.Unlock()
+		if first+waiting == n {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d outcomes waiting behind an Ack of %d, want %d", waiting, first, n-first)
+		}
+	}
+	close(q.release)
+	waitQueueLen(t, q, 0)
+	if acks := q.get(); len(acks) != 2 || len(acks[1]) != n-first {
+		t.Fatalf("Acks %v; want the %d outcomes that waited in one", acks, n-first)
+	}
+}
+
+// keptQueue survives Close, as a durable queue's contents do.
+type keptQueue struct{ *MemoryPublisherQueue }
+
+func (keptQueue) Close() error { return nil }
+
+// An exchange that finishes after Close gave up waiting for it keeps its
+// outcome in the session; the next QueuePublisher on the queue records
+// it without publishing the message again.
+func TestQueuePublisherKeepsOutcomeAfterClose(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	st := session.NewMemoryStore()
+	cli := tbClient(t, b, WithStore(st), WithStats())
+	q := keptQueue{NewMemoryPublisherQueue()}
+	p1, err := NewQueuePublisher(cli, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enqueueAll(t, p1, 1, "late")
+	qb.next(t)
+	gaveUp, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p1.Close(gaveUp); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close with the exchange unanswered = %v", err)
+	}
+
+	close(qb.gate)
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		_, recs, err := st.Load(context.Background())
+		if err == nil && len(recs) == 1 && recs[0].Phase == session.Completed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session records %+v (%v), want the finished exchange kept", recs, err)
+		}
+	}
+
+	newQueuePublisher(t, cli, q)
+	waitQueueLen(t, q, 0)
+	waitEmpty(t, st)
+	if got := qb.payloads(); len(got) != 1 {
+		t.Fatalf("broker received %q, want the message once", got)
+	}
+	if sent := cli.Stats().PublishesSent; sent != 1 {
+		t.Fatalf("PublishesSent = %d, want 1", sent)
 	}
 }
 

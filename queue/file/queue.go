@@ -276,32 +276,37 @@ func (q *Queue) Peek(ctx context.Context, after uint64, n int) ([]mqttv5.QueueEn
 	return out, nil
 }
 
-// Ack implements [mqttv5.PublisherQueue].
-func (q *Queue) Ack(ctx context.Context, seq uint64) error {
+// Ack implements [mqttv5.PublisherQueue]: the entries go in one
+// transaction, so a batch costs one sync.
+func (q *Queue) Ack(ctx context.Context, seqs ...uint64) error {
 	if q.closed.Load() {
 		return mqttv5.ErrQueueClosed
 	}
-	k := seqKey(seq)
-	var removed bool
+	var removed uint64
 	err := q.db.Update(ctx, func(tx *bolt.Tx) error {
-		removed = false
+		removed = 0
 		entries := tx.Bucket(bucketEntries)
-		if entries.Get(k) == nil {
+		for _, seq := range seqs {
+			k := seqKey(seq)
+			if entries.Get(k) == nil {
+				continue
+			}
+			if err := entries.Delete(k); err != nil {
+				return err
+			}
+			removed++
+		}
+		if removed == 0 {
 			return nil
 		}
-		removed = true
-		if err := entries.Delete(k); err != nil {
-			return err
-		}
 		meta := tx.Bucket(bucketMeta)
-		return putUint(meta, keyCount, max(getUint(meta, keyCount), 1)-1)
+		count := getUint(meta, keyCount)
+		return putUint(meta, keyCount, count-min(count, removed))
 	})
 	if err != nil {
 		return q.mapErr(err)
 	}
-	if removed {
-		q.count.Add(-1)
-	}
+	q.count.Add(-int64(removed))
 	return nil
 }
 

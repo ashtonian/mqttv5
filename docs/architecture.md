@@ -91,7 +91,7 @@ control queue that survives reconnects.
 | `auth.go` | `Authenticator` interfaces, AUTH handling, `Reauthenticate` |
 | `publish.go` | `Publish`, `PublishAsync` and `PublishResult`, broker-limit checks, publisher pool |
 | `subscribe.go`, `subscription.go` | subscribe API with its results and tokens, `Message` and its delivery, `Queue[T]`; the subscription registry and control queue |
-| `queue_publisher.go` | `QueuePublisher`, the `PublisherQueue` interface and its in-memory implementation |
+| `queue_publisher.go` | `QueuePublisher` — a drain goroutine that starts exchanges and a recorder goroutine that removes finished messages in batches — the `PublisherQueue` interface and its in-memory implementation |
 | `client_group.go` | `ClientGroup` |
 | `types.go` | public value types and errors |
 | `encoding.go` | `Encoding` and the typed calls: `PublishValue`, `SubscribeAs` and their variants, `TypedMessage` |

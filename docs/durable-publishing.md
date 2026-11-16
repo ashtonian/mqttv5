@@ -6,8 +6,11 @@
 
 - `Publish` returns as soon as the message is stored in the queue.
 - A drain goroutine keeps up to `WithQueueWindow` messages in flight
-  (default 32), in queue order, whenever the client is connected, and
-  removes each from the queue once the broker has accepted it. Throughput
+  (default 32), in queue order, whenever the client is connected, and a
+  recorder goroutine removes them from the queue once the broker has
+  accepted them. The acknowledgements that arrive together are recorded
+  together, in one `Ack` — one transaction, and with `queue/file` one
+  sync — so removal keeps pace with the broker. Throughput
   approaches window ÷ round-trip time, the window capped by the broker's
   Receive Maximum (20 on mosquitto): against a broker that allows the
   whole window, at 25 ms, about 1,200 msg/s with the default window and
@@ -55,7 +58,10 @@ predecessor had in flight — QoS 1 resent with DUP=1, QoS 2 from where it
 stopped — rather than publishing those messages again. If removing a
 finished message from the queue fails, the session keeps the exchange's
 record and the removal is retried with `WithQueueRetryBackoff` (or by
-the next process) without publishing the message again. A message is
+the next process) without publishing the message again. `Close` waits,
+until its ctx ends, for the exchanges in flight and their outcomes; one
+that finishes later keeps its outcome in the session, and the next
+`QueuePublisher` on the queue records it. A message is
 published again as new only if the broker lost the session; enable
 `WithQueueIdempotencyKey` to add the message ID as the `mqttv5-msg-id`
 user property so consumers can drop that copy.
@@ -78,4 +84,6 @@ continue after a reconnect or restart.
 
 Use `mqttv5.NewMemoryPublisherQueue()` for in-process buffering without
 crash safety. A custom `PublisherQueue` can be checked against the
-contract with `github.com/ashtonian/mqttv5/queue/queuetest`.
+contract with `github.com/ashtonian/mqttv5/queue/queuetest`; its `Ack`
+takes the sequence numbers of several entries and removes all of them
+or, with an error, none.

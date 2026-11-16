@@ -282,38 +282,35 @@ func (c *Client) publishConnection(ctx context.Context) (*connState, error) {
 }
 
 // publishTracked starts a QoS 1/2 exchange on the current connection
-// and returns without waiting for it: settle receives the outcome (see
-// [inflight.Message]) and ref is stored with the session record so the
-// exchange can be adopted after a restart. The publisher pool is not
-// used.
-func (c *Client) publishTracked(ctx context.Context, po PublishOptions, ref []byte, settle func(context.Context, error) error) error {
+// and returns without waiting for it: x.settle receives the outcome (see
+// [inflight.SettleFunc]) and x.ref is stored with the session record so
+// the exchange can be adopted after a restart. The publisher pool is not
+// used. The flow waits on link (nil when there is none) for a marker,
+// QueueOrdered with seq or a later one, which the caller queues once for
+// all it started, so they go out in one write — or, should registering
+// one have to wait for a packet identifier, in x.beforeWait.
+func (c *Client) publishTracked(ctx context.Context, po PublishOptions, x exchange) (seq uint64, link inflight.Link, err error) {
 	if po.QoS != 1 && po.QoS != 2 {
-		return fmt.Errorf("mqttv5: tracked publish needs QoS 1 or 2, not %d", po.QoS)
+		return 0, nil, fmt.Errorf("mqttv5: tracked publish needs QoS 1 or 2, not %d", po.QoS)
 	}
 	cs := c.cur.Load()
 	if cs == nil {
-		return ErrNotConnected
+		return 0, nil, ErrNotConnected
 	}
 	opts := po.wire()
-	if err := c.applyServerLimits(cs, &opts); err != nil {
-		return err
+	if err = c.applyServerLimits(cs, &opts); err != nil {
+		return 0, nil, err
 	}
 	if opts.QoS == 0 {
 		// WithQoSDowngrade against a broker that grants only QoS 0: no
 		// acknowledgement would ever settle the message.
-		return fmt.Errorf("%w: the broker's Maximum QoS is 0 and a tracked publish needs an acknowledgement", ErrQoSNotSupported)
+		return 0, nil, fmt.Errorf("%w: the broker's Maximum QoS is 0 and a tracked publish needs an acknowledgement", ErrQoSNotSupported)
 	}
-	flow, link, err := c.startReliable(ctx, opts, exchange{ref: ref, settle: settle})
+	flow, link, err := c.startReliable(ctx, opts, x)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
-	if link != nil {
-		// The writer sends the window's flows released meanwhile in one
-		// write. A failed marker leaves the flow to the next marker or
-		// connection: it is stored with its Ref, and Adopt finds it.
-		_ = link.QueueOrdered(ctx, flow.Seq())
-	}
-	return nil
+	return flow.Seq(), link, nil
 }
 
 // applyServerLimits checks opts against what the broker granted in
@@ -499,10 +496,13 @@ type exchange struct {
 	// ref and settle make the exchange durable for a QueuePublisher; see
 	// [inflight.Message].
 	ref    []byte
-	settle func(context.Context, error) error
+	settle inflight.SettleFunc
 	// onDone runs when the wait on the flow ends; see
 	// [inflight.Message.OnDone].
 	onDone func(error)
+	// beforeWait queues the marker for flows the caller registered
+	// before this one; see [inflight.Message.BeforeWait].
+	beforeWait func()
 }
 
 // placeholderPacketID is the identifier a QoS 1/2 PUBLISH is encoded
@@ -545,7 +545,7 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, x exc
 
 	flow, link, err := c.engine.Register(ctx, inflight.Message{
 		QoS: opts.QoS, Packet: packet, ExpiresAt: expiresAt,
-		Ref: x.ref, Settle: x.settle, OnDone: x.onDone,
+		Ref: x.ref, Settle: x.settle, OnDone: x.onDone, BeforeWait: x.beforeWait,
 	}, c.done())
 	switch {
 	case errors.Is(err, inflight.ErrStopped):

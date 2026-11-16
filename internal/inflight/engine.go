@@ -189,10 +189,11 @@ type Engine struct {
 
 	refs map[string]*Out // unfinished flows with a Ref
 	// orphans are finished flows with a Ref whose producer has not
-	// recorded the outcome: one restored without a Settle, or whose
-	// Settle failed. Each keeps its record and identifier until Adopt
-	// settles it, so a restart continues the exchange instead of the
-	// producer publishing the message again.
+	// recorded the outcome: one restored without a Settle, one whose
+	// producer is recording it, or one whose producer could not. Each
+	// keeps its record and identifier until an adopter records it, so a
+	// restart continues the exchange instead of the producer publishing
+	// the message again.
 	orphans map[string]*Out
 
 	// queues holds each record's store writes, queued and running (the
@@ -628,7 +629,7 @@ func (e *Engine) Discard(ctx context.Context) error {
 	e.fifo = e.fifo[:0]
 	clear(e.ctrl)
 	e.ctrl = e.ctrl[:0]
-	var settles []func(context.Context, error) error
+	var settles []SettleFunc
 	for _, o := range e.drainFlowsLocked() {
 		e.finishLocked(o, ErrSessionLost)
 		e.ids.release(o.id, OwnerPublish)
@@ -650,7 +651,7 @@ func (e *Engine) Discard(ctx context.Context) error {
 	// record the outcome changes nothing here: it publishes the message
 	// again as new.
 	for _, settle := range settles {
-		_ = settle(ctx, ErrSessionLost)
+		settle(ErrSessionLost, ignoreDone)
 	}
 	return nil
 }

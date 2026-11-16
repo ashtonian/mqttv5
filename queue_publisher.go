@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ashtonian/mqttv5/internal/clock"
+	"github.com/ashtonian/mqttv5/internal/inflight"
 	"github.com/ashtonian/mqttv5/wire"
 )
 
@@ -43,8 +44,10 @@ var DefaultQueueRetryBackoff = ExponentialBackoff{Initial: time.Second, Max: tim
 //
 // [QueuePublisher.Publish] returns once the message is stored. A drain
 // goroutine keeps up to [WithQueueWindow] messages in flight, in queue
-// order, while the client is connected, and removes each from the queue
-// when the broker has accepted it. A refusal that cannot pass (see
+// order, while the client is connected, and a recorder goroutine removes
+// them from the queue once the broker has accepted them: the outcomes
+// that come in together leave in one [PublisherQueue] Ack. A refusal that
+// cannot pass (see
 // [WithQueueClassifier]) and a message that expired go to the
 // [WithDeadLetter] callback and are removed; other failures are retried
 // with [WithQueueRetryBackoff], after the messages behind them if need
@@ -79,14 +82,36 @@ type QueuePublisher struct {
 
 	mu      sync.Mutex
 	pending map[uint64]*queuedMessage // claimed and unfinished, at most cfg.window
+	// outcomes are the outcomes of finished exchanges, waiting for the
+	// recorder; running counts the exchanges started whose outcome it has
+	// not recorded. Once the recorder has stopped, stopped is set and an
+	// outcome is left to the session.
+	outcomes []exchangeOutcome
+	running  int
+	stopped  bool
 
-	notify    chan struct{}
+	notify    chan struct{} // wakes the drain
+	finished  chan struct{} // wakes the recorder
 	closing   chan struct{}
-	done      chan struct{}
+	drained   chan struct{}   // closed when the drain has returned
+	done      chan struct{}   // closed when the recorder has returned, after the drain
 	ctx       context.Context // canceled by Close
 	cancel    context.CancelFunc
 	closeOnce sync.Once
-	settling  sync.WaitGroup // exchanges whose outcome is still to come
+}
+
+// exchangeOutcome is how a message's exchange ended. done tells the
+// session once the recorder has recorded it, which lets the session
+// forget the exchange (see [inflight.SettleFunc]).
+type exchangeOutcome struct {
+	m    *queuedMessage
+	err  error
+	done func(error)
+
+	// What the recorder makes of it: m leaves the queue, or is started
+	// again at retryAt.
+	gone    bool
+	retryAt time.Time
 }
 
 type queuedMessage struct {
@@ -228,19 +253,22 @@ func NewQueuePublisher(client *Client, queue PublisherQueue, opts ...QueueOption
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &QueuePublisher{
-		client:  client,
-		queue:   queue,
-		cfg:     cfg,
-		logger:  client.cfg.Logger.With("component", "queue-publisher"),
-		clk:     client.cfg.clock,
-		pending: make(map[uint64]*queuedMessage),
-		notify:  make(chan struct{}, 1),
-		closing: make(chan struct{}),
-		done:    make(chan struct{}),
-		ctx:     ctx,
-		cancel:  cancel,
+		client:   client,
+		queue:    queue,
+		cfg:      cfg,
+		logger:   client.cfg.Logger.With("component", "queue-publisher"),
+		clk:      client.cfg.clock,
+		pending:  make(map[uint64]*queuedMessage),
+		notify:   make(chan struct{}, 1),
+		finished: make(chan struct{}, 1),
+		closing:  make(chan struct{}),
+		drained:  make(chan struct{}),
+		done:     make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 	go p.run()
+	go p.recorder()
 	return p, nil
 }
 
@@ -296,28 +324,20 @@ func (p *QueuePublisher) Publish(ctx context.Context, opts PublishOptions) error
 }
 
 // Close stops publishing, waits until ctx for the exchanges in flight to
-// finish, and closes the queue. Messages whose exchange is still running
-// stay in the queue and in the session; the next QueuePublisher on them
-// continues those exchanges.
+// finish and their outcomes to be recorded, and closes the queue.
+// Messages whose exchange is still running stay in the queue and in the
+// session; the next QueuePublisher on them continues those exchanges.
 func (p *QueuePublisher) Close(ctx context.Context) error {
 	p.closeOnce.Do(func() { close(p.closing) })
+	var err error
 	select {
 	case <-p.done:
 	case <-ctx.Done():
-		return fmt.Errorf("mqttv5: QueuePublisher.Close: %w", ctx.Err())
-	}
-	settled := make(chan struct{})
-	go func() {
-		p.settling.Wait()
-		close(settled)
-	}()
-	var err error
-	select {
-	case <-settled:
-	case <-ctx.Done():
 		err = fmt.Errorf("mqttv5: QueuePublisher.Close: messages still in flight: %w", ctx.Err())
 	}
+	// Whatever the drain and the recorder are waiting on gives up.
 	p.cancel()
+	<-p.done
 	if cerr := p.queue.Close(); err == nil {
 		err = cerr
 	}
@@ -333,9 +353,11 @@ func (p *QueuePublisher) signal() {
 
 // run is the drain goroutine: while connected it starts messages whose
 // turn has come and claims new ones until the window is full, then
-// sleeps until something changes.
+// sleeps until something changes. It may block meanwhile — on a packet
+// identifier, a store write, room in the write queue — which is why the
+// outcomes that free those are the recorder's to record, not its own.
 func (p *QueuePublisher) run() {
-	defer close(p.done)
+	defer close(p.drained)
 	timer := p.clk.NewTimer(time.Hour)
 	timer.Stop()
 	for {
@@ -361,29 +383,101 @@ func (p *QueuePublisher) run() {
 	}
 }
 
+// recorder is the goroutine that records the outcomes of finished
+// exchanges, all that came in since it last ran together (see record).
+// Once Close is called it goes on until the drain has returned and every
+// exchange started has its outcome recorded, or until Close gives up.
+func (p *QueuePublisher) recorder() {
+	defer p.stop()
+	drained := p.drained
+	for {
+		select {
+		case <-p.finished:
+		case <-drained:
+			drained = nil
+		case <-p.ctx.Done():
+			return
+		}
+		p.record()
+		if drained == nil && p.idle() {
+			return
+		}
+	}
+}
+
+// idle reports whether every exchange started has its outcome recorded.
+func (p *QueuePublisher) idle() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running == 0
+}
+
+// stop ends the recorder once the drain has returned. The outcomes it
+// has not recorded, and any that come later, are left to the session,
+// which keeps those exchanges for the next QueuePublisher on the queue.
+func (p *QueuePublisher) stop() {
+	<-p.drained
+	p.mu.Lock()
+	p.stopped = true
+	left := p.outcomes
+	p.outcomes = nil
+	p.mu.Unlock()
+	for _, o := range left {
+		o.done(ErrQueueClosed)
+	}
+	close(p.done)
+}
+
 // fill starts every pending message that is due and claims more from the
 // queue while the window has room, until the connection or the
 // QueuePublisher goes away. It returns when the next retry is due, or
 // zero.
 func (p *QueuePublisher) fill() time.Time {
+	rel := &release{ctx: p.ctx}
+	flush := rel.flush
 	for {
 		due, next, room := p.due()
 		for _, m := range due {
-			p.start(m)
+			rel.add(p.start(m, flush))
 		}
 		if room <= 0 || p.client.cur.Load() == nil || p.ctx.Err() != nil {
+			rel.flush()
 			return next
 		}
 		claimed := p.claim(room)
-		if len(claimed) == 0 {
-			return next
-		}
 		for _, m := range claimed {
-			p.start(m)
+			rel.add(p.start(m, flush))
 		}
-		if p.client.cur.Load() == nil {
+		rel.flush()
+		if len(claimed) == 0 || p.client.cur.Load() == nil {
 			return next
 		}
+	}
+}
+
+// release is the one marker that lets the writer send the exchanges fill
+// started since the last, together: the last one's, on the connection it
+// was registered on. It releases every flow before it there, and a flow
+// registered before that connection came up went out when it did.
+type release struct {
+	ctx  context.Context
+	link inflight.Link
+	seq  uint64
+}
+
+func (r *release) add(seq uint64, link inflight.Link) {
+	if link != nil {
+		r.link, r.seq = link, seq
+	}
+}
+
+// flush queues the marker, if there is one. One that fails leaves the
+// flows to the next marker or connection: each is stored with its Ref,
+// and Adopt finds it.
+func (r *release) flush() {
+	if r.link != nil {
+		_ = r.link.QueueOrdered(r.ctx, r.seq)
+		r.link = nil
 	}
 }
 
@@ -436,43 +530,123 @@ func (p *QueuePublisher) claim(n int) []*queuedMessage {
 // flight. When the session already holds one for m — from an earlier
 // process, from before the session store failed, or one whose outcome
 // could not be recorded yet — it continues that exchange; otherwise it
-// publishes m.
-func (p *QueuePublisher) start(m *queuedMessage) {
+// publishes m, and returns the new flow's sequence number and link for
+// the marker that releases it (see release). flush queues the marker for
+// the flows started before m, should m have to wait for a packet
+// identifier.
+func (p *QueuePublisher) start(m *queuedMessage, flush func()) (seq uint64, link inflight.Link) {
 	e := m.entry
 	p.mu.Lock()
 	m.attempts++
+	p.running++
 	p.mu.Unlock()
 
-	p.settling.Add(1)
-	settle := func(_ context.Context, err error) error {
-		defer p.settling.Done()
-		return p.settled(m, err)
-	}
+	settle := func(outcome error, done func(error)) { p.settled(m, outcome, done) }
 	if p.client.engine.Adopt([]byte(e.ID), settle) {
-		return
+		return 0, nil
 	}
 	now := p.clk.Now()
 	if !e.ExpiresAt.IsZero() && !now.Before(e.ExpiresAt) {
-		p.settling.Done()
-		_ = p.drop(m, ErrMessageExpired)
-		return
+		p.notStarted(m, ErrMessageExpired)
+		return 0, nil
 	}
 	opts := e.Publish
 	if !e.ExpiresAt.IsZero() {
 		left := uint32((e.ExpiresAt.Sub(now) + time.Second - 1) / time.Second)
 		opts.MessageExpiryInterval = &left
 	}
-	if err := p.client.publishTracked(p.ctx, opts, []byte(e.ID), settle); err != nil {
-		p.settling.Done()
-		_ = p.failed(m, err)
+	seq, link, err := p.client.publishTracked(p.ctx, opts, exchange{ref: []byte(e.ID), settle: settle, beforeWait: flush})
+	if err != nil {
+		p.notStarted(m, err)
+		return 0, nil
+	}
+	return seq, link
+}
+
+// notStarted acts on err, why m's exchange could not start.
+func (p *QueuePublisher) notStarted(m *queuedMessage, err error) {
+	p.mu.Lock()
+	p.running--
+	p.mu.Unlock()
+	gone, retryAt := p.decide(m, err)
+	if gone {
+		if p.remove(m) == nil {
+			return
+		}
+		retryAt = p.removalRetry(m)
+	}
+	p.reschedule(m, retryAt)
+	p.signal()
+}
+
+// settled is the Settle of m's exchange: it hands the outcome to the
+// recorder. It never blocks.
+func (p *QueuePublisher) settled(m *queuedMessage, outcome error, done func(error)) {
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		done(ErrQueueClosed)
+		return
+	}
+	// One wake for the outcomes the recorder has yet to take.
+	wake := len(p.outcomes) == 0
+	p.outcomes = append(p.outcomes, exchangeOutcome{m: m, err: outcome, done: done})
+	p.mu.Unlock()
+	if wake {
+		select {
+		case p.finished <- struct{}{}:
+		default:
+		}
 	}
 }
 
-// settled handles the outcome of m's exchange. It runs before the
-// session forgets the exchange, so the queue entry is removed first; an
-// error tells the session to keep the exchange because the removal
-// failed.
-func (p *QueuePublisher) settled(m *queuedMessage, err error) error {
+// record records the outcomes that came in since it last ran. The
+// messages they take out of the queue go in one Ack, and only then does
+// the session forget the exchanges, so a crash in between leaves each
+// exchange to be continued rather than its message to be published
+// again. A message to try again is rescheduled once the session has
+// forgotten its exchange, so the retry starts a new one.
+func (p *QueuePublisher) record() {
+	p.mu.Lock()
+	outcomes := p.outcomes
+	p.outcomes = nil
+	p.mu.Unlock()
+	if len(outcomes) == 0 {
+		return
+	}
+	var gone []*queuedMessage
+	for i := range outcomes {
+		o := &outcomes[i]
+		if o.gone, o.retryAt = p.decide(o.m, o.err); o.gone {
+			gone = append(gone, o.m)
+		}
+	}
+	err := p.remove(gone...)
+	for _, o := range outcomes {
+		switch {
+		case !o.gone:
+			o.done(nil)
+			p.reschedule(o.m, o.retryAt)
+		case err != nil:
+			// The session keeps the exchange; the retry adopts it and
+			// gets the outcome again.
+			o.done(err)
+			p.reschedule(o.m, p.removalRetry(o.m))
+		default:
+			o.done(nil)
+		}
+	}
+	p.mu.Lock()
+	p.running -= len(outcomes)
+	p.mu.Unlock()
+	p.signal()
+}
+
+// decide acts on err, the outcome of m's exchange or why it could not
+// start, and reports whether m leaves the queue — accepted, or
+// dead-lettered — or otherwise when to start it again: at retryAt, or
+// once connected when that is zero.
+func (p *QueuePublisher) decide(m *queuedMessage, err error) (gone bool, retryAt time.Time) {
 	switch {
 	case err == nil:
 		p.mu.Lock()
@@ -482,46 +656,44 @@ func (p *QueuePublisher) settled(m *queuedMessage, err error) error {
 		if first {
 			p.client.stats.addPublishSent()
 		}
-		return p.remove(m)
+		return true, time.Time{}
 	case errors.Is(err, ErrSessionLost):
 		// The broker never confirmed it; publish it again as new.
-		p.retry(m, time.Time{})
-		return nil
-	default:
-		return p.failed(m, err)
-	}
-}
-
-// failed decides what a failed attempt for m leads to. It returns the
-// error of a removal that failed.
-func (p *QueuePublisher) failed(m *queuedMessage, err error) error {
-	switch {
+		return false, time.Time{}
 	case errors.Is(err, ErrMessageExpired) || p.cfg.permanent(err):
-		return p.drop(m, err)
-	case errors.Is(err, ErrNotConnected):
-		p.retry(m, time.Time{})
-	case errors.Is(err, ErrClosed) || p.ctx.Err() != nil:
-		p.retry(m, time.Time{})
+		p.deadLetterOnce(m, err)
+		return true, time.Time{}
+	case errors.Is(err, ErrNotConnected), errors.Is(err, ErrClosed), p.ctx.Err() != nil:
+		return false, time.Time{}
 	default:
 		p.mu.Lock()
 		attempts := m.attempts
 		p.mu.Unlock()
 		p.logger.Warn("publishing a queued message failed; will retry",
 			slog.String("topic", m.entry.Publish.Topic), slog.Int("attempt", attempts), slog.Any("error", err))
-		p.retry(m, p.clk.Now().Add(p.cfg.backoff.Delay(attempts-1)))
+		return false, p.clk.Now().Add(p.cfg.backoff.Delay(attempts - 1))
 	}
-	return nil
 }
 
-func (p *QueuePublisher) retry(m *queuedMessage, at time.Time) {
+// reschedule makes m wait, out of flight, to be started at retryAt.
+func (p *QueuePublisher) reschedule(m *queuedMessage, retryAt time.Time) {
 	p.mu.Lock()
-	m.inFlight, m.retryAt = false, at
+	m.inFlight, m.retryAt = false, retryAt
 	p.mu.Unlock()
-	p.signal()
 }
 
-// drop dead-letters m, once, and removes it.
-func (p *QueuePublisher) drop(m *queuedMessage, reason error) error {
+// removalRetry is when to retry taking m out of the queue after it
+// failed.
+func (p *QueuePublisher) removalRetry(m *queuedMessage) time.Time {
+	p.mu.Lock()
+	attempts := m.attempts
+	p.mu.Unlock()
+	return p.clk.Now().Add(p.cfg.backoff.Delay(attempts - 1))
+}
+
+// deadLetterOnce dead-letters m unless it already was; retrying a
+// failed removal does not do it twice.
+func (p *QueuePublisher) deadLetterOnce(m *queuedMessage, reason error) {
 	p.mu.Lock()
 	first := !m.deadLettered
 	m.deadLettered = true
@@ -529,7 +701,6 @@ func (p *QueuePublisher) drop(m *queuedMessage, reason error) error {
 	if first {
 		p.deadLetter(m.entry, reason)
 	}
-	return p.remove(m)
 }
 
 func (p *QueuePublisher) deadLetter(e QueueEntry, reason error) {
@@ -540,24 +711,29 @@ func (p *QueuePublisher) deadLetter(e QueueEntry, reason error) {
 	}
 }
 
-// remove takes m out of the queue and frees its place in the window.
-// When the queue fails, m stays pending and the removal is retried with
-// the retry backoff; the error goes back to the session, which keeps
-// the exchange so the outcome is not lost.
-func (p *QueuePublisher) remove(m *queuedMessage) error {
-	if err := p.queue.Ack(context.Background(), m.entry.Seq); err != nil {
-		p.mu.Lock()
-		attempts := m.attempts
-		p.mu.Unlock()
-		p.logger.Error("removing a finished message from the queue failed; will retry",
-			slog.String("id", m.entry.ID), slog.Int("attempt", attempts), slog.Any("error", err))
-		p.retry(m, p.clk.Now().Add(p.cfg.backoff.Delay(attempts-1)))
+// remove takes ms out of the queue, in one Ack, and frees their places
+// in the window. When the queue fails they stay pending, for the caller
+// to reschedule.
+func (p *QueuePublisher) remove(ms ...*queuedMessage) error {
+	if len(ms) == 0 {
+		return nil
+	}
+	seqs := make([]uint64, len(ms))
+	for i, m := range ms {
+		seqs[i] = m.entry.Seq
+	}
+	if err := p.queue.Ack(p.ctx, seqs...); err != nil {
+		if p.ctx.Err() == nil {
+			p.logger.Error("removing finished messages from the queue failed; will retry",
+				slog.Int("messages", len(ms)), slog.String("first_id", ms[0].entry.ID), slog.Any("error", err))
+		}
 		return err
 	}
 	p.mu.Lock()
-	delete(p.pending, m.entry.Seq)
+	for _, m := range ms {
+		delete(p.pending, m.entry.Seq)
+	}
 	p.mu.Unlock()
-	p.signal()
 	return nil
 }
 
@@ -643,9 +819,9 @@ type PublisherQueue interface {
 	// Peek returns up to n entries with Seq above after, oldest first.
 	Peek(ctx context.Context, after uint64, n int) ([]QueueEntry, error)
 
-	// Ack removes the entry with seq. Acking a missing entry is not an
-	// error.
-	Ack(ctx context.Context, seq uint64) error
+	// Ack removes the entries with seqs, in one atomic step: all or, with
+	// an error, none. Acking a missing entry is not an error.
+	Ack(ctx context.Context, seqs ...uint64) error
 
 	// Len returns the number of entries, in constant time.
 	Len(ctx context.Context) (int, error)
@@ -735,17 +911,19 @@ func (q *MemoryPublisherQueue) Peek(_ context.Context, after uint64, n int) ([]Q
 }
 
 // Ack implements [PublisherQueue].
-func (q *MemoryPublisherQueue) Ack(_ context.Context, seq uint64) error {
+func (q *MemoryPublisherQueue) Ack(_ context.Context, seqs ...uint64) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
 		return ErrQueueClosed
 	}
-	if i := q.search(seq - 1); i < len(q.entries) && q.entries[i].e.Seq == seq && !q.entries[i].acked {
-		q.entries[i] = hole(seq)
-		q.count--
-		q.reclaim()
+	for _, seq := range seqs {
+		if i := q.search(seq - 1); i < len(q.entries) && q.entries[i].e.Seq == seq && !q.entries[i].acked {
+			q.entries[i] = hole(seq)
+			q.count--
+		}
 	}
+	q.reclaim()
 	return nil
 }
 

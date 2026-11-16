@@ -793,6 +793,41 @@ func (h *harness) whileWaitingForID(fn func()) {
 	}
 }
 
+// A Register that has to wait for an identifier calls BeforeWait first,
+// once, so a caller holding the marker for flows it registered can
+// release them; one that does not wait never calls it.
+func TestRegisterCallsBeforeWait(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.e.ids = newIDTable(2)
+	h.connect(false, 0)
+	pkt := func() []byte {
+		p, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+		return p
+	}
+	calls := 0
+	held, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt(), BeforeWait: func() { calls++ }}, nil)
+	if err != nil || calls != 0 {
+		t.Fatalf("Register with an identifier free: err %v, BeforeWait called %d times", err, calls)
+	}
+	h.publish(1, "second")
+
+	release := make(chan struct{})
+	registered := make(chan error, 1)
+	go func() {
+		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt(), BeforeWait: func() {
+			calls++
+			close(release)
+		}}, nil)
+		registered <- err
+	}()
+	<-release
+	h.collect()
+	h.e.HandlePuback(held.PacketID(), 0, nil)
+	if err := <-registered; err != nil || calls != 1 {
+		t.Fatalf("Register that waited: err %v, BeforeWait called %d times", err, calls)
+	}
+}
+
 // Register waits while every identifier is in use, and sends the
 // PUBLISH with the one it gets.
 func TestRegisterWaitsForAnIdentifier(t *testing.T) {
@@ -1169,12 +1204,12 @@ func (h *harness) register(st *opLog, qos byte, ref string) (*Out, chan error) {
 	settled := make(chan error, 1)
 	o, _, err := h.e.Register(context.Background(), Message{
 		QoS: qos, Packet: pkt, Ref: []byte(ref),
-		Settle: func(_ context.Context, err error) error {
+		Settle: func(err error, done func(error)) {
 			if st != nil {
 				st.add("settle " + ref)
 			}
 			settled <- err
-			return nil
+			done(nil)
 		},
 	}, nil)
 	if err != nil {
@@ -1229,19 +1264,44 @@ func TestSettleRunsBeforeTheRecordIsDeleted(t *testing.T) {
 	}
 }
 
-// With an in-memory store Settle still leaves the read goroutine alone.
-func TestSettleNeverBlocksTheAck(t *testing.T) {
-	h := newHarness(t, Config{})
+// The flow keeps its record and identifier until its producer has
+// recorded the outcome, on whatever goroutine and however late; the
+// acknowledgement does not wait for it. A second done changes nothing,
+// not even once the identifier, and so the record's key, has gone to
+// another flow.
+func TestSettleWaitsForTheProducer(t *testing.T) {
+	st := session.NewMemoryStore()
+	h := newHarness(t, Config{Store: st})
+	h.e.ids = newIDTable(1)
 	h.connect(false, 0)
-	release := make(chan struct{})
 	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
-	done := make(chan struct{})
-	o, _, _ := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("r"),
-		Settle: func(context.Context, error) error { <-release; close(done); return nil }}, nil)
+	recording := make(chan func(error), 1)
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("r"),
+		Settle: func(_ error, done func(error)) { recording <- done }}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.collect()
-	h.e.HandlePuback(o.PacketID(), 0, nil) // returns although Settle is blocked
-	close(release)
-	<-done
+	h.e.HandlePuback(o.PacketID(), 0, nil)
+	done := <-recording
+	if h.e.ids.owner[o.PacketID()] != OwnerPublish || len(records(t, st)) != 1 {
+		t.Fatal("identifier or record released before the producer recorded the outcome")
+	}
+	go done(nil)
+	h.drain()
+	if h.e.ids.owner[o.PacketID()] != OwnerNone || h.e.HasState() || len(records(t, st)) != 0 {
+		t.Fatal("identifier, state or record kept after the producer recorded the outcome")
+	}
+
+	next := h.publish(1, "next")
+	if next.PacketID() != o.PacketID() {
+		t.Fatalf("next flow got identifier %d, want %d again", next.PacketID(), o.PacketID())
+	}
+	done(nil)
+	h.drain()
+	if recs := records(t, st); len(recs) != 1 || h.e.ids.owner[next.PacketID()] != OwnerPublish {
+		t.Fatalf("a second done reached the next flow: records %+v", recs)
+	}
 }
 
 func TestSettleOnSessionLoss(t *testing.T) {
@@ -1288,11 +1348,11 @@ func TestAdoptRestoredFlows(t *testing.T) {
 	h2.collect()
 	h2.e.HandlePuback(early.PacketID(), 0, nil)
 
-	if h2.e.Adopt([]byte("unknown"), func(context.Context, error) error { t.Error("settled an unknown ref"); return nil }) {
+	if h2.e.Adopt([]byte("unknown"), func(_ error, done func(error)) { t.Error("settled an unknown ref"); done(nil) }) {
 		t.Fatal("adopted an unknown ref")
 	}
 	finished := make(chan error, 1)
-	if !h2.e.Adopt([]byte("early"), func(_ context.Context, err error) error { finished <- err; return nil }) {
+	if !h2.e.Adopt([]byte("early"), func(err error, done func(error)) { finished <- err; done(nil) }) {
 		t.Fatal("a flow that finished before adoption was not found")
 	}
 	if err := recvSettle(t, finished); err != nil {
@@ -1303,11 +1363,11 @@ func TestAdoptRestoredFlows(t *testing.T) {
 	if err := h2.e.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h2.e.Adopt([]byte("early"), func(context.Context, error) error { return nil }) {
+	if h2.e.Adopt([]byte("early"), func(_ error, done func(error)) { done(nil) }) {
 		t.Fatal("a finished flow was adopted twice")
 	}
 	live := make(chan error, 1)
-	if !h2.e.Adopt([]byte("running"), func(_ context.Context, err error) error { live <- err; return nil }) {
+	if !h2.e.Adopt([]byte("running"), func(err error, done func(error)) { live <- err; done(nil) }) {
 		t.Fatal("restored flow not found by its ref")
 	}
 	h2.e.HandlePuback(running.PacketID(), 0, nil)
