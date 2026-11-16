@@ -121,6 +121,8 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 |---|---|---|
 | `BenchmarkE2E_Publish` | `Publish` in a loop, `lib × qos (0,1,2) × size (64B,1KiB,1MiB)` | one call; at QoS 1/2 including the broker's acknowledgements |
 | `BenchmarkE2E_PublishConcurrent` | `workers` goroutines (8, 64) publishing QoS 1 on one client | elapsed time per acknowledged message across all workers |
+| `BenchmarkE2E_PublishPipelined` | one goroutine keeping `window` (8, 64) QoS 1 messages of 256 bytes outstanding on one client, through a publish that returns before the acknowledgement: mqttv5's `PublishAsync`, paho3's tokens; autopaho has none (see [Reading the results](#reading-the-results)) | elapsed time per acknowledged message |
+| `BenchmarkE2E_PublishQueued` | QoS 1 messages of 256 bytes through each library's store-and-forward queue to a `floor` subscriber, `queue` memory, file (no sync) or file-sync (mqttv5 only), with `backlog` (100, 1000) messages queued but not yet delivered throughout | time per delivered message at that depth |
 | `BenchmarkE2E_Receive` | a subscriber fed by `rawClient` at the rate the broker sustains; `mode` callback/chan/queue, `consumers` goroutines for chan/queue | time per delivered message |
 | `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed, a reference point for the harness's own cost | time per delivered message through the whole pipeline — source, socket, subscriber and sink — at QoS 1 set by the round trip of a 20-message window between client and source |
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
@@ -827,8 +829,32 @@ nil check.
   the pipeline; through the broker, compare `cpu-ns/op`.
 - **MQTT 3.1.1 is a different protocol.** `paho3` has no Receive
   Maximum or properties; it is here as the most widely used Go client.
-  With 64 concurrent publishers it is not held to the broker's window
-  of 20; the MQTT 5 clients are.
+  With 64 concurrent publishers, or a pipelined window of 64, it is not
+  held to the broker's window of 20; the MQTT 5 clients are.
+- **Pipelining needs a publish that returns before the
+  acknowledgement.** mqttv5's `PublishAsync` returns a result to wait
+  on, and paho3's `Publish` a token; one goroutine so keeps a window of
+  messages in flight. autopaho's `Publish` returns only with the PUBACK,
+  so it pipelines only with a goroutine per message, which is what
+  `PublishConcurrent` measures; its asynchronous route,
+  `PublishViaQueue`, reports no outcome to the caller, so it appears in
+  `PublishQueued` instead.
+- **The queues differ in what they promise and in how they scale.**
+  mqttv5's `QueuePublisher` removes a message from its queue once the
+  broker has acknowledged it, and reports a message it gives up on to a
+  dead-letter callback; autopaho's queue manager removes it once it has
+  written it to the connection, after which only the session holds it.
+  autopaho's file queue keeps a file per message and, to find the
+  oldest, lists and stats the whole directory on every `Peek`: in a
+  profile with thousands of messages queued, most of its CPU time is in
+  that scan, so its cost per message grows with the backlog. That is
+  why `PublishQueued` holds the backlog at a fixed depth; an unbounded
+  burst would make its ns/op depend on N. mqttv5's `queue/file` is a
+  bbolt B+tree: each `Publish` is one write transaction and each batch
+  of acknowledged messages one more, whatever the depth. With
+  `file-sync` each of those transactions also waits for a disk sync, and
+  with one publishing goroutine nothing shares it, so ns/op there is
+  about one sync; concurrent publishers share one sync (group commit).
 
 ## Running
 
@@ -851,7 +877,7 @@ belong together in one set of directories:
 ```bash
 export LOAD_MAX=8 DATE=$(date +%Y-%m-%d)
 scripts/run.sh codec . -run '^$' -bench '^Benchmark(Decode|Encode)Publish' -benchmem -timeout 1h
-scripts/run.sh e2e . -tags e2e -run '^$' -bench '^BenchmarkE2E_(Publish|PublishConcurrent|Receive|ReceiveStream|RoundTrip)$' -benchmem -timeout 3h
+scripts/run.sh e2e . -tags e2e -run '^$' -bench '^BenchmarkE2E_(Publish|PublishConcurrent|PublishPipelined|PublishQueued|Receive|ReceiveStream|RoundTrip)$' -benchmem -timeout 4h
 scripts/run.sh e2e-reconnect . -tags e2e -run '^$' -bench '^BenchmarkE2E_Reconnect$' -benchmem -benchtime 100x -timeout 1h
 RUNS=6 scripts/run.sh e2e-latency . -tags e2e -run '^$' -bench '^BenchmarkE2E_Latency$' -benchtime 10000x -timeout 2h
 RUNS=6 scripts/run.sh e2e-slowconsumer . -tags e2e -run '^$' -bench '^BenchmarkE2E_SlowConsumer$' -benchtime 200000x -timeout 1h
@@ -924,7 +950,8 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 
 | Module | Version | Used for |
 |---|---|---|
-| `github.com/eclipse/paho.golang` | v0.23.0 | `autopaho` client; `packets` codec |
+| `github.com/eclipse/paho.golang` | v0.23.0 | `autopaho` client and its `queue/memory` and `queue/file` queues; `packets` codec |
+| `github.com/ashtonian/mqttv5/queue/file` | this repository (`replace`) | mqttv5's file queue in `PublishQueued` |
 | `github.com/eclipse/paho.mqtt.golang` | v1.5.1 | `paho3` client |
 | `golang.org/x/perf` | see `go.mod` | `benchtab`: parsing, statistics, units |
 | `eclipse-mosquitto` image | 2.1.2-alpine | the broker |
@@ -932,7 +959,12 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 ## API: adding a library or scenario
 
 A library is a `lib` value in [`e2e_libs_test.go`](e2e_libs_test.go):
-`connect` returns a `publisher`; `subscribe` delivers payloads to a
+`connect` returns a `publisher`; `pipeline`, when the library has a
+publish that returns before the acknowledgement, returns a `pipeliner`
+whose `start` sends a message and whose `wait` waits for its
+acknowledgement; `queue` returns a `publisher` that stores each message
+in the library's queue of one of the kinds listed in `queues`;
+`subscribe` delivers payloads to a
 callback through a delivery `mode` and returns a `subscriber`, whose
 `stop` disconnects it, returns only once the library will deliver
 nothing more, and reports an error when it cannot confirm that within
@@ -974,7 +1006,7 @@ when the run is done. The suite sends synthetic payloads only.
 | Path | What |
 |---|---|
 | `harness_test.go` | broker address, sizes, CPU meter, `rawClient` (the library-neutral publisher and subscriber), and the tests of the harness: the sink, the adapters, the scenarios' rejection of corrupted deliveries |
-| `e2e_libs_test.go` | per-library adapters, the gated `subscription`, `sink`, subscription probe |
+| `e2e_libs_test.go` | per-library adapters (publish, pipelined publish, queued publish, subscribe), the gated `subscription`, `sink`, subscription probe |
 | `e2e_test.go` | the scenarios, and `rawServer`, the library-neutral source for `ReceiveStream` |
 | `codec_bench_test.go`, `fixtures.go` | codec benchmarks and their packets |
 | `cmd/benchtab` | Markdown table generator |

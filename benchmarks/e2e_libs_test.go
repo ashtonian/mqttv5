@@ -15,16 +15,37 @@ import (
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho"
+	"github.com/eclipse/paho.golang/autopaho/queue"
+	apfile "github.com/eclipse/paho.golang/autopaho/queue/file"
+	apmemory "github.com/eclipse/paho.golang/autopaho/queue/memory"
 	"github.com/eclipse/paho.golang/paho"
 	paho3 "github.com/eclipse/paho.mqtt.golang"
 
 	"github.com/ashtonian/mqttv5"
+	qfile "github.com/ashtonian/mqttv5/queue/file"
 )
 
 // publisher is one connected client of a library under test.
 type publisher interface {
 	publish(ctx context.Context, topic string, qos byte, payload []byte) error
 }
+
+// pipeliner is a connected client whose publish returns before the
+// acknowledgement: start hands one message over and returns a handle,
+// and wait blocks until the broker has acknowledged that message.
+type pipeliner struct {
+	start func(ctx context.Context, topic string, qos byte, payload []byte) (handle any, err error)
+	wait  func(ctx context.Context, handle any) error
+}
+
+// Store-and-forward queue kinds. The file queues differ in durability:
+// queueFile does not sync to disk, as autopaho's file queue never does;
+// queueFileSync syncs each commit.
+const (
+	queueMemory   = "memory"
+	queueFile     = "file"
+	queueFileSync = "file-sync"
+)
 
 type clientConfig struct {
 	id string
@@ -68,6 +89,14 @@ type lib struct {
 	// modes are the delivery modes subscribe supports.
 	modes   []mode
 	connect func(b *testing.B, cfg clientConfig) publisher
+	// pipeline connects a client whose publish returns before the
+	// acknowledgement; nil when the library has none.
+	pipeline func(b *testing.B, cfg clientConfig) pipeliner
+	// queues are the store-and-forward queue kinds queue supports: it
+	// connects a client whose publish stores the message in a queue of
+	// that kind, which the library drains to the broker.
+	queues []string
+	queue  func(b *testing.B, cfg clientConfig, kind string) publisher
 	// subscribe connects a subscriber to filter and passes each
 	// message's payload to onMsg through mode — from consumers
 	// goroutines for chan and queue. onMsg may block. A QoS 1/2 message
@@ -235,9 +264,23 @@ func (g *gate) close() {
 }
 
 var libs = []lib{
-	{name: "mqttv5", v5: true, modes: []mode{modeCallback, modeChan, modeQueue}, connect: connectMqttv5, subscribe: subscribeMqttv5},
-	{name: "autopaho", v5: true, modes: []mode{modeCallback, modeChan}, connect: connectAutopaho, subscribe: subscribeAutopaho},
-	{name: "paho3", v5: false, modes: []mode{modeCallback}, connect: connectPaho3, subscribe: subscribePaho3},
+	{
+		name: "mqttv5", v5: true, modes: []mode{modeCallback, modeChan, modeQueue},
+		connect: connectMqttv5, pipeline: pipelineMqttv5,
+		queues: []string{queueMemory, queueFile, queueFileSync}, queue: queueMqttv5,
+		subscribe: subscribeMqttv5,
+	},
+	{
+		name: "autopaho", v5: true, modes: []mode{modeCallback, modeChan},
+		connect: connectAutopaho,
+		queues:  []string{queueMemory, queueFile}, queue: queueAutopaho,
+		subscribe: subscribeAutopaho,
+	},
+	{
+		name: "paho3", v5: false, modes: []mode{modeCallback},
+		connect: connectPaho3, pipeline: pipelinePaho3,
+		subscribe: subscribePaho3,
+	},
 }
 
 func (l lib) supports(m mode) bool {
@@ -295,6 +338,52 @@ func newMqttv5(b *testing.B, cfg clientConfig) *mqttv5.Client {
 
 func connectMqttv5(b *testing.B, cfg clientConfig) publisher {
 	return mqttv5Publisher{newMqttv5(b, cfg)}
+}
+
+func pipelineMqttv5(b *testing.B, cfg clientConfig) pipeliner {
+	cli := newMqttv5(b, cfg)
+	return pipeliner{
+		start: func(ctx context.Context, topic string, qos byte, payload []byte) (any, error) {
+			return cli.PublishAsync(ctx, mqttv5.PublishOptions{Topic: topic, QoS: qos, Payload: payload})
+		},
+		wait: func(ctx context.Context, h any) error { return h.(*mqttv5.PublishResult).Wait(ctx) },
+	}
+}
+
+type mqttv5Queuer struct{ p *mqttv5.QueuePublisher }
+
+func (q mqttv5Queuer) publish(ctx context.Context, topic string, qos byte, payload []byte) error {
+	return q.p.Publish(ctx, mqttv5.PublishOptions{Topic: topic, QoS: qos, Payload: payload})
+}
+
+func queueMqttv5(b *testing.B, cfg clientConfig, kind string) publisher {
+	b.Helper()
+	cli := newMqttv5(b, cfg)
+	var q mqttv5.PublisherQueue
+	switch kind {
+	case queueMemory:
+		q = mqttv5.NewMemoryPublisherQueue()
+	case queueFile, queueFileSync:
+		policy := qfile.SyncNone
+		if kind == queueFileSync {
+			policy = qfile.SyncGroupCommit
+		}
+		fq, err := qfile.Open(b.TempDir(), qfile.WithSyncPolicy(policy))
+		if err != nil {
+			b.Fatalf("mqttv5 queue/file Open: %v", err)
+		}
+		q = fq
+	default:
+		b.Fatalf("mqttv5: no queue %q", kind)
+	}
+	p, err := mqttv5.NewQueuePublisher(cli, q)
+	if err != nil {
+		b.Fatalf("mqttv5 NewQueuePublisher: %v", err)
+	}
+	// Cleanups run last first: the publisher closes before the client
+	// disconnects.
+	cleanupWithin(b, "mqttv5 QueuePublisher Close", stopBound, p.Close)
+	return mqttv5Queuer{p}
 }
 
 func subscribeMqttv5(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) subscriber {
@@ -361,7 +450,7 @@ func (p autopahoPublisher) publish(ctx context.Context, topic string, qos byte, 
 	return err
 }
 
-func newAutopaho(b *testing.B, cfg clientConfig, onPublish func(paho.PublishReceived) (bool, error)) *autopaho.ConnectionManager {
+func newAutopaho(b *testing.B, cfg clientConfig, onPublish func(paho.PublishReceived) (bool, error), configure ...func(*autopaho.ClientConfig)) *autopaho.ConnectionManager {
 	b.Helper()
 	u, err := url.Parse("mqtt://" + cfg.host(b))
 	if err != nil {
@@ -391,6 +480,9 @@ func newAutopaho(b *testing.B, cfg clientConfig, onPublish func(paho.PublishRece
 	if onPublish != nil {
 		cc.OnPublishReceived = []func(paho.PublishReceived) (bool, error){onPublish}
 	}
+	for _, c := range configure {
+		c(&cc)
+	}
 	// The connection manager lives until its context is cancelled.
 	life, cancel := context.WithCancel(context.Background())
 	cm, err := autopaho.NewConnection(life, cc)
@@ -413,6 +505,30 @@ func newAutopaho(b *testing.B, cfg clientConfig, onPublish func(paho.PublishRece
 
 func connectAutopaho(b *testing.B, cfg clientConfig) publisher {
 	return autopahoPublisher{newAutopaho(b, cfg, nil)}
+}
+
+type autopahoQueuer struct{ cm *autopaho.ConnectionManager }
+
+func (q autopahoQueuer) publish(ctx context.Context, topic string, qos byte, payload []byte) error {
+	return q.cm.PublishViaQueue(ctx, &autopaho.QueuePublish{Publish: &paho.Publish{Topic: topic, QoS: qos, Payload: payload}})
+}
+
+func queueAutopaho(b *testing.B, cfg clientConfig, kind string) publisher {
+	b.Helper()
+	var q queue.Queue
+	switch kind {
+	case queueMemory:
+		q = apmemory.New()
+	case queueFile:
+		fq, err := apfile.New(b.TempDir(), "msg", ".pub")
+		if err != nil {
+			b.Fatalf("autopaho queue/file New: %v", err)
+		}
+		q = fq
+	default:
+		b.Fatalf("autopaho: no queue %q", kind)
+	}
+	return autopahoQueuer{newAutopaho(b, cfg, nil, func(cc *autopaho.ClientConfig) { cc.Queue = q })}
 }
 
 func subscribeAutopaho(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, consumers int, onMsg func([]byte)) subscriber {
@@ -553,6 +669,24 @@ func disconnectPaho3(ctx context.Context, c paho3.Client) error {
 
 func connectPaho3(b *testing.B, cfg clientConfig) publisher {
 	return paho3Publisher{newPaho3(b, cfg)}
+}
+
+func pipelinePaho3(b *testing.B, cfg clientConfig) pipeliner {
+	c := newPaho3(b, cfg)
+	return pipeliner{
+		start: func(_ context.Context, topic string, qos byte, payload []byte) (any, error) {
+			return c.Publish(topic, qos, false, payload), nil
+		},
+		wait: func(ctx context.Context, h any) error {
+			t := h.(paho3.Token)
+			select {
+			case <-t.Done():
+				return t.Error()
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
 }
 
 func subscribePaho3(b *testing.B, cfg clientConfig, filter string, qos byte, m mode, _ int, onMsg func([]byte)) subscriber {

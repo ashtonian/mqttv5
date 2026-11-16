@@ -113,6 +113,153 @@ func BenchmarkE2E_PublishConcurrent(b *testing.B) {
 	}
 }
 
+// BenchmarkE2E_PublishPipelined has one goroutine keep window QoS 1
+// messages outstanding on one client: before each publish past the first
+// window it waits for the acknowledgement of the message window places
+// back. ns/op is the time per acknowledged message; set against
+// PublishConcurrent with as many workers, it is the same number in
+// flight without a goroutine per message. Only the libraries whose
+// publish can return before the acknowledgement take part — mqttv5's
+// PublishAsync and paho3's tokens. autopaho's Publish waits for the
+// PUBACK, and its asynchronous route, PublishViaQueue, reports no
+// outcome (see PublishQueued). The broker's Receive Maximum of 20 caps
+// what the MQTT 5 client has unacknowledged; the rest of a larger window
+// waits in its session.
+func BenchmarkE2E_PublishPipelined(b *testing.B) {
+	requireBroker(b)
+	for _, l := range libs {
+		if l.pipeline == nil {
+			continue
+		}
+		for _, window := range []int{8, 64} {
+			b.Run(fmt.Sprintf("lib=%s/window=%d/size=%s", l.name, window, size256B.name), func(b *testing.B) {
+				p := l.pipeline(b, clientConfig{id: uniqueID(l.name + "-pipe")})
+				topic := "bench/pipelined/" + uniqueID("")
+				payload := Payload(size256B.bytes)
+				ctx := context.Background()
+				outstanding := make([]any, window)
+				wait := func(i int) {
+					if h := outstanding[i]; h != nil {
+						if err := p.wait(ctx, h); err != nil {
+							b.Fatalf("publish: %v", err)
+						}
+						outstanding[i] = nil
+					}
+				}
+
+				b.SetBytes(int64(size256B.bytes))
+				b.ReportAllocs()
+				b.ResetTimer()
+				cpu := startCPU(b)
+				for i := range b.N {
+					wait(i % window)
+					h, err := p.start(ctx, topic, 1, payload)
+					if err != nil {
+						b.Fatalf("publish: %v", err)
+					}
+					outstanding[i%window] = h
+				}
+				for i := range outstanding {
+					wait(i)
+				}
+				b.StopTimer()
+				cpu.stop()
+			})
+		}
+	}
+}
+
+// BenchmarkE2E_PublishQueued publishes QoS 1 messages through each
+// library's store-and-forward queue, which the library drains to the
+// broker, to a library-neutral subscriber (floor). The publisher keeps
+// backlog messages queued but not yet delivered: it queues backlog
+// messages before the measurement starts and then one more for each
+// delivery, so the queue holds about backlog messages throughout. ns/op
+// is the time per delivered message at that depth. queue=memory compares
+// in-memory queues. queue=file compares file queues that do not sync to
+// disk: autopaho's file queue never does, and mqttv5's queue/file runs
+// with SyncNone. queue=file-sync is queue/file with its default group
+// commit, which survives power loss and has no autopaho counterpart;
+// with one publishing goroutine each message waits for a sync of its
+// own. The libraries leave the queue at different points: mqttv5 removes
+// a message once the broker has acknowledged it, autopaho once it has
+// written it to the connection. Neither has a persistent session store
+// here.
+func BenchmarkE2E_PublishQueued(b *testing.B) {
+	requireBroker(b)
+	for _, l := range libs {
+		for _, kind := range l.queues {
+			for _, backlog := range []int{100, 1000} {
+				b.Run(fmt.Sprintf("lib=%s/queue=%s/backlog=%d/size=%s", l.name, kind, backlog, size256B.name), func(b *testing.B) {
+					runPublishQueued(b, l, kind, backlog)
+				})
+			}
+		}
+	}
+}
+
+func runPublishQueued(b *testing.B, l lib, kind string, backlog int) {
+	topic := "bench/queued/" + uniqueID("")
+	total := backlog + b.N
+	s := newSink(size256B.bytes, total)
+	// delivered wakes the publisher after a delivery; one pending wake-up
+	// is enough, as it rereads the count.
+	delivered := make(chan struct{}, 1)
+	sub := subscribe(b, floorLib, clientConfig{id: uniqueID("floor-sub"), receiveMaximum: receiveWindow}, topic, 1, modeCallback, 1, func(p []byte) {
+		if s.accept(p) {
+			select {
+			case delivered <- struct{}{}:
+			default:
+			}
+		}
+	})
+	p := l.queue(b, clientConfig{id: uniqueID(l.name + "-queue")}, kind)
+	ctx := context.Background()
+	waitLive(b, s, func() error { return p.publish(ctx, topic, 1, nil) })
+	// One buffer, stamped for each message: both libraries copy a message
+	// into the queue before their publish returns.
+	payload := Payload(size256B.bytes)
+	publish := func(seq int) {
+		stampSeq(payload, uint64(seq))
+		if err := p.publish(ctx, topic, 1, payload); err != nil {
+			b.Fatalf("queue %d: %v", seq, err)
+		}
+	}
+	stall := time.NewTimer(time.Minute)
+	defer stall.Stop()
+	// awaitDelivered waits until at least n messages have been delivered.
+	awaitDelivered := func(n int64) {
+		for s.got.Load() < n {
+			stall.Reset(time.Minute)
+			select {
+			case <-delivered:
+			case <-s.invalid:
+				b.Fatalf("invalid delivery: %s", s)
+			case <-stall.C:
+				b.Fatalf("no delivery for a minute: %s", s)
+			}
+		}
+	}
+	for seq := range backlog {
+		publish(seq)
+	}
+
+	b.SetBytes(int64(size256B.bytes))
+	b.ReportAllocs()
+	b.ResetTimer()
+	cpu := startCPU(b)
+	before := s.got.Load()
+	for seq := backlog; seq < total; seq++ {
+		awaitDelivered(int64(seq - backlog + 1))
+		publish(seq)
+	}
+	awaitDelivered(before + int64(b.N))
+	b.StopTimer()
+	cpu.stop()
+	s.wait(b, time.Minute)
+	s.check(b, sub)
+}
+
 // receiveWindow is the Receive Maximum the MQTT 5 subscribers advertise:
 // the benchmark broker's in-flight limit towards MQTT 3.1.1 clients, so
 // every library receives QoS 1 with the same window.
