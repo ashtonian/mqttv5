@@ -111,15 +111,15 @@ the same pinned mosquitto broker. QoS 0 waits for the packet to be
 written (`PublishWaitForFlush`); QoS 1/2 wait for the broker's
 acknowledgement. `autopaho` is MQTT 5; `paho3` is MQTT 3.1.1.
 
-<!-- benchtab file=benchmarks/results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish /size:1KiB" rows=qos cols=lib unit=allocs/op -->
+<!-- benchtab file=benchmarks/results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Publish /size:1KiB" rows=qos cols=lib unit=allocs/op -->
 
 | qos | mqttv5 | autopaho | paho3 |
 |---|---:|---:|---:|
 | 0 | 0 | 15 | 23 |
-| 1 | 5 | 53 | 42 |
-| 2 | 6 | 92 | 62 |
+| 1 | 4 | 53 | 42 |
+| 2 | 5 | 92 | 62 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 See the [full benchmarks](benchmarks/README.md) for decoding and delivery
