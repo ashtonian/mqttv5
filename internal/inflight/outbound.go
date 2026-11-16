@@ -119,7 +119,7 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 
 	e.mu.Lock()
 	if e.failure != nil {
-		e.releaseLocked(m.ID, OwnerPublish)
+		e.ids.release(m.ID, OwnerPublish)
 		defer e.mu.Unlock()
 		return nil, nil, e.failure
 	}
@@ -138,38 +138,40 @@ func (e *Engine) Register(ctx context.Context, m Message) (*Out, Link, error) {
 	if e.cursor == nil {
 		e.cursor = o
 	}
-	var put *job
-	var putErr error
-	if e.store != nil {
-		r := o.record()
-		// A fresh flow has no earlier write, so this Put is first in line
-		// and runs below on the caller's goroutine, under its ctx.
-		put = e.queueLocked(outKey(o.id), o, &job{
-			op: "put outbound",
-			do: func(context.Context) error { return e.store.Put(ctx, r) },
-			after: func(err error) error {
-				if err == nil {
-					return nil
-				}
-				// Never stored: the caller learns it was not accepted, and
-				// writes queued for it since (a reconnect's) never run.
-				putErr = &StoreError{Op: "put outbound", Err: err}
-				e.cancelLocked(outKey(o.id), o)
-				e.unlinkLocked(o)
-				delete(e.out, o.id)
-				if len(o.ref) > 0 {
-					delete(e.refs, string(o.ref))
-					// A session loss may have ended it meanwhile.
-					if e.orphans[string(o.ref)] == o {
-						delete(e.orphans, string(o.ref))
-					}
-				}
-				o.finished = true
-				e.releaseLocked(o.id, OwnerPublish)
-				return nil
-			},
-		})
+	if e.store == nil {
+		link := e.link
+		e.mu.Unlock()
+		return o, link, nil
 	}
+	var putErr error
+	r := o.record()
+	// A fresh flow has no earlier write, so this Put is first in line
+	// and runs below on the caller's goroutine, under its ctx.
+	put := e.queueLocked(outKey(o.id), o, &job{
+		op: "put outbound",
+		do: func(context.Context) error { return e.store.Put(ctx, r) },
+		after: func(err error) error {
+			if err == nil {
+				return nil
+			}
+			// Never stored: the caller learns it was not accepted, and
+			// writes queued for it since (a reconnect's) never run.
+			putErr = &StoreError{Op: "put outbound", Err: err}
+			e.cancelLocked(outKey(o.id), o)
+			e.unlinkLocked(o)
+			delete(e.out, o.id)
+			if len(o.ref) > 0 {
+				delete(e.refs, string(o.ref))
+				// A session loss may have ended it meanwhile.
+				if e.orphans[string(o.ref)] == o {
+					delete(e.orphans, string(o.ref))
+				}
+			}
+			o.finished = true
+			e.ids.release(o.id, OwnerPublish)
+			return nil
+		},
+	})
 	e.mu.Unlock()
 
 	if put != nil {
@@ -352,7 +354,7 @@ func (e *Engine) retireLocked(o *Out) *job {
 			return e.completeLocked(o)
 		}
 	} else if e.store == nil && o.settle == nil {
-		e.releaseLocked(o.id, OwnerPublish)
+		e.ids.release(o.id, OwnerPublish)
 		return nil
 	}
 	return e.settleLocked(o)
@@ -471,7 +473,7 @@ func (e *Engine) settleLocked(o *Out) *job {
 				if len(o.ref) > 0 && e.orphans[string(o.ref)] == o {
 					delete(e.orphans, string(o.ref))
 				}
-				e.releaseLocked(o.id, OwnerPublish)
+				e.ids.release(o.id, OwnerPublish)
 			}
 			return nil
 		},

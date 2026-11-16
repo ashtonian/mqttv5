@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -650,8 +651,8 @@ func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	if _, err := h.e.AllocateID(ctx, OwnerPublish, nil); !errors.Is(err, ErrIDsExhausted) {
 		t.Fatalf("err = %v", err)
 	}
@@ -664,6 +665,56 @@ func TestIdentifiersBlockWhenExhausted(t *testing.T) {
 	id, err := h.e.AllocateID(context.Background(), OwnerSubscribe, nil)
 	if err != nil || id != 4000 {
 		t.Fatalf("after release: id %d err %v", id, err)
+	}
+}
+
+// A call waiting for an identifier gets the next one released, or one
+// of the table Restore loads.
+func TestIdentifierWaitEnds(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.e.ids = newIDTable(3)
+	for range 3 {
+		if _, err := h.e.AllocateID(context.Background(), OwnerSubscribe, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wait := func() <-chan uint16 {
+		got := make(chan uint16, 1)
+		go func() {
+			id, err := h.e.AllocateID(context.Background(), OwnerPublish, nil)
+			if err != nil {
+				t.Error(err)
+			}
+			got <- id
+		}()
+		for {
+			h.e.mu.Lock()
+			waiting := h.e.ids.freed != nil
+			h.e.mu.Unlock()
+			if waiting {
+				return got
+			}
+			runtime.Gosched()
+		}
+	}
+
+	got := wait()
+	h.e.ReleaseID(2, OwnerSubscribe)
+	if id := <-got; id != 2 {
+		t.Fatalf("after a release: id %d, want 2", id)
+	}
+
+	got = wait()
+	if err := h.e.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if id := <-got; id != 1 {
+		t.Fatalf("after Restore: id %d, want 1", id)
+	}
+	h.e.mu.Lock()
+	defer h.e.mu.Unlock()
+	if h.e.ids.used != 1 {
+		t.Fatalf("%d identifiers counted in use after Restore, want 1", h.e.ids.used)
 	}
 }
 

@@ -293,6 +293,7 @@ func (e *Engine) Restore(ctx context.Context) error {
 		return errors.New("mqttv5: Restore over a live session")
 	}
 	e.failure = nil
+	e.ids.wake()
 	e.ids = newIDTable(e.ids.max)
 	clear(e.orphans)
 	e.meta = meta
@@ -624,13 +625,13 @@ func (e *Engine) Discard(ctx context.Context) error {
 	var settles []func(context.Context, error) error
 	for _, o := range e.drainFlowsLocked() {
 		e.finishLocked(o, ErrSessionLost)
-		e.releaseLocked(o.id, OwnerPublish)
+		e.ids.release(o.id, OwnerPublish)
 		if o.settle != nil {
 			settles = append(settles, o.settle)
 		}
 	}
 	for ref, o := range e.orphans {
-		e.releaseLocked(o.id, OwnerPublish)
+		e.ids.release(o.id, OwnerPublish)
 		delete(e.orphans, ref)
 		if o.settle != nil {
 			settles = append(settles, o.settle)
@@ -849,22 +850,27 @@ var ErrIDsExhausted = errors.New("mqttv5: all packet identifiers in use")
 var ErrStopped = errors.New("mqttv5: stopped waiting for a packet identifier")
 
 // idTable hands out packet identifiers 1..65535 and remembers each
-// one's owner. It is guarded by the engine's mutex except for inUse,
-// whose buffered capacity counts allocated identifiers so a full table
-// blocks AllocateID without holding the mutex.
+// one's owner. It is guarded by the engine's mutex.
 type idTable struct {
 	owner [65536]Owner
 	next  uint16
 	max   uint16 // highest identifier handed out; 65535 outside tests
-	inUse chan struct{}
+	used  int
+	// freed is closed at the next release, or when the table is
+	// replaced, to wake the AllocateID calls waiting for an identifier.
+	// It exists only while one waits, so an allocation or release
+	// touches no channel.
+	freed chan struct{}
 }
 
 func newIDTable(max uint16) idTable {
-	return idTable{next: 1, max: max, inUse: make(chan struct{}, int(max))}
+	return idTable{next: 1, max: max}
 }
 
+func (t *idTable) full() bool { return t.used == int(t.max) }
+
 // take marks the first free identifier at or after the hint as owned.
-// The caller holds a reservation in inUse, so one is always free.
+// The table must not be full.
 func (t *idTable) take(o Owner) uint16 {
 	for {
 		id := t.next
@@ -875,6 +881,7 @@ func (t *idTable) take(o Owner) uint16 {
 		}
 		if t.owner[id] == OwnerNone {
 			t.owner[id] = o
+			t.used++
 			return id
 		}
 	}
@@ -886,30 +893,49 @@ func (t *idTable) claim(id uint16, o Owner) bool {
 	if id == 0 || id > t.max || t.owner[id] != OwnerNone {
 		return false
 	}
-	select {
-	case t.inUse <- struct{}{}:
-	default:
+	t.owner[id] = o
+	t.used++
+	return true
+}
+
+// release frees id if o owns it and reports whether it did.
+func (t *idTable) release(id uint16, o Owner) bool {
+	if id == 0 || t.owner[id] != o {
 		return false
 	}
-	t.owner[id] = o
+	t.owner[id] = OwnerNone
+	t.used--
+	t.wake()
 	return true
+}
+
+// wake lets the AllocateID calls waiting for an identifier try again.
+func (t *idTable) wake() {
+	if t.freed != nil {
+		close(t.freed)
+		t.freed = nil
+	}
 }
 
 // AllocateID reserves a packet identifier for o, blocking while all are
 // in use until ctx ends or stop closes (nil never does).
 func (e *Engine) AllocateID(ctx context.Context, o Owner, stop <-chan struct{}) (uint16, error) {
-	select {
-	case e.ids.inUse <- struct{}{}:
-	default:
+	e.mu.Lock()
+	for e.ids.full() {
+		if e.ids.freed == nil {
+			e.ids.freed = make(chan struct{})
+		}
+		freed := e.ids.freed
+		e.mu.Unlock()
 		select {
-		case e.ids.inUse <- struct{}{}:
+		case <-freed:
 		case <-ctx.Done():
 			return 0, errors.Join(ErrIDsExhausted, ctx.Err())
 		case <-stop:
 			return 0, ErrStopped
 		}
+		e.mu.Lock()
 	}
-	e.mu.Lock()
 	id := e.ids.take(o)
 	e.mu.Unlock()
 	return id, nil
@@ -918,18 +944,9 @@ func (e *Engine) AllocateID(ctx context.Context, o Owner, stop <-chan struct{}) 
 // ReleaseID frees id if o owns it and reports whether it did.
 func (e *Engine) ReleaseID(id uint16, o Owner) bool {
 	e.mu.Lock()
-	ok := e.releaseLocked(id, o)
+	ok := e.ids.release(id, o)
 	e.mu.Unlock()
 	return ok
-}
-
-func (e *Engine) releaseLocked(id uint16, o Owner) bool {
-	if id == 0 || e.ids.owner[id] != o {
-		return false
-	}
-	e.ids.owner[id] = OwnerNone
-	<-e.ids.inUse
-	return true
 }
 
 // maxPublishesPerCollect bounds one Collect so a single writev stays
