@@ -736,8 +736,8 @@ func requireBrokerT(t *testing.T) {
 	_ = c.Close()
 }
 
-// The slow-consumer and reconnect scenarios, which go through the
-// broker, reject a corrupted delivery.
+// The slow-consumer, reconnect and queued-publishing scenarios, which go
+// through the broker, reject a corrupted delivery.
 func TestBrokerScenariosRejectCorruption(t *testing.T) {
 	requireBrokerT(t)
 	l := libs[0]
@@ -768,6 +768,22 @@ func TestBrokerScenariosRejectCorruption(t *testing.T) {
 			})
 		}
 		res := testing.Benchmark(func(b *testing.B) { runReconnect(b, corrupting) })
+		if res.N > 0 {
+			t.Fatal("a run with corrupted deliveries was accepted")
+		}
+	})
+	t.Run("PublishQueued", func(t *testing.T) {
+		corrupting := l
+		corrupting.queue = func(b *testing.B, cfg clientConfig, kind string) publisher {
+			p := l.queue(b, cfg, kind)
+			return publishFunc(func(ctx context.Context, topic string, qos byte, payload []byte) error {
+				if len(payload) > 0 {
+					payload = corrupted(payload)
+				}
+				return p.publish(ctx, topic, qos, payload)
+			})
+		}
+		res := testing.Benchmark(func(b *testing.B) { runPublishQueued(b, corrupting, queueMemory, 10) })
 		if res.N > 0 {
 			t.Fatal("a run with corrupted deliveries was accepted")
 		}

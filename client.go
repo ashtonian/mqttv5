@@ -702,7 +702,7 @@ type Stats struct {
 	ServerDisconnects uint64 // broker-sent DISCONNECT packets
 	PingTimeouts      uint64 // PINGRESP timeouts that forced a reconnect
 
-	PublishesSent     uint64 // Publish calls that returned nil (QoS 1/2 once acknowledged), and QueuePublisher messages the broker accepted
+	PublishesSent     uint64 // Publish calls that returned nil (QoS 1/2 once acknowledged), PublishAsync messages likewise, and QueuePublisher messages the broker accepted
 	PublishesAcked    uint64 // PUBACK and PUBCOMP packets received, refusals included
 	PublishesInflight uint64 // QoS 1/2 outbound entries awaiting ack
 	SendQuota         uint64 // QoS 1/2 PUBLISHes the send quota (the broker's Receive Maximum, or MaxInflight) still allows in flight

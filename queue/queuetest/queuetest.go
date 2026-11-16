@@ -46,6 +46,7 @@ func Run(t *testing.T, f Factory) {
 	t.Run("DropNewest", func(t *testing.T) { testDropNewest(t, open(t)) })
 	t.Run("DropOldest", func(t *testing.T) { testDropOldest(t, open(t)) })
 	t.Run("ConcurrentBound", func(t *testing.T) { testConcurrentBound(t, open) })
+	t.Run("ConcurrentPeek", func(t *testing.T) { testConcurrentPeek(t, open(t)) })
 	t.Run("Closed", func(t *testing.T) { testClosed(t, f.Open(t)) })
 	if f.Reopen != nil {
 		t.Run("Reopen", func(t *testing.T) {
@@ -130,19 +131,30 @@ func testOrder(t *testing.T, q mqttv5.PublisherQueue) {
 
 func testAck(t *testing.T, q mqttv5.PublisherQueue) {
 	var seqs []uint64
-	for i := range 4 {
+	for i := range 7 {
 		seqs = append(seqs, enqueue(t, q, entry(fmt.Sprint(i))))
 	}
-	for _, s := range []uint64{seqs[2], seqs[0], seqs[2], seqs[3] + 1000} {
+	for _, s := range []uint64{seqs[2], seqs[0], seqs[2], seqs[6] + 1000} {
 		if err := q.Ack(ctx, s); err != nil {
 			t.Fatalf("Ack(%d): %v", s, err)
 		}
 	}
-	if got := payloads(peek(t, q, 0, 10)); !reflect.DeepEqual(got, []string{"1", "3"}) {
+	if got := payloads(peek(t, q, 0, 10)); !reflect.DeepEqual(got, []string{"1", "3", "4", "5", "6"}) {
 		t.Fatalf("after acks Peek = %q", got)
 	}
-	if n := length(t, q); n != 2 {
-		t.Fatalf("Len = %d, want 2", n)
+	// Several at once, in any order, with one acked already, one twice
+	// and one missing.
+	if err := q.Ack(ctx, seqs[5], seqs[3], seqs[0], seqs[5], seqs[6]+1000); err != nil {
+		t.Fatalf("Ack of several: %v", err)
+	}
+	if got := payloads(peek(t, q, 0, 10)); !reflect.DeepEqual(got, []string{"1", "4", "6"}) {
+		t.Fatalf("after acking several Peek = %q", got)
+	}
+	if n := length(t, q); n != 3 {
+		t.Fatalf("Len = %d, want 3", n)
+	}
+	if err := q.Ack(ctx); err != nil {
+		t.Fatalf("Ack of none: %v", err)
 	}
 }
 
@@ -287,6 +299,62 @@ func testConcurrentBound(t *testing.T, open func(*testing.T) mqttv5.PublisherQue
 				t.Fatalf("Len %d, stored %d, evicted %d, bound %d", n, stored, evicted, max)
 			}
 		})
+	}
+}
+
+// Entries become visible in Seq order while producers race: a reader
+// that, like the QueuePublisher's drain, peeks after the last Seq it
+// has seen misses none of them.
+func testConcurrentPeek(t *testing.T, q mqttv5.PublisherQueue) {
+	const producers, each = 8, 50
+	var wg sync.WaitGroup
+	for g := range producers {
+		wg.Go(func() {
+			for i := range each {
+				if _, _, err := q.Enqueue(ctx, entry(fmt.Sprint(g, "-", i)), mqttv5.QueueLimit{}); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	stored := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(stored)
+	}()
+	var (
+		after uint64
+		seen  []uint64
+	)
+	for done := false; !done; {
+		select {
+		case <-stored:
+			// One more pass after the last Enqueue has returned sees what
+			// is left.
+			done = true
+		default:
+		}
+		for {
+			es := peek(t, q, after, 16)
+			if len(es) == 0 {
+				break
+			}
+			for _, e := range es {
+				seen = append(seen, e.Seq)
+			}
+			after = es[len(es)-1].Seq
+		}
+	}
+	all := peek(t, q, 0, producers*each+1)
+	if len(all) != producers*each {
+		t.Fatalf("queue holds %d entries, want %d", len(all), producers*each)
+	}
+	want := make([]uint64, len(all))
+	for i, e := range all {
+		want[i] = e.Seq
+	}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("a reader peeking after the last Seq it saw got %d entries, want all %d: entries appeared behind it", len(seen), len(want))
 	}
 }
 

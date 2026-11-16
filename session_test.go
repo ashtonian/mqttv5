@@ -811,12 +811,12 @@ type failingAckQueue struct {
 	acks   atomic.Int32
 }
 
-func (q *failingAckQueue) Ack(ctx context.Context, seq uint64) error {
+func (q *failingAckQueue) Ack(ctx context.Context, seqs ...uint64) error {
 	q.acks.Add(1)
 	if !q.healed.Load() {
 		return errors.New("queue unavailable")
 	}
-	return q.MemoryPublisherQueue.Ack(ctx, seq)
+	return q.MemoryPublisherQueue.Ack(ctx, seqs...)
 }
 
 // A message the broker accepted but the queue could not remove keeps
@@ -870,7 +870,7 @@ func (s *registerGate) Put(ctx context.Context, r session.Record) error {
 
 // A store failure while a queued message's record is being written ends
 // that message's exchange once: the QueuePublisher sees one outcome, so
-// its accounting holds (no negative WaitGroup) and it closes cleanly.
+// its count of running exchanges holds and it closes cleanly.
 func TestQueuePublisherSurvivesStoreFailureDuringRegister(t *testing.T) {
 	st := &registerGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
 	triggered, pubrec := make(chan struct{}), make(chan struct{})

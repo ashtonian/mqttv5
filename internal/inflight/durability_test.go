@@ -384,9 +384,9 @@ func TestFailedSettleKeepsTheRecord(t *testing.T) {
 	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	attempts := make(chan error, 1)
 	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
-		Settle: func(_ context.Context, outcome error) error {
+		Settle: func(outcome error, done func(error)) {
 			attempts <- outcome
-			return errors.New("queue unavailable")
+			done(errors.New("queue unavailable"))
 		}}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +405,7 @@ func TestFailedSettleKeepsTheRecord(t *testing.T) {
 	}
 
 	settled := make(chan error, 1)
-	if !h.e.Adopt([]byte("entry"), func(_ context.Context, outcome error) error { settled <- outcome; return nil }) {
+	if !h.e.Adopt([]byte("entry"), func(outcome error, done func(error)) { settled <- outcome; done(nil) }) {
 		t.Fatal("the unsettled flow was not offered again")
 	}
 	if err := recvSettle(t, settled); err != nil {
@@ -444,7 +444,7 @@ func TestOrphanKeepsRecordUntilAdopted(t *testing.T) {
 		t.Fatal("an unadopted orphan is session state worth resuming")
 	}
 	settled := make(chan error, 1)
-	if !restarted.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+	if !restarted.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
 		t.Fatal("orphan not found")
 	}
 	if err := recvSettle(t, settled); err != nil {
@@ -475,9 +475,10 @@ func TestInboundDeleteWaitsForItsPut(t *testing.T) {
 	}
 }
 
-// A producer that adopts a flow again while its Settle is still running
-// — a retry scheduled by the failing Settle itself — gets the outcome
-// once that Settle has failed; the flow is never invisible to Adopt.
+// A producer that adopts a flow again while it is still recording the
+// outcome — a retry scheduled by the failing producer itself — gets the
+// outcome once that recording has failed; the flow is never invisible to
+// Adopt.
 func TestAdoptWhileSettling(t *testing.T) {
 	st := session.NewMemoryStore()
 	h := newHarness(t, Config{Store: st})
@@ -485,11 +486,11 @@ func TestAdoptWhileSettling(t *testing.T) {
 	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	retried := make(chan error, 1)
 	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
-		Settle: func(context.Context, error) error {
-			if !h.e.Adopt([]byte("entry"), func(_ context.Context, outcome error) error { retried <- outcome; return nil }) {
-				t.Error("the flow was not adoptable while its Settle ran")
+		Settle: func(_ error, done func(error)) {
+			if !h.e.Adopt([]byte("entry"), func(outcome error, done func(error)) { retried <- outcome; done(nil) }) {
+				t.Error("the flow was not adoptable while its outcome was being recorded")
 			}
-			return errors.New("queue unavailable")
+			done(errors.New("queue unavailable"))
 		}}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -566,7 +567,7 @@ func TestAcceptedOutcomeSurvivesRestart(t *testing.T) {
 			h.connect(false, 10)
 			pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: 1})
 			o, _, err := h.e.Register(context.Background(), Message{QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
-				Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}, nil)
+				Settle: func(_ error, done func(error)) { done(errors.New("queue unavailable")) }}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -592,7 +593,7 @@ func TestAcceptedOutcomeSurvivesRestart(t *testing.T) {
 			restarted.connect(tc.present, 10)
 			want(t, restarted.collect())
 			settled := make(chan error, 1)
-			if !restarted.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+			if !restarted.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
 				t.Fatal("the completed message was not adoptable after the restart")
 			}
 			if err := recvSettle(t, settled); err != nil {
@@ -619,7 +620,7 @@ func TestFailureDuringRegisterCompletesOnce(t *testing.T) {
 	registered := make(chan error, 1)
 	go func() {
 		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
-			Settle: func(_ context.Context, err error) error { settles <- err; return nil }}, nil)
+			Settle: func(err error, done func(error)) { settles <- err; done(nil) }}, nil)
 		registered <- err
 	}()
 	<-st.held
@@ -734,7 +735,7 @@ func TestEveryOutcomeSurvivesRestart(t *testing.T) {
 				h.connect(false, 10)
 				pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: tc.qos, PacketID: 1})
 				o, _, err := h.e.Register(context.Background(), Message{QoS: tc.qos, Packet: pkt, Ref: []byte("entry"),
-					Settle: func(context.Context, error) error { return errors.New("queue unavailable") }}, nil)
+					Settle: func(_ error, done func(error)) { done(errors.New("queue unavailable")) }}, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -749,7 +750,7 @@ func TestEveryOutcomeSurvivesRestart(t *testing.T) {
 				restarted.connect(present, 10)
 				want(t, restarted.collect())
 				settled := make(chan error, 1)
-				if !restarted.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+				if !restarted.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
 					t.Fatal("the ended exchange was not adoptable after the restart")
 				}
 				tc.want(t, recvSettle(t, settled))
@@ -787,7 +788,7 @@ func TestRestoredOutcomeKeptUntilAdopted(t *testing.T) {
 	third.connect(true, 10)
 	want(t, third.collect())
 	settled := make(chan error, 1)
-	if !third.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+	if !third.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
 		t.Fatal("not adoptable")
 	}
 	if err := recvSettle(t, settled); err != nil {
@@ -806,7 +807,7 @@ func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
 	returned := make(chan error, 1)
 	go func() {
 		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
-			Settle: func(_ context.Context, err error) error { settled <- err; return nil }}, nil)
+			Settle: func(err error, done func(error)) { settled <- err; done(nil) }}, nil)
 		returned <- err
 	}()
 	<-st.held
@@ -817,7 +818,7 @@ func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
 		t.Fatal("Register accepted a message whose record was never written")
 	}
 	h.drain()
-	if h.e.Adopt([]byte("entry"), func(_ context.Context, err error) error { settled <- err; return nil }) {
+	if h.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
 		t.Fatal("a rejected registration is adoptable")
 	}
 	select {

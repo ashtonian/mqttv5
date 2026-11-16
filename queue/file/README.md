@@ -108,7 +108,7 @@ carry over to other hardware. Measure on your own hardware with
 | Symbol | Description |
 |---|---|
 | `Open(dir string, opts ...Option) (*Queue, error)` | Opens or creates the queue in `dir`. Returns `ErrLocked` when another `Queue` (in any process) holds it. Existing entries are kept. |
-| `(*Queue).Enqueue / Peek / Ack / Len / Close` | The `mqttv5.PublisherQueue` contract; Enqueue and Ack are durable per the sync policy when they return. |
+| `(*Queue).Enqueue / Peek / Ack / Len / Close` | The `mqttv5.PublisherQueue` contract; Enqueue and Ack are durable per the sync policy when they return. An Ack of several entries is one transaction, so one sync. |
 | `(*Queue).Path() string` | Path of `queue.db`. |
 | `(*Queue).Corrupt() []error` | Entries quarantined since `Open`, each wrapping `ErrCorrupt`. |
 | `ErrLocked`, `ErrCorrupt` | Sentinels for `errors.Is`. After `Close`, calls return `mqttv5.ErrQueueClosed`. |

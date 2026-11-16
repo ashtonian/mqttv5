@@ -8,7 +8,7 @@ Outbound, a publish takes the shortest path the connection allows:
 flowchart LR
     pub["Publish"] -- "QoS 1/2: packet ID,<br/>send quota, record" --> engine["session engine"] --> store[("session.Store")]
     pub -- "idle TCP or Unix socket" --> direct["caller's goroutine,<br/>direct write"] --> sock(("socket"))
-    pub -- "busy writer, TLS, WebSocket, QUIC,<br/>fire-and-forget QoS 0" --> writer["writer goroutine<br/>queue, batched writes"] --> sock
+    pub -- "busy writer, TLS, WebSocket, QUIC,<br/>fire-and-forget QoS 0, PublishAsync" --> writer["writer goroutine<br/>queue, batched writes"] --> sock
 ```
 
 Inbound, acknowledgements leave in arrival order, from the read loop
@@ -29,9 +29,11 @@ queued: a QoS 0 header and its payload in one `writev`, without copying
 the payload; a QoS 1/2 publish the packet the session keeps for
 retransmission. If the caller's ctx ends mid-write, a deadline stops
 the write and the writer goroutine sends the rest before anything else.
-Otherwise — TLS, WebSocket and QUIC connections, a busy writer, and
-fire-and-forget QoS 0 — one writer goroutine per connection drains an
-MPSC channel of encoded packets to the socket. The QoS 1/2 publishes
+Otherwise — TLS, WebSocket and QUIC connections, a busy writer,
+fire-and-forget QoS 0, and the QoS 1/2 publishes of `PublishAsync` and
+`QueuePublisher`, whose callers do not wait for the write — one writer
+goroutine per connection drains an MPSC channel of encoded packets to
+the socket. The QoS 1/2 publishes
 queued behind a write go out together in one write, and queued QoS 0
 packets do when `WithWriteBatch` is set; a write lock
 keeps the two paths from interleaving, and a publish never overtakes a
@@ -87,9 +89,9 @@ control queue that survives reconnects.
 | `lifecycle.go` | `Connect`/`Disconnect`, the supervisor and its reconnect limits, lifecycle callbacks and their queue, server redirects |
 | `conn.go`, `conn_unix.go`, `conn_other.go` | per-connection state: read loop and dispatch, writer goroutine, direct writes, keep-alive; the non-blocking socket write on unix |
 | `auth.go` | `Authenticator` interfaces, AUTH handling, `Reauthenticate` |
-| `publish.go` | `Publish`, broker-limit checks, publisher pool |
+| `publish.go` | `Publish`, `PublishAsync` and `PublishResult`, broker-limit checks, publisher pool |
 | `subscribe.go`, `subscription.go` | subscribe API with its results and tokens, `Message` and its delivery, `Queue[T]`; the subscription registry and control queue |
-| `queue_publisher.go` | `QueuePublisher`, the `PublisherQueue` interface and its in-memory implementation |
+| `queue_publisher.go` | `QueuePublisher` — a drain goroutine that starts exchanges and a recorder goroutine that removes finished messages in batches — the `PublisherQueue` interface and its in-memory implementation |
 | `client_group.go` | `ClientGroup` |
 | `types.go` | public value types and errors |
 | `encoding.go` | `Encoding` and the typed calls: `PublishValue`, `SubscribeAs` and their variants, `TypedMessage` |

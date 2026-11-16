@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 
 	"github.com/ashtonian/mqttv5/session"
 )
@@ -25,8 +26,9 @@ func (e *StoreError) Error() string {
 // matches either.
 func (e *StoreError) Unwrap() []error { return []error{ErrStoreFailed, e.Err} }
 
-// settleError is a producer's Settle that failed. It is not a store
-// failure: the flow's record is kept until the outcome is settled.
+// settleError is what a producer that could not record an outcome gave
+// done. It is not a store failure: the flow's record is kept until the
+// outcome is recorded.
 type settleError struct{ err error }
 
 func (e *settleError) Error() string { return "settle: " + e.err.Error() }
@@ -35,19 +37,22 @@ func (e *settleError) Unwrap() error { return e.err }
 // job is one store write for a record and what follows from it.
 type job struct {
 	op string
-	do func(ctx context.Context) error
-	// after runs with e.mu held once do has returned, unless the session
-	// failed in between. It returns the error that fails the session: nil
-	// when do succeeded or after has dealt with its error. Without an
-	// after, any error fails the session.
+	// begin, when set, starts the job, which goes on when something else
+	// calls finish: a producer that has recorded an outcome (see
+	// SettleFunc). With nil do follows; an error ends the job with it.
+	// The record's later writes wait meanwhile.
+	begin func(finish func(error))
+	do    func(ctx context.Context) error
+	// after runs with e.mu held once the job has ended, unless the
+	// session failed in between. It returns the error that fails the
+	// session: nil when the job succeeded or after has dealt with its
+	// error. Without an after, any error fails the session.
 	after func(err error) error
-	// goroutine keeps the job off the submitting goroutine even when the
-	// store is in memory: it runs a producer's Settle.
-	goroutine bool
 
 	key   session.RecordKey
 	owner any // the flow the write is for; see cancelLocked
 	epoch uint64
+	begun atomic.Bool // finish has been called; later calls do nothing
 }
 
 // queueLocked appends j to the write queue of the record it writes.
@@ -104,13 +109,13 @@ func inKey(id uint16) session.RecordKey {
 	return session.RecordKey{Dir: session.Inbound, PacketID: id}
 }
 
-// start runs jobs that queueLocked returned: on this goroutine when the
-// store is in memory, otherwise each on its own.
+// start runs jobs that queueLocked returned, each on this goroutine
+// when it may run here (see runsHere), otherwise on its own.
 func (e *Engine) start(jobs ...*job) {
 	for _, j := range jobs {
 		switch {
 		case j == nil:
-		case e.inline && !j.goroutine:
+		case e.runsHere(j):
 			e.run(j)
 		default:
 			go e.run(j)
@@ -118,67 +123,102 @@ func (e *Engine) start(jobs ...*job) {
 	}
 }
 
-// run performs j, then each job queued behind it for the same record.
+// runsHere reports whether j may start on whichever goroutine reaches
+// it: a store write when the store is in memory, and a job that begins
+// by handing something over.
+func (e *Engine) runsHere(j *job) bool { return e.inline || j.begin != nil }
+
+// run performs j, then each job queued behind it for the same record
+// that may run here. A job with a begin goes on from whoever finishes
+// it (see proceed).
 func (e *Engine) run(j *job) {
 	for j != nil {
-		err := j.do(e.bg)
-		if err != nil {
-			e.logWriteError(j.op, err)
+		if j.begin != nil {
+			j.begin(func(err error) {
+				if j.begun.CompareAndSwap(false, true) {
+					e.proceed(j, err)
+				}
+			})
+			return
 		}
-		e.mu.Lock()
-		var failure error
-		if j.epoch == e.epoch {
-			if j.after != nil {
-				failure = j.after(err)
-			} else if err != nil {
-				failure = &StoreError{Op: j.op, Err: err}
-			}
-		}
-		q := e.queues[j.key]
-		q[0] = nil
-		q = q[1:]
-		var next *job
-		if len(q) > 0 {
-			next = q[0]
-			e.queues[j.key] = q
-		} else {
-			delete(e.queues, j.key)
-		}
-		var dropped []func(context.Context, error) error
-		first := false
-		if failure != nil {
-			dropped, first = e.failLocked(failure)
-		}
-		// A write may have made a gated frame or a PUBLISH ready.
-		var l Link
-		if e.writableLocked() {
-			l = e.link
-		}
-		e.mu.Unlock()
+		j = e.end(j, j.do(e.bg))
+	}
+}
 
-		if first {
-			e.afterFailure(failure, dropped)
+// proceed goes on with j once its begin has finished with err: its do,
+// unless err ends it — on this goroutine when the store is in memory,
+// otherwise on one of its own — then the jobs queued behind it.
+func (e *Engine) proceed(j *job, err error) {
+	switch {
+	case err != nil || j.do == nil:
+		e.run(e.end(j, err))
+	case e.inline:
+		e.run(e.end(j, j.do(e.bg)))
+	default:
+		go func() { e.run(e.end(j, j.do(e.bg))) }()
+	}
+}
+
+// end completes j with err and returns the job queued behind it when
+// that may run on this goroutine; otherwise it starts that job on its
+// own and returns nil.
+func (e *Engine) end(j *job, err error) *job {
+	if err != nil {
+		e.logWriteError(j.op, err)
+	}
+	e.mu.Lock()
+	var failure error
+	if j.epoch == e.epoch {
+		if j.after != nil {
+			failure = j.after(err)
+		} else if err != nil {
+			failure = &StoreError{Op: j.op, Err: err}
 		}
-		// The write counts until its failure, if any, has been reported,
-		// so Drain does not return before OnFailure has run.
-		e.mu.Lock()
-		e.writes--
-		if e.writes == 0 {
-			close(e.writesIdle)
-		}
-		e.mu.Unlock()
-		if l != nil {
-			l.Wake()
-		}
-		switch {
-		case next == nil:
-			j = nil
-		case e.inline && !next.goroutine:
-			j = next
-		default:
-			go e.run(next)
-			j = nil
-		}
+	}
+	q := e.queues[j.key]
+	q[0] = nil
+	q = q[1:]
+	var next *job
+	if len(q) > 0 {
+		next = q[0]
+		e.queues[j.key] = q
+	} else {
+		delete(e.queues, j.key)
+	}
+	var dropped []SettleFunc
+	first := false
+	if failure != nil {
+		dropped, first = e.failLocked(failure)
+	}
+	// A write may have made a gated frame or a PUBLISH ready.
+	var l Link
+	if e.writableLocked() {
+		l = e.link
+	}
+	e.mu.Unlock()
+
+	if first {
+		e.afterFailure(failure, dropped)
+	}
+	// The write counts until its failure, if any, has been reported,
+	// so Drain does not return before OnFailure has run.
+	e.mu.Lock()
+	e.writes--
+	if e.writes == 0 {
+		close(e.writesIdle)
+	}
+	e.mu.Unlock()
+	if l != nil {
+		l.Wake()
+	}
+	switch {
+	case next == nil:
+		return nil
+	case e.runsHere(next):
+		return next
+	default:
+		go e.run(next)
+		return nil
 	}
 }
 
@@ -197,7 +237,7 @@ func (e *Engine) logWriteError(op string, err error) {
 // unfinished flows complete with err, and the engine refuses new flows
 // until Restore reloads what the store holds. It returns the Settles of
 // the dropped flows and whether this is the session's first failure.
-func (e *Engine) failLocked(err error) (dropped []func(context.Context, error) error, first bool) {
+func (e *Engine) failLocked(err error) (dropped []SettleFunc, first bool) {
 	if e.failure != nil {
 		return nil, false
 	}
@@ -235,13 +275,9 @@ func (e *Engine) failLocked(err error) (dropped []func(context.Context, error) e
 
 // afterFailure tells the producers of dropped flows and then the client.
 // Called without e.mu.
-func (e *Engine) afterFailure(err error, dropped []func(context.Context, error) error) {
-	if len(dropped) > 0 {
-		go func() {
-			for _, settle := range dropped {
-				_ = settle(e.bg, err)
-			}
-		}()
+func (e *Engine) afterFailure(err error, dropped []SettleFunc) {
+	for _, settle := range dropped {
+		settle(err, ignoreDone)
 	}
 	if e.cfg.OnFailure != nil {
 		e.cfg.OnFailure(err)

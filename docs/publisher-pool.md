@@ -33,7 +33,7 @@ cli, _ := mqttv5.New(
 )
 ```
 
-`Publish` is called as it is without a pool.
+`Publish` and `PublishAsync` are called as they are without a pool.
 
 - **When it helps.** When the round trip limits throughput: several
   goroutines publishing QoS 1 or 2 to a broker across a WAN, or to one
@@ -41,7 +41,7 @@ cli, _ := mqttv5.New(
   instead, and a pool adds little; QoS 0 has no window to widen.
   [`examples/pool`](../examples/pool) measures the difference against your
   broker.
-- **Routing.** Each `Publish` goes out on one connection. Round robin
+- **Routing.** Each message goes out on one connection. Round robin
   (the default) takes the next member each call and may reorder a
   topic; `PoolRoutingHashByTopic` keeps each topic on one member, and so
   in order while that member stays connected.
@@ -81,10 +81,11 @@ cli, _ := mqttv5.New(
   keepalive pings. When the main connection drops, the members stay
   connected and publishing goes on. `Disconnect` refuses new publishes
   with `ErrClosed`, waits, bounded by its ctx, for those in flight on
-  members (a member's session ends with its connection, so nothing could
-  finish them later), then disconnects the members. A publish its ctx
-  cuts short returns `ErrClosed`, and the broker may or may not have it;
-  `Disconnect` then returns ctx's error.
+  members — running `Publish` calls and outstanding `PublishAsync`
+  results (a member's session ends with its connection, so nothing could
+  finish them later) — then disconnects the members. A publish its ctx
+  cuts short completes with `ErrClosed`, and the broker may or may not
+  have it; `Disconnect` then returns ctx's error.
 - **Client-wide calls.** `Reauthenticate` re-authenticates every
   connected member along with the main connection, so the
   `Authenticator` must be safe for concurrent use. `Stats()` counts the

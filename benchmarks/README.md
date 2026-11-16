@@ -121,6 +121,8 @@ Sub-benchmark names are `key=value` pairs, which is how `benchtab` and
 |---|---|---|
 | `BenchmarkE2E_Publish` | `Publish` in a loop, `lib × qos (0,1,2) × size (64B,1KiB,1MiB)` | one call; at QoS 1/2 including the broker's acknowledgements |
 | `BenchmarkE2E_PublishConcurrent` | `workers` goroutines (8, 64) publishing QoS 1 on one client | elapsed time per acknowledged message across all workers |
+| `BenchmarkE2E_PublishPipelined` | one goroutine keeping `window` (8, 64) QoS 1 messages of 256 bytes outstanding on one client, through a publish that returns before the acknowledgement: mqttv5's `PublishAsync`, paho3's tokens; autopaho has none (see [Reading the results](#reading-the-results)) | elapsed time per acknowledged message |
+| `BenchmarkE2E_PublishQueued` | QoS 1 messages of 256 bytes through each library's store-and-forward queue to a `floor` subscriber, `queue` memory, file (no sync) or file-sync (mqttv5 only), with `backlog` (100, 1000) messages queued but not yet delivered throughout | time per delivered message at that depth |
 | `BenchmarkE2E_Receive` | a subscriber fed by `rawClient` at the rate the broker sustains; `mode` callback/chan/queue, `consumers` goroutines for chan/queue | time per delivered message |
 | `BenchmarkE2E_ReceiveStream` | a subscriber fed directly by `rawServer`, a minimal MQTT 5 / 3.1.1 server in the benchmark process that writes pre-encoded PUBLISH packets as fast as the client reads them (no broker); `lib=floor` is the cheapest subscriber the harness can feed, a reference point for the harness's own cost | time per delivered message through the whole pipeline — source, socket, subscriber and sink — at QoS 1 set by the round trip of a 20-message window between client and source |
 | `BenchmarkE2E_RoundTrip` | publish one message, wait until the same library's subscriber has it, repeat | closed-loop publish-to-delivery latency |
@@ -143,21 +145,21 @@ the subscriber's.
 
 ### Conditions
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt meta=date,commit,toolchain,host-os,host-cpu,host-cpus,gomaxprocs,broker,runs,load-before,load-after -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt meta=date,commit,toolchain,host-os,host-cpu,host-cpus,gomaxprocs,broker,runs,load-before,load-after -->
 
 | | |
 |---|---|
-| date | 2026-10-09T22:14:27Z |
-| commit | 80beb93780a2a59174ee5e9fd1d03da7cdfb312b |
-| toolchain | go1.27.2 |
-| host-os | Darwin 25.5.0 |
+| date | 2026-11-16T07:38:29Z |
+| commit | 989e13c76172f8350fc451edcd101276775f411d |
+| toolchain | go1.27.4 |
+| host-os | Darwin 27.2.0 |
 | host-cpu | Apple M2 Max |
 | host-cpus | 12 |
 | gomaxprocs | 12 |
 | broker | eclipse-mosquitto:2.1.2-alpine image sha256:38c0da4f2ef8 |
 | runs | 10 |
-| load-before | 5.61 5.70 5.54 |
-| load-after | 4.77 5.36 5.42 |
+| load-before | 6.37 6.03 6.26 |
+| load-after | 8.95 8.12 7.34 |
 <!-- /benchtab -->
 
 The host is a shared development machine. The load averages above say
@@ -169,111 +171,176 @@ across machines.
 
 Time per `Publish` call:
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | size | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 64B | 3.564µs ±1% | 4.060µs ±2% | 7.260µs ±1% | -12.23% (p=0.000 n=10) | -50.91% (p=0.000 n=10) |
-| 0 | 1KiB | 3.953µs ±3% | 4.344µs ±2% | 8.030µs ±2% | -9.01% (p=0.000 n=10) | -50.78% (p=0.000 n=10) |
-| 0 | 1MiB | 322.3µs ±10% | 333.2µs ±6% | 340.4µs ±14% | ~ (p=0.218 n=10) | ~ (p=0.075 n=10) |
-| 1 | 64B | 114.0µs ±11% | 117.4µs ±18% | 133.0µs ±13% | ~ (p=0.280 n=10) | -14.30% (p=0.023 n=10) |
-| 1 | 1KiB | 124.5µs ±20% | 143.9µs ±7% | 148.8µs ±18% | ~ (p=0.218 n=10) | ~ (p=0.105 n=10) |
-| 1 | 1MiB | 684.4µs ±5% | 684.1µs ±4% | 680.9µs ±4% | ~ (p=0.796 n=10) | ~ (p=0.912 n=10) |
-| 2 | 64B | 226.6µs ±22% | 251.7µs ±17% | 276.0µs ±18% | ~ (p=0.280 n=10) | -17.90% (p=0.043 n=10) |
-| 2 | 1KiB | 233.2µs ±19% | 274.1µs ±18% | 281.6µs ±6% | ~ (p=0.075 n=10) | -17.19% (p=0.005 n=10) |
-| 2 | 1MiB | 784.1µs ±11% | 836.1µs ±6% | 821.4µs ±9% | ~ (p=0.123 n=10) | ~ (p=0.143 n=10) |
+| 0 | 64B | 5.135µs ±5% | 5.535µs ±4% | 8.755µs ±1% | -7.23% (p=0.000 n=10) | -41.35% (p=0.000 n=10) |
+| 0 | 1KiB | 5.483µs ±7% | 5.827µs ±2% | 9.356µs ±10% | -5.90% (p=0.030 n=10) | -41.40% (p=0.000 n=10) |
+| 0 | 1MiB | 334.2µs ±22% | 380.6µs ±15% | 346.3µs ±19% | -12.19% (p=0.035 n=10) | ~ (p=0.280 n=10) |
+| 1 | 64B | 119.2µs ±14% | 150.0µs ±22% | 136.8µs ±11% | -20.52% (p=0.009 n=10) | -12.83% (p=0.011 n=10) |
+| 1 | 1KiB | 138.1µs ±15% | 147.2µs ±12% | 138.6µs ±14% | ~ (p=0.075 n=10) | ~ (p=0.353 n=10) |
+| 1 | 1MiB | 699.3µs ±2% | 721.2µs ±12% | 737.4µs ±7% | -3.03% (p=0.003 n=10) | -5.17% (p=0.035 n=10) |
+| 2 | 64B | 264.1µs ±11% | 293.1µs ±14% | 296.1µs ±4% | -9.92% (p=0.015 n=10) | -10.83% (p=0.001 n=10) |
+| 2 | 1KiB | 271.7µs ±26% | 281.2µs ±11% | 293.7µs ±6% | ~ (p=0.393 n=10) | ~ (p=0.052 n=10) |
+| 2 | 1MiB | 834.1µs ±4% | 866.9µs ±6% | 847.8µs ±3% | -3.79% (p=0.029 n=10) | ~ (p=0.143 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 CPU time per call:
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | size | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 64B | 4.915µs ±2% | 5.725µs ±3% | 12.68µs ±1% | -14.15% (p=0.000 n=10) | -61.23% (p=0.000 n=10) |
-| 0 | 1KiB | 5.259µs ±3% | 5.948µs ±3% | 13.80µs ±3% | -11.58% (p=0.000 n=10) | -61.89% (p=0.000 n=10) |
-| 0 | 1MiB | 69.94µs ±8% | 68.41µs ±8% | 435.3µs ±5% | ~ (p=0.912 n=10) | -83.93% (p=0.000 n=10) |
-| 1 | 64B | 39.11µs ±2% | 47.61µs ±2% | 45.89µs ±3% | -17.84% (p=0.000 n=10) | -14.76% (p=0.000 n=10) |
-| 1 | 1KiB | 40.78µs ±4% | 48.66µs ±2% | 46.94µs ±4% | -16.20% (p=0.000 n=10) | -13.12% (p=0.000 n=10) |
-| 1 | 1MiB | 401.6µs ±6% | 490.7µs ±3% | 489.2µs ±3% | -18.15% (p=0.000 n=10) | -17.89% (p=0.000 n=10) |
-| 2 | 64B | 64.41µs ±5% | 75.80µs ±2% | 86.83µs ±4% | -15.02% (p=0.000 n=10) | -25.82% (p=0.000 n=10) |
-| 2 | 1KiB | 65.78µs ±4% | 77.23µs ±3% | 88.30µs ±1% | -14.82% (p=0.000 n=10) | -25.50% (p=0.000 n=10) |
-| 2 | 1MiB | 445.1µs ±5% | 545.1µs ±6% | 550.8µs ±8% | -18.34% (p=0.000 n=10) | -19.19% (p=0.000 n=10) |
+| 0 | 64B | 7.153µs ±3% | 7.833µs ±4% | 15.16µs ±1% | -8.68% (p=0.000 n=10) | -52.82% (p=0.000 n=10) |
+| 0 | 1KiB | 7.491µs ±3% | 8.158µs ±1% | 16.43µs ±1% | -8.18% (p=0.000 n=10) | -54.40% (p=0.000 n=10) |
+| 0 | 1MiB | 70.20µs ±5% | 75.66µs ±7% | 460.7µs ±7% | -7.23% (p=0.015 n=10) | -84.76% (p=0.000 n=10) |
+| 1 | 64B | 43.63µs ±14% | 51.69µs ±4% | 49.43µs ±1% | -15.60% (p=0.000 n=10) | -11.73% (p=0.000 n=10) |
+| 1 | 1KiB | 44.53µs ±5% | 51.71µs ±6% | 50.72µs ±3% | -13.88% (p=0.000 n=10) | -12.21% (p=0.000 n=10) |
+| 1 | 1MiB | 481.1µs ±2% | 593.4µs ±3% | 554.5µs ±6% | -18.92% (p=0.000 n=10) | -13.22% (p=0.000 n=10) |
+| 2 | 64B | 72.17µs ±6% | 86.40µs ±7% | 95.05µs ±4% | -16.48% (p=0.000 n=10) | -24.07% (p=0.000 n=10) |
+| 2 | 1KiB | 74.73µs ±14% | 89.77µs ±4% | 96.41µs ±2% | -16.75% (p=0.000 n=10) | -22.48% (p=0.000 n=10) |
+| 2 | 1MiB | 527.4µs ±6% | 630.4µs ±5% | 606.0µs ±5% | -16.35% (p=0.000 n=10) | -12.98% (p=0.000 n=10) |
 
-<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 Concurrent publishers on one client, QoS 1, 256 bytes (aggregate time
 per acknowledged message):
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_PublishConcurrent" rows=workers cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_PublishConcurrent" rows=workers cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | workers | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---:|---:|---:|---:|---:|
-| 8 | 31.00µs ±4% | 33.43µs ±4% | 31.23µs ±6% | -7.27% (p=0.000 n=10) | ~ (p=0.971 n=10) |
-| 64 | 12.56µs ±5% | 15.82µs ±6% | 10.69µs ±1% | -20.61% (p=0.000 n=10) | +17.50% (p=0.000 n=10) |
+| 8 | 31.77µs ±7% | 34.59µs ±3% | 31.43µs ±8% | -8.14% (p=0.005 n=10) | ~ (p=0.739 n=10) |
+| 64 | 13.81µs ±6% | 15.98µs ±2% | 11.43µs ±7% | -13.59% (p=0.002 n=10) | +20.80% (p=0.000 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_PublishConcurrent" rows=workers cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_PublishConcurrent" rows=workers cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | workers | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---:|---:|---:|---:|---:|
-| 8 | 17.16µs ±7% | 34.99µs ±2% | 35.77µs ±4% | -50.97% (p=0.000 n=10) | -52.04% (p=0.000 n=10) |
-| 64 | 8.174µs ±6% | 44.11µs ±2% | 33.14µs | -81.47% (p=0.000 n=10) | -75.33% (p=0.000 n=10) |
+| 8 | 19.57µs ±8% | 37.30µs ±5% | 36.96µs ±5% | -47.52% (p=0.000 n=10) | -47.05% (p=0.000 n=10) |
+| 64 | 7.583µs ±7% | 44.90µs ±3% | 35.42µs ±4% | -83.11% (p=0.000 n=10) | -78.60% (p=0.000 n=10) |
 
-<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
+<!-- /benchtab -->
+
+### Pipelined publishing
+
+One goroutine keeping `window` QoS 1 messages of 256 bytes outstanding
+(time per acknowledged message). Set against
+[concurrent publishers](#publishing) with as many workers, it is the
+same number in flight without a goroutine for each. autopaho has no
+publish that returns before the acknowledgement
+([why](#reading-the-results)).
+
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_PublishPipelined" rows=window cols=lib unit=sec/op compare=mqttv5:paho3 -->
+
+| window | mqttv5 | paho3 | mqttv5 vs paho3 |
+|---|---:|---:|---:|
+| 8 | 32.99µs ±17% | 33.13µs ±5% | ~ (p=0.796 n=10) |
+| 64 | 13.51µs ±6% | 11.68µs ±25% | +15.66% (p=0.023 n=10) |
+
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
+<!-- /benchtab -->
+
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_PublishPipelined" rows=window cols=lib unit=cpu-sec/op compare=mqttv5:paho3 -->
+
+| window | mqttv5 | paho3 | mqttv5 vs paho3 |
+|---|---:|---:|---:|
+| 8 | 12.56µs ±7% | 33.12µs ±3% | -62.07% (p=0.000 n=10) |
+| 64 | 6.220µs ±4% | 31.14µs ±4% | -80.03% (p=0.000 n=10) |
+
+<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
+<!-- /benchtab -->
+
+### Store-and-forward queues
+
+QoS 1 messages of 256 bytes through each library's queue, with
+`backlog` messages queued and not yet delivered throughout (time per
+delivered message). `file` syncs nothing in either library;
+`file-sync` is mqttv5's `queue/file` with its default group commit, for
+which autopaho has no counterpart.
+
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_PublishQueued" rows=queue,backlog cols=lib unit=sec/op compare=mqttv5:autopaho -->
+
+| queue | backlog | mqttv5 | autopaho | mqttv5 vs autopaho |
+|---|---|---:|---:|---:|
+| memory | 100 | 14.73µs ±2% | 20.04µs ±15% | -26.48% (p=0.000 n=10) |
+| memory | 1000 | 14.92µs ±5% | 19.07µs ±6% | -21.77% (p=0.000 n=10) |
+| file | 100 | 42.76µs ±9% | 375.6µs ±9% | -88.62% (p=0.000 n=10) |
+| file | 1000 | 41.89µs ±9% | 2.171ms ±4% | -98.07% (p=0.000 n=10) |
+| file-sync | 100 | 2.006ms ±7% | — | — |
+| file-sync | 1000 | 2.124ms ±256% | — | — |
+
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
+<!-- /benchtab -->
+
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_PublishQueued" rows=queue,backlog cols=lib unit=cpu-sec/op compare=mqttv5:autopaho -->
+
+| queue | backlog | mqttv5 | autopaho | mqttv5 vs autopaho |
+|---|---|---:|---:|---:|
+| memory | 100 | 19.93µs ±3% | 54.38µs ±3% | -63.35% (p=0.000 n=10) |
+| memory | 1000 | 20.29µs ±2% | 48.91µs ±5% | -58.51% (p=0.000 n=10) |
+| file | 100 | 111.5µs ±11% | 539.4µs ±8% | -79.34% (p=0.000 n=10) |
+| file | 1000 | 93.19µs ±17% | 2.605ms ±3% | -96.42% (p=0.000 n=10) |
+| file-sync | 100 | 259.6µs ±9% | — | — |
+| file-sync | 1000 | 273.3µs ±46% | — | — |
+
+<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Receiving
 
 Time per delivered message, handler called by the library:
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Receive /mode:callback" rows=qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Receive /mode:callback" rows=qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | size | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 64B | 2.109µs ±7% | 2.850µs ±4% | 2.918µs ±9% | -26.00% (p=0.000 n=10) | -27.72% (p=0.000 n=10) |
-| 0 | 1KiB | 8.119µs ±21% | 7.648µs ±2% | 7.701µs ±10% | ~ (p=0.143 n=10) | ~ (p=0.353 n=10) |
-| 1 | 64B | 12.19µs ±6% | 15.86µs ±3% | 17.01µs ±6% | -23.13% (p=0.000 n=10) | -28.33% (p=0.000 n=10) |
-| 1 | 1KiB | 24.42µs ±12% | 22.93µs ±4% | 25.85µs ±4% | ~ (p=0.075 n=10) | -5.54% (p=0.011 n=10) |
+| 0 | 64B | 1.712µs ±14% | 2.882µs ±8% | 3.115µs ±13% | -40.60% (p=0.000 n=10) | -45.04% (p=0.000 n=10) |
+| 0 | 1KiB | 4.062µs ±23% | 4.552µs ±12% | 4.584µs ±10% | -10.76% (p=0.011 n=10) | -11.39% (p=0.009 n=10) |
+| 1 | 64B | 13.06µs ±12% | 16.08µs ±2% | 17.28µs ±3% | -18.78% (p=0.002 n=10) | -24.44% (p=0.002 n=10) |
+| 1 | 1KiB | 15.86µs ±6% | 17.70µs ±4% | 18.92µs ±15% | -10.36% (p=0.001 n=10) | -16.15% (p=0.002 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 CPU time per delivered message:
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Receive /mode:callback" rows=qos,size cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Receive /mode:callback" rows=qos,size cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | size | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 64B | 1.337µs ±5% | 5.938µs ±3% | 5.888µs ±4% | -77.48% (p=0.000 n=10) | -77.29% (p=0.000 n=10) |
-| 0 | 1KiB | 4.766µs ±7% | 13.90µs ±2% | 13.49µs ±2% | -65.70% (p=0.000 n=10) | -64.66% (p=0.000 n=10) |
-| 1 | 64B | 7.407µs ±8% | 22.01µs ±3% | 34.82µs ±2% | -66.35% (p=0.000 n=10) | -78.73% (p=0.000 n=10) |
-| 1 | 1KiB | 19.28µs ±12% | 32.63µs ±4% | 44.17µs ±1% | -40.90% (p=0.000 n=10) | -56.34% (p=0.000 n=10) |
+| 0 | 64B | 1.290µs ±4% | 5.969µs ±1% | 6.205µs ±6% | -78.40% (p=0.000 n=10) | -79.22% (p=0.000 n=10) |
+| 0 | 1KiB | 3.086µs ±9% | 9.762µs ±6% | 9.492µs ±3% | -68.39% (p=0.000 n=10) | -67.49% (p=0.000 n=10) |
+| 1 | 64B | 8.046µs ±3% | 24.25µs ±3% | 37.00µs ±2% | -66.82% (p=0.000 n=10) | -78.26% (p=0.000 n=10) |
+| 1 | 1KiB | 12.63µs ±8% | 30.49µs ±2% | 43.11µs ±4% | -58.56% (p=0.000 n=10) | -70.70% (p=0.000 n=10) |
 
-<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 QoS 1 through a channel or queue drained by several consumers (the
 autopaho channel is the one an application forwards into from its
 handler):
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Receive /qos:1 /size:64B -/mode:callback" rows=mode,consumers cols=lib unit=sec/op compare=mqttv5:autopaho -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Receive /qos:1 /size:64B -/mode:callback" rows=mode,consumers cols=lib unit=sec/op compare=mqttv5:autopaho -->
 
 | mode | consumers | mqttv5 | autopaho | mqttv5 vs autopaho |
 |---|---|---:|---:|---:|
-| chan | 1 | 12.68µs ±4% | 16.79µs ±2% | -24.48% (p=0.000 n=10) |
-| chan | 4 | 13.11µs ±3% | 16.86µs ±2% | -22.22% (p=0.000 n=10) |
-| chan | 8 | 13.78µs ±2% | 16.68µs ±1% | -17.37% (p=0.000 n=10) |
-| queue | 1 | 12.60µs ±3% | — | — |
-| queue | 4 | 12.90µs ±4% | — | — |
-| queue | 8 | 12.95µs ±3% | — | — |
+| chan | 1 | 13.36µs ±8% | 17.05µs ±4% | -21.60% (p=0.000 n=10) |
+| chan | 4 | 13.69µs ±5% | 17.11µs ±4% | -19.98% (p=0.000 n=10) |
+| chan | 8 | 14.08µs ±18% | 17.35µs ±11% | -18.88% (p=0.002 n=10) |
+| queue | 1 | 13.69µs ±11% | — | — |
+| queue | 4 | 13.09µs ±6% | — | — |
+| queue | 8 | 13.25µs ±4% | — | — |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Receiving without a broker
@@ -297,59 +364,59 @@ measurement, of a library's own cost.
 
 Time per delivered message:
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_ReceiveStream" rows=mode,qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_ReceiveStream" rows=mode,qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | mode | qos | size | mqttv5 | autopaho | paho3 | floor | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| callback | 0 | 64B | 254.0ns ±3% | 2.761µs ±1% | 2.659µs ±2% | 43.71ns ±22% | -90.80% (p=0.000 n=10) | -90.45% (p=0.000 n=10) |
-| callback | 0 | 1KiB | 642.1ns ±7% | 4.371µs ±2% | 4.010µs ±4% | 136.4ns ±13% | -85.31% (p=0.000 n=10) | -83.99% (p=0.000 n=10) |
-| callback | 1 | 64B | 1.718µs ±1% | 8.268µs ±1% | 9.192µs ±2% | 1.159µs ±5% | -79.22% (p=0.000 n=10) | -81.31% (p=0.000 n=10) |
-| callback | 1 | 1KiB | 2.062µs ±1% | 9.359µs ±2% | 10.42µs ±2% | 1.423µs ±2% | -77.97% (p=0.000 n=10) | -80.22% (p=0.000 n=10) |
-| chan | 1 | 64B | 1.915µs ±3% | 9.205µs ±1% | — | — | -79.20% (p=0.000 n=10) | — |
-| chan | 1 | 1KiB | 2.490µs ±2% | 10.36µs ±1% | — | — | -75.97% (p=0.000 n=10) | — |
-| queue | 1 | 64B | 1.954µs ±2% | — | — | — | — | — |
-| queue | 1 | 1KiB | 2.492µs ±2% | — | — | — | — | — |
+| callback | 0 | 64B | 256.9ns ±1% | 2.743µs ±11% | 2.682µs ±31% | 62.62ns ±38% | -90.63% (p=0.000 n=10) | -90.42% (p=0.000 n=10) |
+| callback | 0 | 1KiB | 587.4ns ±4% | 4.316µs ±6% | 4.094µs ±11% | 217.8ns ±13% | -86.39% (p=0.000 n=10) | -85.65% (p=0.000 n=10) |
+| callback | 1 | 64B | 1.946µs ±3% | 9.515µs ±4% | 9.822µs ±10% | 1.389µs ±14% | -79.55% (p=0.000 n=10) | -80.19% (p=0.000 n=10) |
+| callback | 1 | 1KiB | 2.271µs ±4% | 10.12µs ±2% | 10.79µs ±2% | 1.677µs ±6% | -77.56% (p=0.000 n=10) | -78.95% (p=0.000 n=10) |
+| chan | 1 | 64B | 2.152µs ±4% | 10.14µs ±1% | — | — | -78.78% (p=0.000 n=10) | — |
+| chan | 1 | 1KiB | 2.832µs ±7% | 11.32µs ±4% | — | — | -74.99% (p=0.000 n=10) | — |
+| queue | 1 | 64B | 2.169µs ±5% | — | — | — | — | — |
+| queue | 1 | 1KiB | 2.865µs ±4% | — | — | — | — | — |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 CPU time per delivered message for the whole process, `rawServer`
 included (how much it costs depends on how often the client lets it
 wake):
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_ReceiveStream" rows=mode,qos,size cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_ReceiveStream" rows=mode,qos,size cols=lib unit=cpu-sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | mode | qos | size | mqttv5 | autopaho | paho3 | floor | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| callback | 0 | 64B | 351.9ns ±4% | 5.689µs ±1% | 5.553µs ±2% | 86.82ns ±19% | -93.81% (p=0.000 n=10) | -93.66% (p=0.000 n=10) |
-| callback | 0 | 1KiB | 1.177µs ±5% | 8.960µs ±1% | 8.262µs ±3% | 271.4ns ±11% | -86.86% (p=0.000 n=10) | -85.75% (p=0.000 n=10) |
-| callback | 1 | 64B | 2.032µs ±2% | 29.10µs ±1% | 38.37µs ±2% | 1.389µs ±5% | -93.02% (p=0.000 n=10) | -94.70% (p=0.000 n=10) |
-| callback | 1 | 1KiB | 2.735µs ±2% | 31.44µs ±1% | 42.21µs ±1% | 1.616µs ±2% | -91.30% (p=0.000 n=10) | -93.52% (p=0.000 n=10) |
-| chan | 1 | 64B | 2.693µs ±2% | 35.09µs ±2% | — | — | -92.33% (p=0.000 n=10) | — |
-| chan | 1 | 1KiB | 4.127µs ±3% | 39.14µs ±1% | — | — | -89.46% (p=0.000 n=10) | — |
-| queue | 1 | 64B | 2.742µs ±2% | — | — | — | — | — |
-| queue | 1 | 1KiB | 4.144µs ±2% | — | — | — | — | — |
+| callback | 0 | 64B | 370.9ns ±2% | 5.782µs ±3% | 5.611µs ±16% | 122.1ns ±29% | -93.59% (p=0.000 n=10) | -93.39% (p=0.000 n=10) |
+| callback | 0 | 1KiB | 1.148µs ±5% | 9.426µs ±3% | 8.612µs ±11% | 405.1ns ±10% | -87.83% (p=0.000 n=10) | -86.68% (p=0.000 n=10) |
+| callback | 1 | 64B | 2.324µs ±4% | 32.84µs ±1% | 41.44µs ±6% | 1.609µs ±4% | -92.92% (p=0.000 n=10) | -94.39% (p=0.000 n=10) |
+| callback | 1 | 1KiB | 3.023µs ±2% | 35.79µs ±1% | 46.11µs ±2% | 1.805µs ±3% | -91.56% (p=0.000 n=10) | -93.44% (p=0.000 n=10) |
+| chan | 1 | 64B | 2.958µs ±2% | 37.93µs ±1% | — | — | -92.20% (p=0.000 n=10) | — |
+| chan | 1 | 1KiB | 4.681µs ±4% | 43.12µs ±3% | — | — | -89.14% (p=0.000 n=10) | — |
+| queue | 1 | 64B | 2.991µs ±3% | — | — | — | — | — |
+| queue | 1 | 1KiB | 4.709µs ±3% | — | — | — | — | — |
 
-<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>cpu-sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Round trip
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_RoundTrip" rows=qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_RoundTrip" rows=qos,size cols=lib unit=sec/op compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | size | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 64B | 113.3µs ±4% | 117.1µs ±8% | 123.6µs ±5% | -3.28% (p=0.004 n=10) | -8.32% (p=0.000 n=10) |
-| 0 | 1KiB | 121.7µs ±5% | 137.1µs ±8% | 129.8µs ±8% | -11.23% (p=0.000 n=10) | -6.27% (p=0.003 n=10) |
-| 0 | 1MiB | 1.182ms ±2% | 1.350ms ±4% | 1.298ms ±2% | -12.43% (p=0.000 n=10) | -8.94% (p=0.000 n=10) |
-| 1 | 64B | 131.9µs ±2% | 143.1µs ±2% | 144.1µs ±6% | -7.82% (p=0.000 n=10) | -8.48% (p=0.000 n=10) |
-| 1 | 1KiB | 134.6µs ±4% | 149.3µs ±5% | 145.5µs ±8% | -9.88% (p=0.000 n=10) | -7.51% (p=0.000 n=10) |
-| 1 | 1MiB | 1.234ms ±5% | 1.521ms ±3% | 1.308ms ±7% | -18.90% (p=0.000 n=10) | -5.67% (p=0.002 n=10) |
-| 2 | 64B | 255.8µs ±6% | 262.8µs ±6% | 272.9µs ±1% | -2.64% (p=0.043 n=10) | -6.26% (p=0.002 n=10) |
-| 2 | 1KiB | 252.4µs ±1% | 274.8µs ±6% | 279.5µs ±2% | -8.12% (p=0.000 n=10) | -9.70% (p=0.000 n=10) |
-| 2 | 1MiB | 1.332ms ±3% | 1.687ms ±4% | 1.422ms ±2% | -21.04% (p=0.000 n=10) | -6.29% (p=0.000 n=10) |
+| 0 | 64B | 119.9µs ±6% | 130.8µs ±13% | 138.4µs ±9% | -8.29% (p=0.011 n=10) | -13.31% (p=0.001 n=10) |
+| 0 | 1KiB | 124.3µs ±41% | 144.3µs ±9% | 148.0µs ±9% | ~ (p=0.075 n=10) | -16.06% (p=0.023 n=10) |
+| 0 | 1MiB | 1.389ms ±9% | 1.535ms ±13% | 1.447ms ±4% | -9.55% (p=0.005 n=10) | ~ (p=0.143 n=10) |
+| 1 | 64B | 143.4µs ±16% | 158.3µs ±8% | 166.6µs ±11% | ~ (p=0.123 n=10) | -13.93% (p=0.009 n=10) |
+| 1 | 1KiB | 139.5µs ±6% | 164.8µs ±5% | 166.4µs ±6% | -15.34% (p=0.002 n=10) | -16.18% (p=0.001 n=10) |
+| 1 | 1MiB | 1.394ms ±6% | 1.653ms ±14% | 1.459ms ±8% | -15.63% (p=0.000 n=10) | ~ (p=0.105 n=10) |
+| 2 | 64B | 259.2µs ±9% | 286.7µs ±5% | 310.7µs ±9% | -9.59% (p=0.002 n=10) | -16.56% (p=0.002 n=10) |
+| 2 | 1KiB | 266.3µs ±3% | 291.1µs ±7% | 301.4µs ±7% | -8.50% (p=0.000 n=10) | -11.64% (p=0.005 n=10) |
+| 2 | 1MiB | 1.500ms ±6% | 1.899ms ±10% | 1.436ms ±10% | -21.00% (p=0.002 n=10) | ~ (p=0.143 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Open-loop latency
@@ -357,57 +424,57 @@ wake):
 256-byte messages at a fixed rate; latency from each message's
 scheduled send time to its delivery.
 
-<!-- benchtab file=results/2026-10-10-e2e-latency/e2e-latency.txt meta=date,host-cpu,runs,load-before,load-after -->
+<!-- benchtab file=results/2026-11-16-e2e-latency/e2e-latency.txt meta=date,host-cpu,runs,load-before,load-after -->
 
 | | |
 |---|---|
-| date | 2026-10-09T22:45:29Z |
+| date | 2026-11-16T08:29:04Z |
 | host-cpu | Apple M2 Max |
 | runs | 6 |
-| load-before | 3.31 4.89 5.25 |
-| load-after | 4.32 4.38 4.85 |
+| load-before | 3.84 7.02 7.83 |
+| load-after | 5.55 6.26 7.15 |
 <!-- /benchtab -->
 
 Median:
 
-<!-- benchtab file=results/2026-10-10-e2e-latency/e2e-latency.txt rows=qos,rate cols=lib unit=p50-sec compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e-latency/e2e-latency.txt rows=qos,rate cols=lib unit=p50-sec compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | rate | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 1000 | 274.9µs ±7% | 292.0µs ±3% | 282.5µs ±7% | -5.88% (p=0.026 n=6) | ~ (p=0.485 n=6) |
-| 0 | 10000 | 152.1µs ±11% | 157.9µs ±11% | 159.0µs ±6% | ~ (p=0.485 n=6) | ~ (p=0.065 n=6) |
-| 1 | 1000 | 265.4µs ±8% | 274.5µs ±4% | 271.5µs ±3% | -3.32% (p=0.002 n=6) | ~ (p=0.071 n=6) |
-| 1 | 10000 | 215.7µs ±8% | 246.6µs ±5% | 248.4µs ±4% | -12.52% (p=0.002 n=6) | -13.15% (p=0.002 n=6) |
+| 0 | 1000 | 197.1µs ±8% | 194.9µs ±16% | 213.5µs ±14% | ~ (p=0.818 n=6) | ~ (p=0.065 n=6) |
+| 0 | 10000 | 149.4µs ±28% | 164.3µs ±8% | 168.6µs ±20% | ~ (p=0.240 n=6) | ~ (p=0.485 n=6) |
+| 1 | 1000 | 188.1µs ±9% | 195.6µs ±11% | 194.0µs ±12% | ~ (p=0.180 n=6) | ~ (p=0.485 n=6) |
+| 1 | 10000 | 240.8µs ±17% | 267.0µs ±5% | 263.8µs ±22% | -9.82% (p=0.041 n=6) | -8.72% (p=0.041 n=6) |
 
-<sub>p50-sec: median of 6 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>p50-sec: median of 6 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 99th percentile:
 
-<!-- benchtab file=results/2026-10-10-e2e-latency/e2e-latency.txt rows=qos,rate cols=lib unit=p99-sec compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e-latency/e2e-latency.txt rows=qos,rate cols=lib unit=p99-sec compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | rate | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 1000 | 40.88ms ±21% | 39.57ms ±17% | 41.67ms ±5% | ~ (p=0.818 n=6) | ~ (p=0.485 n=6) |
-| 0 | 10000 | 10.95ms ±7% | 11.92ms ±193% | 11.05ms ±4% | ~ (p=0.180 n=6) | ~ (p=0.818 n=6) |
-| 1 | 1000 | 37.72ms ±22% | 36.90ms ±6% | 39.42ms ±12% | ~ (p=1.000 n=6) | ~ (p=0.699 n=6) |
-| 1 | 10000 | 11.58ms ±7% | 12.72ms ±10% | 12.65ms ±8% | -8.93% (p=0.009 n=6) | -8.41% (p=0.004 n=6) |
+| 0 | 1000 | 2.772ms ±578% | 1.164ms ±1472% | 2.760ms ±554% | ~ (p=0.818 n=6) | ~ (p=0.818 n=6) |
+| 0 | 10000 | 713.9µs ±6379% | 302.0µs ±140% | 468.7µs ±4540% | ~ (p=0.485 n=6) | ~ (p=0.937 n=6) |
+| 1 | 1000 | 2.932ms ±819% | 392.1µs ±1504% | 6.794ms ±361% | ~ (p=0.240 n=6) | ~ (p=0.699 n=6) |
+| 1 | 10000 | 490.3µs ±23025% | 583.1µs ±7335% | 623.1µs ±17878% | ~ (p=0.485 n=6) | ~ (p=0.699 n=6) |
 
-<sub>p99-sec: median of 6 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>p99-sec: median of 6 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 99.9th percentile:
 
-<!-- benchtab file=results/2026-10-10-e2e-latency/e2e-latency.txt rows=qos,rate cols=lib unit=p99.9-sec compare=mqttv5:autopaho,mqttv5:paho3 -->
+<!-- benchtab file=results/2026-11-16-e2e-latency/e2e-latency.txt rows=qos,rate cols=lib unit=p99.9-sec compare=mqttv5:autopaho,mqttv5:paho3 -->
 
 | qos | rate | mqttv5 | autopaho | paho3 | mqttv5 vs autopaho | mqttv5 vs paho3 |
 |---|---|---:|---:|---:|---:|---:|
-| 0 | 1000 | 53.58ms ±8% | 53.74ms ±54% | 54.06ms ±3% | ~ (p=0.937 n=6) | ~ (p=0.699 n=6) |
-| 0 | 10000 | 19.80ms ±3% | 20.20ms ±108% | 19.56ms ±2% | ~ (p=0.589 n=6) | ~ (p=0.132 n=6) |
-| 1 | 1000 | 52.29ms ±7% | 53.00ms ±3% | 53.24ms ±4% | ~ (p=0.310 n=6) | ~ (p=0.180 n=6) |
-| 1 | 10000 | 19.27ms ±2% | 19.33ms ±2% | 19.53ms ±3% | ~ (p=0.699 n=6) | ~ (p=0.310 n=6) |
+| 0 | 1000 | 6.586ms ±550% | 16.24ms ±128% | 6.663ms ±484% | ~ (p=0.699 n=6) | ~ (p=1.000 n=6) |
+| 0 | 10000 | 3.875ms ±1321% | 1.553ms ±26% | 1.445ms ±1661% | ~ (p=0.937 n=6) | ~ (p=0.485 n=6) |
+| 1 | 1000 | 9.578ms ±397% | 3.521ms ±654% | 10.82ms ±352% | ~ (p=0.310 n=6) | ~ (p=0.818 n=6) |
+| 1 | 10000 | 1.561ms ±7475% | 1.904ms ±2351% | 1.842ms ±6166% | ~ (p=0.394 n=6) | ~ (p=0.485 n=6) |
 
-<sub>p99.9-sec: median of 6 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>p99.9-sec: median of 6 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Reconnect and resume
@@ -415,22 +482,22 @@ Median:
 Time from the cut until all 20 in-flight QoS 1 messages have reached a
 subscriber:
 
-<!-- benchtab file=results/2026-10-10-e2e-reconnect/e2e-reconnect.txt rows=inflight cols=lib unit=sec/op compare=mqttv5:autopaho -->
+<!-- benchtab file=results/2026-11-16-e2e-reconnect/e2e-reconnect.txt rows=inflight cols=lib unit=sec/op compare=mqttv5:autopaho -->
 
 | inflight | mqttv5 | autopaho | mqttv5 vs autopaho |
 |---|---:|---:|---:|
-| 20 | 2.672ms ±11% | 4.899ms ±27% | -45.46% (p=0.000 n=10) |
+| 20 | 2.494ms ±16% | 3.770ms ±22% | -33.85% (p=0.000 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
-<!-- benchtab file=results/2026-10-10-e2e-reconnect/e2e-reconnect.txt rows=inflight cols=lib unit=publish-errors/op -->
+<!-- benchtab file=results/2026-11-16-e2e-reconnect/e2e-reconnect.txt rows=inflight cols=lib unit=publish-errors/op -->
 
 | inflight | mqttv5 | autopaho |
 |---|---:|---:|
 | 20 | 0 | 0 |
 
-<sub>publish-errors/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>publish-errors/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 `publish-errors/op` counts `Publish` calls that returned an error
@@ -441,27 +508,27 @@ although their message was delivered after the reconnect.
 A consumer that stops while 200,000 1 KiB messages arrive, at QoS 0
 and at QoS 1:
 
-<!-- benchtab file=results/2026-10-10-e2e-slowconsumer/e2e-slowconsumer.txt rows=lib,mode,qos cols=size unit=held-B -->
+<!-- benchtab file=results/2026-11-16-e2e-slowconsumer/e2e-slowconsumer.txt rows=lib,mode,qos cols=size unit=held-B -->
 
 | lib | mode | qos | 1KiB |
 |---|---|---|---:|
-| mqttv5 | callback | 0 | 384B ±? |
+| mqttv5 | callback | 0 | 2.910KiB ±? |
 | mqttv5 | callback | 1 | 0B |
-| mqttv5 | chan | 0 | 85.87KiB ±10% |
-| mqttv5 | chan | 1 | 332.6KiB |
+| mqttv5 | chan | 0 | 85.03KiB ±11% |
+| mqttv5 | chan | 1 | 330.9KiB ±1% |
 | mqttv5 | queue | 0 | 81.01MiB |
-| mqttv5 | queue | 1 | 335.2KiB ±1% |
+| mqttv5 | queue | 1 | 335.1KiB ±1% |
 | autopaho | callback | 0 | 89.51MiB |
-| autopaho | callback | 1 | 28.62KiB ±15% |
+| autopaho | callback | 1 | 28.35KiB ±13% |
 | autopaho | chan | 0 | 89.57MiB |
-| autopaho | chan | 1 | 29.47KiB ±15% |
-| paho3 | callback | 0 | 4.023KiB ±24% |
-| paho3 | callback | 1 | 3.570KiB ±22% |
+| autopaho | chan | 1 | 29.47KiB ±3% |
+| paho3 | callback | 0 | 4.305KiB ±7% |
+| paho3 | callback | 1 | 3.266KiB ±27% |
 
-<sub>held-B: median of 6 runs ±95% CI; recorded 2026-10-09 at 6db7a65a64a9.</sub>
+<sub>held-B: median of 6 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
-<!-- benchtab file=results/2026-10-10-e2e-slowconsumer/e2e-slowconsumer.txt rows=lib,mode,qos cols=size unit=delivered-% -->
+<!-- benchtab file=results/2026-11-16-e2e-slowconsumer/e2e-slowconsumer.txt rows=lib,mode,qos cols=size unit=delivered-% -->
 
 | lib | mode | qos | 1KiB |
 |---|---|---|---:|
@@ -478,7 +545,7 @@ and at QoS 1:
 | paho3 | callback | 0 | 100% |
 | paho3 | callback | 1 | 100% |
 
-<sub>delivered-%: median of 6 runs ±95% CI; recorded 2026-10-09 at 6db7a65a64a9.</sub>
+<sub>delivered-%: median of 6 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 What each library does with the backlog:
@@ -516,35 +583,35 @@ would measure the collector's pacing rather than the library.
 
 ### Codec
 
-<!-- benchtab file=results/2026-10-10-codec/codec.txt meta=date,commit,toolchain,host-cpu,runs,load-before,load-after -->
+<!-- benchtab file=results/2026-11-16-codec/codec.txt meta=date,commit,toolchain,host-cpu,runs,load-before,load-after -->
 
 | | |
 |---|---|
-| date | 2026-10-09T21:54:15Z |
-| commit | 80beb93780a2a59174ee5e9fd1d03da7cdfb312b |
-| toolchain | go1.27.2 |
+| date | 2026-11-16T07:09:54Z |
+| commit | 989e13c76172f8350fc451edcd101276775f411d |
+| toolchain | go1.27.4 |
 | host-cpu | Apple M2 Max |
 | runs | 10 |
-| load-before | 4.62 5.03 5.89 |
-| load-after | 7.80 5.40 5.39 |
+| load-before | 6.83 8.33 8.65 |
+| load-after | 8.79 6.66 6.68 |
 <!-- /benchtab -->
 
 Decode a PUBLISH, then read its properties:
 
-<!-- benchtab file=results/2026-10-10-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=sec/op compare=mqttv5:eclipse -->
+<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=sec/op compare=mqttv5:eclipse -->
 
 | props | size | eclipse | mqttv5 | mqttv5 vs eclipse |
 |---|---|---:|---:|---:|
-| none | 64B | 855.6ns ±23% | 58.04ns ±4% | -93.22% (p=0.000 n=10) |
-| none | 256B | 997.9ns ±6% | 70.63ns ±2% | -92.92% (p=0.000 n=10) |
-| none | 1KiB | 1.336µs ±7% | 95.13ns ±2% | -92.88% (p=0.000 n=10) |
-| none | 16KiB | 6.919µs ±12% | 358.6ns ±2% | -94.82% (p=0.000 n=10) |
-| five | 64B | 4.440µs ±21% | 179.2ns ±3% | -95.96% (p=0.000 n=10) |
-| five | 256B | 4.652µs ±5% | 185.8ns ±4% | -96.01% (p=0.000 n=10) |
-| five | 1KiB | 4.893µs ±5% | 209.2ns ±4% | -95.73% (p=0.000 n=10) |
-| five | 16KiB | 10.26µs ±6% | 468.2ns ±3% | -95.44% (p=0.000 n=10) |
+| none | 64B | 851.0ns ±29% | 59.26ns ±2% | -93.04% (p=0.000 n=10) |
+| none | 256B | 917.9ns ±26% | 71.22ns ±3% | -92.24% (p=0.000 n=10) |
+| none | 1KiB | 1.264µs ±22% | 94.59ns ±2% | -92.51% (p=0.000 n=10) |
+| none | 16KiB | 6.790µs ±21% | 362.4ns ±4% | -94.66% (p=0.000 n=10) |
+| five | 64B | 4.522µs ±15% | 179.8ns ±2% | -96.02% (p=0.000 n=10) |
+| five | 256B | 4.608µs ±20% | 188.3ns ±2% | -95.91% (p=0.000 n=10) |
+| five | 1KiB | 4.852µs ±9% | 209.9ns ±4% | -95.67% (p=0.000 n=10) |
+| five | 16KiB | 10.85µs ±10% | 473.6ns ±2% | -95.63% (p=0.000 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 Encode a QoS 1 PUBLISH and write it. mqttv5 has three encoders, and
@@ -556,20 +623,20 @@ which one a publish uses depends on its path through the client:
 | pooled (`EncodePublish`) | copied into a pooled buffer | every other QoS 0 publish, queued for the writer goroutine; the caller may reuse its payload before the write |
 | owned (`MarshalPublish`) | copied into a buffer of its own | every QoS 1/2 publish: the session keeps the packet to send again until the broker acknowledges it |
 
-<!-- benchtab file=results/2026-10-10-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=sec/op compare=mqttv5-header:eclipse,mqttv5-pooled:eclipse,mqttv5-owned:eclipse -->
+<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=sec/op compare=mqttv5-header:eclipse,mqttv5-pooled:eclipse,mqttv5-owned:eclipse -->
 
 | props | size | eclipse | mqttv5-header | mqttv5-pooled | mqttv5-owned | mqttv5-header vs eclipse | mqttv5-pooled vs eclipse | mqttv5-owned vs eclipse |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| none | 64B | 167.9ns ±3% | 70.13ns ±3% | 68.35ns ±2% | 74.69ns ±4% | -58.23% (p=0.000 n=10) | -59.29% (p=0.000 n=10) | -55.52% (p=0.000 n=10) |
-| none | 256B | 166.1ns ±4% | 69.75ns ±3% | 73.17ns ±2% | 97.03ns ±6% | -58.01% (p=0.000 n=10) | -55.95% (p=0.000 n=10) | -41.58% (p=0.000 n=10) |
-| none | 1KiB | 169.8ns ±5% | 69.61ns ±2% | 83.60ns ±2% | 187.2ns ±6% | -59.00% (p=0.000 n=10) | -50.76% (p=0.000 n=10) | +10.25% (p=0.000 n=10) |
-| none | 16KiB | 167.2ns ±5% | 70.04ns ±5% | 296.2ns ±3% | 1.574µs ±9% | -58.10% (p=0.000 n=10) | +77.24% (p=0.000 n=10) | +841.67% (p=0.000 n=10) |
-| five | 64B | 370.6ns ±7% | 161.2ns ±2% | 161.2ns ±2% | 184.8ns ±4% | -56.50% (p=0.000 n=10) | -56.51% (p=0.000 n=10) | -50.14% (p=0.000 n=10) |
-| five | 256B | 374.9ns ±7% | 161.1ns ±2% | 168.2ns ±3% | 199.8ns ±6% | -57.03% (p=0.000 n=10) | -55.12% (p=0.000 n=10) | -46.72% (p=0.000 n=10) |
-| five | 1KiB | 378.0ns ±7% | 165.2ns ±4% | 179.6ns ±5% | 286.0ns ±8% | -56.30% (p=0.000 n=10) | -52.49% (p=0.000 n=10) | -24.33% (p=0.000 n=10) |
-| five | 16KiB | 375.6ns ±19% | 166.9ns ±4% | 398.3ns ±5% | 1.651µs ±5% | -55.55% (p=0.000 n=10) | +6.07% (p=0.029 n=10) | +339.49% (p=0.000 n=10) |
+| none | 64B | 166.1ns ±5% | 67.71ns ±6% | 68.79ns ±6% | 74.44ns ±18% | -59.22% (p=0.000 n=10) | -58.57% (p=0.000 n=10) | -55.17% (p=0.000 n=10) |
+| none | 256B | 163.0ns ±13% | 67.78ns ±3% | 73.11ns ±3% | 95.29ns ±21% | -58.40% (p=0.000 n=10) | -55.14% (p=0.000 n=10) | -41.52% (p=0.000 n=10) |
+| none | 1KiB | 161.2ns ±6% | 67.60ns ±5% | 83.82ns ±3% | 179.8ns ±13% | -58.08% (p=0.000 n=10) | -48.02% (p=0.000 n=10) | +11.50% (p=0.000 n=10) |
+| none | 16KiB | 162.3ns ±8% | 68.52ns ±2% | 300.6ns ±4% | 1.621µs ±8% | -57.78% (p=0.000 n=10) | +85.21% (p=0.000 n=10) | +898.77% (p=0.000 n=10) |
+| five | 64B | 372.1ns ±5% | 161.1ns ±9% | 163.0ns ±3% | 186.0ns ±3% | -56.72% (p=0.000 n=10) | -56.19% (p=0.000 n=10) | -50.00% (p=0.000 n=10) |
+| five | 256B | 359.5ns ±4% | 159.0ns ±1% | 165.1ns ±2% | 195.5ns ±12% | -55.77% (p=0.000 n=10) | -54.08% (p=0.000 n=10) | -45.62% (p=0.000 n=10) |
+| five | 1KiB | 361.9ns ±7% | 158.9ns ±2% | 176.5ns ±3% | 278.0ns ±2% | -56.09% (p=0.000 n=10) | -51.23% (p=0.000 n=10) | -23.18% (p=0.000 n=10) |
+| five | 16KiB | 366.4ns ±18% | 159.9ns ±3% | 406.1ns ±3% | 1.641µs ±4% | -56.37% (p=0.000 n=10) | ~ (p=0.105 n=10) | +347.73% (p=0.000 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 Neither Eclipse's encoder nor mqttv5's header encoder touches the
@@ -588,27 +655,27 @@ after a restart.
 In-process, without a broker (`go test -bench BenchmarkReceive` in the
 core module), 64-byte messages:
 
-<!-- benchtab file=results/2026-10-10-receive/receive.txt filter=".name:Receive /size:64B" rows=qos,consumer cols=delivery unit=sec/op -->
+<!-- benchtab file=results/2026-11-16-receive/receive.txt filter=".name:Receive /size:64B" rows=qos,consumer cols=delivery unit=sec/op -->
 
 | qos | consumer | owned | zerocopy |
 |---|---|---:|---:|
-| 1 | callback | 511.9ns ±4% | 494.3ns ±7% |
-| 1 | chan | 767.0ns ±4% | 890.7ns ±6% |
-| 1 | queue | 727.0ns ±3% | 833.8ns ±5% |
-| 0 | callback | 208.1ns ±5% | 184.6ns ±4% |
+| 1 | callback | 546.8ns ±6% | 522.9ns ±3% |
+| 1 | chan | 796.9ns ±7% | 886.9ns ±7% |
+| 1 | queue | 730.2ns ±7% | 837.1ns ±3% |
+| 0 | callback | 212.8ns ±2% | 189.4ns ±5% |
 
-<sub>sec/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 With 10,000 subscriptions that do not match the message:
 
-<!-- benchtab file=results/2026-10-10-receive/receive.txt filter=".name:ReceiveFilters" rows=qos,consumer cols=filters unit=sec/op -->
+<!-- benchtab file=results/2026-11-16-receive/receive.txt filter=".name:ReceiveFilters" rows=qos,consumer cols=filters unit=sec/op -->
 
 | qos | consumer | 0 | 10000 |
 |---|---|---:|---:|
-| 0 | callback | 207.4ns ±4% | 222.8ns ±3% |
+| 0 | callback | 212.4ns ±1% | 223.9ns ±3% |
 
-<sub>sec/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ## Allocation counts
@@ -634,7 +701,7 @@ under and how to read them, are in the [results above](#results).
 Allocations to decode one PUBLISH from a stream (`props=five`: a
 content type and five user properties), then read its properties:
 
-<!-- benchtab file=results/2026-10-10-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=allocs/op -->
 
 | props | size | eclipse | mqttv5 |
 |---|---|---:|---:|
@@ -647,7 +714,7 @@ content type and five user properties), then read its properties:
 | five | 1KiB | 95 | 0 |
 | five | 16KiB | 103 | 0 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 Allocations to encode one PUBLISH and write it, with each of mqttv5's
@@ -658,7 +725,7 @@ goroutine), and `mqttv5-owned` copies it into a buffer of its own that
 the session keeps for retransmission (every QoS 1/2 publish). See the
 [codec section](#codec):
 
-<!-- benchtab file=results/2026-10-10-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=allocs/op -->
 
 | props | size | eclipse | mqttv5-header | mqttv5-pooled | mqttv5-owned |
 |---|---|---:|---:|---:|---:|
@@ -671,7 +738,7 @@ the session keeps for retransmission (every QoS 1/2 publish). See the
 | five | 1KiB | 12 | 0 | 0 | 1 |
 | five | 16KiB | 12 | 0 | 0 | 1 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Publish allocations
@@ -683,38 +750,38 @@ the payload); QoS 1 and 2 return when the broker has acknowledged. The
 packet a QoS 1/2 publish keeps for retransmission is one exact-size
 copy.
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=allocs/op -->
 
 | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---:|---:|---:|
 | 0 | 64B | 0 | 15 | 23 |
 | 0 | 1KiB | 0 | 15 | 23 |
 | 0 | 1MiB | 0 | 15 | 23 |
-| 1 | 64B | 5 | 53 | 42 |
-| 1 | 1KiB | 5 | 53 | 42 |
-| 1 | 1MiB | 7 | 55 ±2% | 43 |
-| 2 | 64B | 6 | 92 | 62 |
-| 2 | 1KiB | 6 | 92 | 62 |
-| 2 | 1MiB | 8 | 93 | 63 |
+| 1 | 64B | 4 | 53 | 42 |
+| 1 | 1KiB | 4 | 53 | 42 |
+| 1 | 1MiB | 6 | 55 ±2% | 43 |
+| 2 | 64B | 5 | 92 | 62 |
+| 2 | 1KiB | 5 | 92 | 62 |
+| 2 | 1MiB | 7 | 93 | 63 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=B/op -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Publish" rows=qos,size cols=lib unit=B/op -->
 
 | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---:|---:|---:|
 | 0 | 64B | 0B | 600B | 1.305KiB |
 | 0 | 1KiB | 0B | 600B | 2.305KiB |
 | 0 | 1MiB | 0B | 600B | 1.009MiB |
-| 1 | 64B | 424B | 4.309KiB | 1.641KiB |
-| 1 | 1KiB | 1.447KiB | 5.309KiB | 2.642KiB |
+| 1 | 64B | 440B | 4.309KiB | 1.642KiB |
+| 1 | 1KiB | 1.462KiB | 5.309KiB | 2.642KiB |
 | 1 | 1MiB | 1.009MiB | 1.012MiB | 1.010MiB |
-| 2 | 64B | 440B | 7.191KiB | 2.145KiB |
-| 2 | 1KiB | 1.462KiB | 8.191KiB | 3.146KiB |
+| 2 | 64B | 456B | 7.191KiB | 2.146KiB |
+| 2 | 1KiB | 1.479KiB | 8.191KiB | 3.146KiB |
 | 2 | 1MiB | 1.009MiB | 1.015MiB | 1.010MiB |
 
-<sub>B/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>B/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 ### Receive allocations
@@ -727,7 +794,7 @@ forwards into from its handler. A QoS 1 message is acknowledged when
 the callback returns, or, in `chan` and `queue` mode, when a consumer
 takes it.
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_Receive /consumers:1" rows=mode,qos,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_Receive /consumers:1" rows=mode,qos,size cols=lib unit=allocs/op -->
 
 | mode | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---|---:|---:|---:|
@@ -740,32 +807,32 @@ takes it.
 | queue | 1 | 64B | 6 | — | — |
 | queue | 1 | 1KiB | 6 | — | — |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 Publish-to-delivery round trip, both clients in one process:
 
-<!-- benchtab file=results/2026-10-10-e2e/e2e.txt filter=".name:E2E_RoundTrip" rows=qos,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-16-e2e/e2e.txt filter=".name:E2E_RoundTrip" rows=qos,size cols=lib unit=allocs/op -->
 
 | qos | size | mqttv5 | autopaho | paho3 |
 |---|---|---:|---:|---:|
 | 0 | 64B | 5 | 45 | 42 |
 | 0 | 1KiB | 5 | 47 | 42 |
 | 0 | 1MiB | 13 | 66 | 42 |
-| 1 | 64B | 13 | 95 | 78 |
-| 1 | 1KiB | 13 | 97 | 78 |
-| 1 | 1MiB | 22 ±5% | 117 ±1% | 80 |
-| 2 | 64B | 15 | 173 | 120 |
-| 2 | 1KiB | 15 | 175 | 120 |
-| 2 | 1MiB | 25 ±4% | 194 | 121 ±1% |
+| 1 | 64B | 12 | 95 | 78 |
+| 1 | 1KiB | 12 | 97 | 78 |
+| 1 | 1MiB | 21 | 117 ±1% | 80 |
+| 2 | 64B | 14 | 173 | 119 ±1% |
+| 2 | 1KiB | 14 | 175 | 120 ±1% |
+| 2 | 1MiB | 24 | 194 | 121 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 mqttv5's receive path by delivery mode, measured in-process without a
 broker (`BenchmarkReceive`, 64-byte payloads):
 
-<!-- benchtab file=results/2026-10-10-receive/receive.txt filter=".name:Receive /size:64B" rows=qos,consumer cols=delivery unit=allocs/op -->
+<!-- benchtab file=results/2026-11-16-receive/receive.txt filter=".name:Receive /size:64B" rows=qos,consumer cols=delivery unit=allocs/op -->
 
 | qos | consumer | owned | zerocopy |
 |---|---|---:|---:|
@@ -774,7 +841,7 @@ broker (`BenchmarkReceive`, 64-byte payloads):
 | 1 | queue | 4 | 3 |
 | 0 | callback | 2 | 1 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-10-09 at 80beb93780a2.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
 <!-- /benchtab -->
 
 `WithStats` is off in these runs; its counters are atomic adds behind a
@@ -827,8 +894,32 @@ nil check.
   the pipeline; through the broker, compare `cpu-ns/op`.
 - **MQTT 3.1.1 is a different protocol.** `paho3` has no Receive
   Maximum or properties; it is here as the most widely used Go client.
-  With 64 concurrent publishers it is not held to the broker's window
-  of 20; the MQTT 5 clients are.
+  With 64 concurrent publishers, or a pipelined window of 64, it is not
+  held to the broker's window of 20; the MQTT 5 clients are.
+- **Pipelining needs a publish that returns before the
+  acknowledgement.** mqttv5's `PublishAsync` returns a result to wait
+  on, and paho3's `Publish` a token; one goroutine so keeps a window of
+  messages in flight. autopaho's `Publish` returns only with the PUBACK,
+  so it pipelines only with a goroutine per message, which is what
+  `PublishConcurrent` measures; its asynchronous route,
+  `PublishViaQueue`, reports no outcome to the caller, so it appears in
+  `PublishQueued` instead.
+- **The queues differ in what they promise and in how they scale.**
+  mqttv5's `QueuePublisher` removes a message from its queue once the
+  broker has acknowledged it, and reports a message it gives up on to a
+  dead-letter callback; autopaho's queue manager removes it once it has
+  written it to the connection, after which only the session holds it.
+  autopaho's file queue keeps a file per message and, to find the
+  oldest, lists and stats the whole directory on every `Peek`: in a
+  profile with thousands of messages queued, most of its CPU time is in
+  that scan, so its cost per message grows with the backlog. That is
+  why `PublishQueued` holds the backlog at a fixed depth; an unbounded
+  burst would make its ns/op depend on N. mqttv5's `queue/file` is a
+  bbolt B+tree: each `Publish` is one write transaction and each batch
+  of acknowledged messages one more, whatever the depth. With
+  `file-sync` each of those transactions also waits for a disk sync, and
+  with one publishing goroutine nothing shares it, so ns/op there is
+  about one sync; concurrent publishers share one sync (group commit).
 
 ## Running
 
@@ -851,7 +942,7 @@ belong together in one set of directories:
 ```bash
 export LOAD_MAX=8 DATE=$(date +%Y-%m-%d)
 scripts/run.sh codec . -run '^$' -bench '^Benchmark(Decode|Encode)Publish' -benchmem -timeout 1h
-scripts/run.sh e2e . -tags e2e -run '^$' -bench '^BenchmarkE2E_(Publish|PublishConcurrent|Receive|ReceiveStream|RoundTrip)$' -benchmem -timeout 3h
+scripts/run.sh e2e . -tags e2e -run '^$' -bench '^BenchmarkE2E_(Publish|PublishConcurrent|PublishPipelined|PublishQueued|Receive|ReceiveStream|RoundTrip)$' -benchmem -timeout 4h
 scripts/run.sh e2e-reconnect . -tags e2e -run '^$' -bench '^BenchmarkE2E_Reconnect$' -benchmem -benchtime 100x -timeout 1h
 RUNS=6 scripts/run.sh e2e-latency . -tags e2e -run '^$' -bench '^BenchmarkE2E_Latency$' -benchtime 10000x -timeout 2h
 RUNS=6 scripts/run.sh e2e-slowconsumer . -tags e2e -run '^$' -bench '^BenchmarkE2E_SlowConsumer$' -benchtime 200000x -timeout 1h
@@ -924,7 +1015,8 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 
 | Module | Version | Used for |
 |---|---|---|
-| `github.com/eclipse/paho.golang` | v0.23.0 | `autopaho` client; `packets` codec |
+| `github.com/eclipse/paho.golang` | v0.23.0 | `autopaho` client and its `queue/memory` and `queue/file` queues; `packets` codec |
+| `github.com/ashtonian/mqttv5/queue/file` | this repository (`replace`) | mqttv5's file queue in `PublishQueued` |
 | `github.com/eclipse/paho.mqtt.golang` | v1.5.1 | `paho3` client |
 | `golang.org/x/perf` | see `go.mod` | `benchtab`: parsing, statistics, units |
 | `eclipse-mosquitto` image | 2.1.2-alpine | the broker |
@@ -932,7 +1024,12 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
 ## API: adding a library or scenario
 
 A library is a `lib` value in [`e2e_libs_test.go`](e2e_libs_test.go):
-`connect` returns a `publisher`; `subscribe` delivers payloads to a
+`connect` returns a `publisher`; `pipeline`, when the library has a
+publish that returns before the acknowledgement, returns a `pipeliner`
+whose `start` sends a message and whose `wait` waits for its
+acknowledgement; `queue` returns a `publisher` that stores each message
+in the library's queue of one of the kinds listed in `queues`;
+`subscribe` delivers payloads to a
 callback through a delivery `mode` and returns a `subscriber`, whose
 `stop` disconnects it, returns only once the library will deliver
 nothing more, and reports an error when it cannot confirm that within
@@ -974,7 +1071,7 @@ when the run is done. The suite sends synthetic payloads only.
 | Path | What |
 |---|---|
 | `harness_test.go` | broker address, sizes, CPU meter, `rawClient` (the library-neutral publisher and subscriber), and the tests of the harness: the sink, the adapters, the scenarios' rejection of corrupted deliveries |
-| `e2e_libs_test.go` | per-library adapters, the gated `subscription`, `sink`, subscription probe |
+| `e2e_libs_test.go` | per-library adapters (publish, pipelined publish, queued publish, subscribe), the gated `subscription`, `sink`, subscription probe |
 | `e2e_test.go` | the scenarios, and `rawServer`, the library-neutral source for `ReceiveStream` |
 | `codec_bench_test.go`, `fixtures.go` | codec benchmarks and their packets |
 | `cmd/benchtab` | Markdown table generator |

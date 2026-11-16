@@ -30,9 +30,21 @@ supervisor:
   window of its own; subscriptions stay on the main connection, so a
   slow `SubscribeCallback` handler holds up no publish a member carries
   ([Publish pool](publisher-pool.md#publish-pool-withpublisherpool)).
+- **Pipelined publishing from one goroutine.** `PublishAsync` returns a
+  result to wait on, so one goroutine keeps many QoS 1/2 messages in
+  flight; autopaho's `Publish` returns only with the acknowledgement,
+  so it needs a goroutine per message in flight
+  ([Pipelined publishing](../benchmarks/README.md#pipelined-publishing)).
 - **Durable publishing.** `QueuePublisher` with `queue/file` and
   `store/file` keeps publishing through outages and survives a process
-  crash without publishing an in-flight message twice.
+  crash without publishing an in-flight message twice. A message leaves
+  the queue once the broker has acknowledged it, and one the publisher
+  gives up on goes to a dead-letter callback; autopaho's
+  `PublishViaQueue` reports no outcome and removes a message once it is
+  written. autopaho's file queue scans its whole directory for every
+  message it sends, so its cost per message grows with the backlog;
+  `queue/file` is a B+tree whose cost does not
+  ([Store-and-forward queues](../benchmarks/README.md#store-and-forward-queues)).
 - **Typed payloads.** One `Encoding` on the client, the payload type per
   call: `cli.SubscribeAs[Reading](…)` delivers decoded values and
   `cli.PublishValue(…)` encodes any value and declares the MQTT 5
