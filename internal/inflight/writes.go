@@ -53,6 +53,9 @@ type job struct {
 	owner any // the flow the write is for; see cancelLocked
 	epoch uint64
 	begun atomic.Bool // finish has been called; later calls do nothing
+	// begunOK is set with begun when that first finish had no error: for
+	// a settle, the producer has recorded the outcome.
+	begunOK atomic.Bool
 }
 
 // queueLocked appends j to the write queue of the record it writes.
@@ -136,6 +139,9 @@ func (e *Engine) run(j *job) {
 		if j.begin != nil {
 			j.begin(func(err error) {
 				if j.begun.CompareAndSwap(false, true) {
+					if err == nil {
+						j.begunOK.Store(true)
+					}
 					e.proceed(j, err)
 				}
 			})
