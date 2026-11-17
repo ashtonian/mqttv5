@@ -20,9 +20,12 @@
   messages in flight share the store's writes: about half the window
   goes in each `Apply`, with `store/file` one transaction and one fsync.
   Draining a backlog with `store/file`'s group commit (macOS, in-process
-  broker) took 73 µs per message with the default window, 16 messages
-  to each fsync, and 15 µs with a window of 256. Raise the window when
-  the disk's sync rate, rather than the broker, limits the drain.
+  broker without a Receive Maximum) took 73 µs per message with the
+  default window, 16 messages to each fsync, and 15 µs with a window of
+  256, with `queue/file` on `SyncNone`; with `queue/file` also on group
+  commit, whose Acks take fsyncs of their own, 0.42 ms and 85 µs. Raise
+  the window when the disk's sync rate, rather than the broker, limits
+  the drain.
 
 ```go
 import (
