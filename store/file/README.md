@@ -24,7 +24,9 @@ cli, err := mqttv5.New(
 
 The client keeps its session state in memory and writes each change to
 the store before acting on it on the network (see the `session`
-package documentation for the exact order). After a crash, the next
+package documentation for the exact order). It gives the store every
+change that is due at once in one `Apply` (up to 1,024 changes and
+4 MiB of packets), which this store commits as one transaction. After a crash, the next
 process opens the same directory, `Connect` loads the state, sends
 CONNECT with CleanStart=0, and the session engine:
 
@@ -60,7 +62,7 @@ reported by `Store.Corrupt()` rather than stopping the client.
 
 ### Sync policies
 
-| Policy | Guarantee when Put/Delete returns | Throughput |
+| Policy | Guarantee when Apply returns | Throughput |
 |---|---|---|
 | `SyncGroupCommit` | On stable storage: survives process crash and power loss. `Open` syncs the directories it creates entries in, so a new store survives power loss too (on Windows, as far as NTFS journaling keeps new names). | One fsync per transaction; concurrent writes share a transaction. A lone writer pays one fsync, no batching delay. |
 | `SyncEveryWrite` | Same as group commit. | One fsync per write, regardless of concurrency. |
@@ -88,10 +90,34 @@ that saves depends on the file system (it is most of the cost on APFS,
 less in the Linux VM, where bbolt's work on each key dominates). Measure
 on your own with `go test -run '^$' -bench BenchmarkPut ./store/file`.
 
-For the client, every QoS 1/2 Publish waits for one store write before
-the PUBLISH is sent, and a QoS 2 exchange writes twice more; inbound QoS
-2 messages write once on Ack and once on PUBREL. Size the policy to your
-publish rate and latency budget.
+For the client, a QoS 1/2 PUBLISH is sent once its record is stored, its
+acknowledgement deletes the record, and a QoS 2 exchange writes once
+more on PUBREC; inbound QoS 2 messages write once on Ack and once on
+PUBREL. The client gives the store all the changes that are due at once
+in one `Apply`, one transaction, so concurrent publishes share each
+fsync. Measured on 2026-11-16 on the Mac above, group commit, against an
+in-process broker (medians of 8 runs, 3 for window 256; the
+fsync-bound rows vary by up to 60%):
+
+| Workload | Time per message | Messages per fsync |
+|---|---:|---:|
+| one goroutine calling `Publish` | 2.1 ms | 1 |
+| 64 goroutines calling `Publish` | 38 µs | 32 |
+| `QueuePublisher` draining a backlog, window 32, `queue/file` on `SyncNone` | 72 µs | 16 |
+| `QueuePublisher` draining a backlog, window 256, `queue/file` on `SyncNone` | 15 µs | 112 |
+
+Each message's writes take two commits, the record's and its
+deletion's, so about half of the messages in flight share a commit. The
+broker's Receive Maximum caps how many are sent and unacknowledged, not
+how many are stored at once. With `queue/file` also on group commit, the
+queue's Acks take fsyncs of their own on the same disk: against a
+broker with a Receive Maximum of 20 the drain took 311 µs per message
+with a window of 32, 27 µs with 256 and 8.4 µs with the default 4,096,
+where about 400 messages share each session fsync (medians of 6 runs;
+up to 3× more in runs where this disk's syncs were slow). See
+[sizing the window](../../docs/durable-publishing.md#sizing-the-window).
+Size the policy, and the number of messages in flight, to your publish
+rate and latency budget.
 
 ## External dependencies
 
@@ -109,7 +135,7 @@ import this submodule pull these in.
 | Symbol | Description |
 |---|---|
 | `Open(dir string, opts ...Option) (*Store, error)` | Opens or creates the store in `dir`. Returns `ErrLocked` when another `Store` (in any process) holds it. |
-| `(*Store).Load / Put / Delete / SetMeta / Reset / Close` | The `session.Store` contract. Put and Delete are durable per the sync policy when they return. |
+| `(*Store).Load / Apply / SetMeta / Reset / Close` | The `session.Store` contract. `Apply` writes its changes in one transaction, all or none, durable per the sync policy when it returns. |
 | `(*Store).Path() string` | Path of `session.db`. |
 | `(*Store).Corrupt() []error` | Records the last `Load` skipped (checksum or decode failure), each wrapping `ErrCorrupt`. |
 | `ErrLocked`, `ErrClosed`, `ErrCorrupt` | Sentinels for `errors.Is`. |
@@ -149,7 +175,7 @@ and delete or compact `session.db` (`bbolt compact`).
 |---|---|---|
 | `Open` returns `ErrLocked` | Another process (or another `Store` in this process) has the directory open. | Check for a second instance with the same session directory (`lsof session.db`). Each client identity needs its own directory. A crashed process releases the lock when it exits. |
 | `Connect` returns `load session store: …` | `session.db` cannot be read (permissions, disk failure). | Check the file's owner and mode; check the disk. Deleting `session.db` starts a fresh session (unacknowledged messages are lost). |
-| `Stats().StoreErrors` increasing | Writes failing (disk full, I/O errors). | A failed write before a PUBLISH fails that Publish; later failures are logged and the protocol continues in memory, so a crash at that point can resend or drop the affected messages. Free disk space or replace the volume. |
+| `Stats().StoreErrors` increasing | Writes failing (disk full, I/O errors); Error log `mqttv5: session store … failed`. | A failed write of a new message's record fails that message alone, unsent. Any other failed write stops the client, which fires `WithOnStoreFailure`; the next `Connect` reloads the session from the store (see [Store failures](../../docs/operations.md#store-failures)). Free disk space or replace the volume, then `Connect` again. |
 | `Store.Corrupt()` non-empty after `Load` | A record failed its checksum (torn hardware write, external modification). | The affected flows are not resumed. Inspect the logs for the packet identifiers; the rest of the session is intact. |
 | Messages resent after a restart that the broker had already acknowledged | The acknowledgement arrived but its Delete had not committed when the process died. | Expected at-least-once behaviour for QoS 1; QoS 2 stays exactly-once while the broker keeps the session. |
 

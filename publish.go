@@ -98,9 +98,11 @@ func (c *Client) Publish(ctx context.Context, po PublishOptions) error {
 // session for the next Connect.
 //
 // ctx bounds the start only: the wait for a connection
-// ([WithPublishWaitForConnection]), for a packet identifier, for the
-// session store's write and for room in the write queue. Once the
-// message is accepted ctx neither bounds nor withdraws it;
+// ([WithPublishWaitForConnection]), for a packet identifier and for room
+// in the write queue. With [WithStore] the message's record is written
+// in the background and the PUBLISH is sent once it is; a record the
+// store refuses completes the result with the [*StoreError], unsent.
+// Once the message is accepted ctx neither bounds nor withdraws it;
 // [PublishResult.Wait] takes a ctx of its own. Each unfinished message
 // holds a packet identifier, so at most 65,535 are unfinished at once
 // and a further call waits for one.
@@ -510,8 +512,8 @@ type exchange struct {
 const placeholderPacketID = 1
 
 // startReliable encodes the PUBLISH once and registers the flow with the
-// session engine, which allocates its packet identifier and stores it
-// first when a Store is configured. The flow belongs to the session from
+// session engine, which allocates its packet identifier and, when a
+// Store is configured, sends it only once its record is stored. The flow belongs to the session from
 // registration on: a dropped connection resends it, and a session loss
 // applies the [SessionLossPolicy]. On the live connection, link (nil
 // when there is none), the flow is sent once the caller's marker, from
@@ -553,7 +555,7 @@ func (c *Client) startReliable(ctx context.Context, opts wire.PublishOpts, x exc
 	case errors.Is(err, inflight.ErrIDsExhausted):
 		return nil, nil, fmt.Errorf("mqttv5: allocate packet id: %w", err)
 	case err != nil:
-		return nil, nil, fmt.Errorf("mqttv5: store outbound publish: %w", err)
+		return nil, nil, fmt.Errorf("mqttv5: register outbound publish: %w", err)
 	}
 	return flow, link, nil
 }

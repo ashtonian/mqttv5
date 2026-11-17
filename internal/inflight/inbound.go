@@ -1,8 +1,6 @@
 package inflight
 
 import (
-	"context"
-
 	"github.com/ashtonian/mqttv5/session"
 	"github.com/ashtonian/mqttv5/wire"
 )
@@ -93,12 +91,8 @@ func (e *Engine) ack(in *In) bool {
 		e.pushCtrlLocked(wire.PUBREC, head.id, wire.ReasonSuccess, true, nil)
 		if e.store != nil {
 			k := inKey(head.id)
-			jobs = append(jobs, e.queueLocked(k, head, &job{
-				op: "put inbound",
-				do: func(ctx context.Context) error {
-					return e.store.Put(ctx, session.Record{Key: k, QoS: 2, Phase: session.AwaitPubrel})
-				},
-			}))
+			c := session.Put(session.Record{Key: k, QoS: 2, Phase: session.AwaitPubrel})
+			jobs = append(jobs, e.queueLocked(k, head, &job{op: "put inbound", change: &c}))
 		}
 	}
 	if n > 0 {
@@ -138,10 +132,8 @@ func (e *Engine) HandlePubrel(id uint16) {
 		e.pushCtrlLocked(wire.PUBCOMP, id, wire.ReasonSuccess, true, in)
 		if e.store != nil {
 			k := inKey(id)
-			j = e.queueLocked(k, in, &job{
-				op: "delete inbound",
-				do: func(ctx context.Context) error { return e.store.Delete(ctx, k) },
-			})
+			c := session.Delete(k)
+			j = e.queueLocked(k, in, &job{op: "delete inbound", change: &c})
 		}
 	}
 	e.mu.Unlock()

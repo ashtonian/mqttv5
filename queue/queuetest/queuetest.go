@@ -39,6 +39,7 @@ func Run(t *testing.T, f Factory) {
 		return q
 	}
 	t.Run("OrderAndPeekAfter", func(t *testing.T) { testOrder(t, open(t)) })
+	t.Run("PeekBytes", func(t *testing.T) { testPeekBytes(t, open(t)) })
 	t.Run("Ack", func(t *testing.T) { testAck(t, open(t)) })
 	t.Run("SeqNeverReused", func(t *testing.T) { testSeqNeverReused(t, open(t)) })
 	t.Run("RoundTrip", func(t *testing.T) { testRoundTrip(t, open(t)) })
@@ -80,9 +81,14 @@ func enqueue(t *testing.T, q mqttv5.PublisherQueue, e mqttv5.QueueEntry) uint64 
 
 func peek(t *testing.T, q mqttv5.PublisherQueue, after uint64, n int) []mqttv5.QueueEntry {
 	t.Helper()
-	es, err := q.Peek(ctx, after, n)
+	return peekLimit(t, q, after, mqttv5.PeekLimit{Entries: n})
+}
+
+func peekLimit(t *testing.T, q mqttv5.PublisherQueue, after uint64, limit mqttv5.PeekLimit) []mqttv5.QueueEntry {
+	t.Helper()
+	es, err := q.Peek(ctx, after, limit)
 	if err != nil {
-		t.Fatalf("Peek(%d, %d): %v", after, n, err)
+		t.Fatalf("Peek(%d, %+v): %v", after, limit, err)
 	}
 	return es
 }
@@ -126,6 +132,40 @@ func testOrder(t *testing.T, q mqttv5.PublisherQueue) {
 	}
 	if n := length(t, q); n != 5 {
 		t.Fatalf("Len = %d, want 5", n)
+	}
+}
+
+// Peek ends its entries with the one that brings their total size to
+// the byte limit, and returns the first entry whatever its size.
+func testPeekBytes(t *testing.T, q mqttv5.PublisherQueue) {
+	var (
+		seqs  []uint64
+		sizes []int
+	)
+	for _, p := range []string{"aaaa", "bb", "cccccc", "d"} {
+		e := entry(p)
+		seqs = append(seqs, enqueue(t, q, e))
+		sizes = append(sizes, e.Size())
+	}
+	tests := []struct {
+		name  string
+		after uint64
+		limit mqttv5.PeekLimit
+		want  []string
+	}{
+		{"reaching the limit exactly", 0, mqttv5.PeekLimit{Entries: 10, Bytes: sizes[0] + sizes[1]}, []string{"aaaa", "bb"}},
+		{"the entry that crosses it", 0, mqttv5.PeekLimit{Entries: 10, Bytes: sizes[0] + 1}, []string{"aaaa", "bb"}},
+		{"a first entry over it", 0, mqttv5.PeekLimit{Entries: 10, Bytes: 1}, []string{"aaaa"}},
+		{"no byte limit", 0, mqttv5.PeekLimit{Entries: 10}, []string{"aaaa", "bb", "cccccc", "d"}},
+		{"entries first", 0, mqttv5.PeekLimit{Entries: 1, Bytes: 1 << 20}, []string{"aaaa"}},
+		{"after an entry", seqs[0], mqttv5.PeekLimit{Entries: 10, Bytes: sizes[1] + sizes[2]}, []string{"bb", "cccccc"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := payloads(peekLimit(t, q, tt.after, tt.limit)); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Peek(%d, %+v) = %q, want %q", tt.after, tt.limit, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -366,7 +406,7 @@ func testClosed(t *testing.T, q mqttv5.PublisherQueue) {
 	if _, _, err := q.Enqueue(ctx, entry("b"), mqttv5.QueueLimit{}); !errors.Is(err, mqttv5.ErrQueueClosed) {
 		t.Errorf("Enqueue after Close: %v", err)
 	}
-	if _, err := q.Peek(ctx, 0, 1); !errors.Is(err, mqttv5.ErrQueueClosed) {
+	if _, err := q.Peek(ctx, 0, mqttv5.PeekLimit{Entries: 1}); !errors.Is(err, mqttv5.ErrQueueClosed) {
 		t.Errorf("Peek after Close: %v", err)
 	}
 	if err := q.Ack(ctx, seq); !errors.Is(err, mqttv5.ErrQueueClosed) {

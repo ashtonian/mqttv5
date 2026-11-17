@@ -242,7 +242,7 @@ func (q *Queue) Enqueue(ctx context.Context, e mqttv5.QueueEntry, limit mqttv5.Q
 }
 
 // Peek implements [mqttv5.PublisherQueue].
-func (q *Queue) Peek(ctx context.Context, after uint64, n int) ([]mqttv5.QueueEntry, error) {
+func (q *Queue) Peek(ctx context.Context, after uint64, limit mqttv5.PeekLimit) ([]mqttv5.QueueEntry, error) {
 	if q.closed.Load() {
 		return nil, mqttv5.ErrQueueClosed
 	}
@@ -250,18 +250,20 @@ func (q *Queue) Peek(ctx context.Context, after uint64, n int) ([]mqttv5.QueueEn
 		return nil, err
 	}
 	var (
-		out []mqttv5.QueueEntry
-		bad []corruptEntry
+		out  []mqttv5.QueueEntry
+		size int
+		bad  []corruptEntry
 	)
 	err := q.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketEntries).Cursor()
-		for k, v := c.Seek(seqKey(after + 1)); k != nil && len(out) < n; k, v = c.Next() {
+		for k, v := c.Seek(seqKey(after + 1)); k != nil && !limit.Reached(len(out), size); k, v = c.Next() {
 			e, err := decodeEntry(k, v)
 			if err != nil {
 				bad = append(bad, corruptEntry{seq: binary.BigEndian.Uint64(k), err: err, value: bytes.Clone(v)})
 				continue
 			}
 			out = append(out, e)
+			size += e.Size()
 		}
 		return nil
 	})

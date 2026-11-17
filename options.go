@@ -1241,8 +1241,12 @@ func WithStats() Option {
 // packet that depends on it is sent (see package session). Without a
 // store the same state is kept in memory and survives reconnects only.
 //
-// A failed write of a new message's record fails that Publish. Any
-// other failed write means the store no longer holds what the session
+// The client gives s every record change that is due at once, in one
+// Apply, so concurrent publishes and a [QueuePublisher]'s window share
+// one transaction. A failed write of a new message's record fails that
+// message alone, unsent: Publish returns the [*StoreError], a
+// [PublishResult] completes with it, and a QueuePublisher retries the
+// message. Any other failed write means the store no longer holds what the session
 // has done, so the client stops rather than go on without the guarantee
 // the store exists for: it sends DISCONNECT 0x80 (the broker publishes
 // the Will), ends as [Client.Disconnect] would, and fires

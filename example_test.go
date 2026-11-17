@@ -288,7 +288,6 @@ func ExampleNewQueuePublisher() {
 	defer cli.Disconnect(ctx)
 
 	pub, err := mqttv5.NewQueuePublisher(cli, mqttv5.NewMemoryPublisherQueue(),
-		mqttv5.WithQueueWindow(32),
 		mqttv5.WithQueueTTL(24*time.Hour),
 		mqttv5.WithDeadLetter(func(e mqttv5.QueueEntry, err error) {
 			fmt.Println("dead letter", e.Publish.Topic, err)

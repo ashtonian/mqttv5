@@ -168,6 +168,7 @@ process and compact `queue.db` (`bbolt compact`).
 | `Corrupt()` non-empty, `WithOnCorrupt` firing | An entry failed its checksum or did not decode (torn hardware write, external modification). | The entry is in the `quarantine` bucket of `queue.db` with its raw bytes; it is not published. Inspect it offline with `bbolt get`. |
 | A message published twice after a restart | It was in flight at the crash and no persistent session store was configured, the broker lost the session, or the process died between the broker's acknowledgement and the queue removal. | Use `store/file` with the same client ID; enable `WithQueueIdempotencyKey` so consumers can drop the copy. |
 | Backlog not draining while connected | Messages failing with a reason that may pass (logged with `will retry`), or the broker's Receive Maximum is small. | Read the warnings for the reason code; raise `WithQueueWindow` if the link has high latency. |
+| Backlog drains slower than the broker accepts | Each message holds its window slot for the broker's round trip and the sync of its removal; with `SyncGroupCommit` on a slow disk the syncs, not the broker, bound the drain at about window ÷ two syncs. | Raise `WithQueueWindow`, or `WithQueueWindowBytes` for large messages, as in [sizing the window](../../docs/durable-publishing.md#sizing-the-window). `SyncNone` takes the sync out, but power loss then loses the latest stored messages and publishes the latest removed ones again. |
 
 ## Security
 

@@ -39,7 +39,7 @@
 | `WithCleanStartOnReconnect(b)` | false | `CleanStart` on every reconnect. False preserves QoS 1/2 session for resume. |
 | `WithSessionExpiry(seconds)` | 300 (5 min) | Session Expiry Interval ([§3.1.2.11.2]). Pass 0 to end the session with the connection. A broker override in CONNACK is honoured. |
 | `WithSessionLossPolicy(p)` | `SessionLossRepublish` | What happens to unacknowledged QoS 1/2 publishes when a connection starts without the session (Session Present = 0): `SessionLossRepublish` sends them again as new messages in their original order; `SessionLossFail` completes them with `ErrSessionLost`. |
-| `WithStore(s)` | none (in memory) | `session.Store` that persists session state across restarts (use `store/file`). Without it, state survives reconnects only. A failed write of a new message's record fails that `Publish`; any other failed write stops the client (see [Store failures](operations.md#store-failures)). |
+| `WithStore(s)` | none (in memory) | `session.Store` that persists session state across restarts (use `store/file`). Without it, state survives reconnects only. Record changes due at once go to the store in one `Apply`. A failed write of a new message's record fails that message alone (`Publish`, the `PublishAsync` result, or a `QueuePublisher` retry); any other failed write stops the client (see [Store failures](operations.md#store-failures)). |
 | `WithReceiveMaximum(n)` | 256 (`DefaultReceiveMaximum`) | QoS 1/2 messages the broker may send unacknowledged, and so how many a subscription whose consumer falls behind holds beyond its buffer. A broker that exceeds it is disconnected with reason 0x93. Limits the broker, not the client's own publishes (`WithMaxInflight`). |
 | `WithMaximumPacketSize(n)` | 0 (no advertised limit) | CONNECT property [§3.1.2.11.4] — caps the largest packet the broker may send. See note below. |
 | `WithInboundTopicAliasMaximum(n)` | 0 (no inbound aliases) | CONNECT property [§3.1.2.11.5] — opt into wire compression on inbound PUBLISHes. An alias the broker sends outside 1..n closes the connection (`0x94`). |
@@ -234,7 +234,8 @@ after five seconds.
 
 | Option | Type | Default | Effect |
 |---|---|---|---|
-| `WithQueueWindow(n)` | `int` | 32 (`DefaultQueueWindow`) | Messages in flight at once; the broker's Receive Maximum and `WithMaxInflight` still apply. Must be ≥ 1. |
+| `WithQueueWindow(n)` | `int` | 4096 (`DefaultQueueWindow`); under `DropOldest`, at most half of `WithQueueMaxSize` | Messages held at once, each from when the drain takes it until it has left the queue (the broker's round trip and, on a syncing queue, the sync of its removal). Held in memory; without `WithStore`, a restart publishes the accepted ones again. The broker's Receive Maximum and `WithMaxInflight` still bound those sent and unacknowledged. Must be ≥ 1. See [sizing the window](durable-publishing.md#sizing-the-window). |
+| `WithQueueWindowBytes(n)` | `int` | 8 MiB (`DefaultQueueWindowBytes`) | Bounds the window by the total `QueueEntry.Size` (ID, topic, payload, properties) of its messages as well: the drain takes no more once they reach n bytes, and always takes the next one when it holds none, so a larger message goes alone. The window's live memory measured 2–3× n. 0 means no byte bound; must be ≥ 0. |
 | `WithQueueMaxSize(n)` | `int` | 0 (unbounded) | Bound on queued messages, enforced atomically by the queue. |
 | `WithQueueDropPolicy(p)` | `DropPolicy` | `DropNewest` | At the bound: `DropNewest` returns `ErrQueueFull`; `DropOldest` evicts the oldest messages not in flight and dead-letters them. |
 | `WithQueueTTL(d)` | `time.Duration` | 0 (none) | Longest a message may wait, from `Publish`; the remaining lifetime is sent as Message Expiry Interval. |

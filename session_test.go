@@ -556,9 +556,9 @@ func storedPublish(t *testing.T, st session.Store, id uint16, seq uint64, topic 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Put(context.Background(), session.Record{
+	if err := st.Apply(context.Background(), session.Put(session.Record{
 		Key: session.RecordKey{Dir: session.Outbound, PacketID: id}, Seq: seq, QoS: 1, Phase: session.AwaitPuback, Packet: pkt,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -606,11 +606,18 @@ type recordingStore struct {
 	puts []session.RecordKey
 }
 
-func (r *recordingStore) Put(ctx context.Context, rec session.Record) error {
+func (r *recordingStore) Apply(ctx context.Context, changes ...session.Change) error {
+	if err := r.MemoryStore.Apply(ctx, changes...); err != nil {
+		return err
+	}
 	r.mu.Lock()
-	r.puts = append(r.puts, rec.Key)
+	for _, c := range changes {
+		if _, put := c.Record(); put {
+			r.puts = append(r.puts, c.Key())
+		}
+	}
 	r.mu.Unlock()
-	return r.MemoryStore.Put(ctx, rec)
+	return nil
 }
 
 func (r *recordingStore) stored(k session.RecordKey) bool {
@@ -706,11 +713,58 @@ type phaseFailStore struct {
 	fail  atomic.Bool
 }
 
-func (s *phaseFailStore) Put(ctx context.Context, r session.Record) error {
-	if s.fail.Load() && r.Phase == s.phase {
-		return errors.New("disk full")
+func (s *phaseFailStore) Apply(ctx context.Context, changes ...session.Change) error {
+	for _, c := range changes {
+		if r, put := c.Record(); put && s.fail.Load() && r.Phase == s.phase {
+			return errors.New("disk full")
+		}
 	}
-	return s.MemoryStore.Put(ctx, r)
+	return s.MemoryStore.Apply(ctx, changes...)
+}
+
+// A message whose record cannot be stored is never sent: Publish and a
+// PublishAsync result complete with the *StoreError, and the client
+// carries on.
+func TestUnstorableMessageFailsAlone(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	st := &phaseFailStore{MemoryStore: session.NewMemoryStore(), phase: session.AwaitPuback}
+	st.fail.Store(true)
+	failures := make(chan error, 1)
+	cli := tbClient(t, b, WithStore(st), WithOnStoreFailure(func(err error) { failures <- err }))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	r, err := cli.PublishAsync(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("async")})
+	if err != nil {
+		t.Fatalf("PublishAsync: %v", err)
+	}
+	var se *StoreError
+	if err := r.Wait(ctx); !errors.As(err, &se) || se.Op != "put outbound" {
+		t.Fatalf("PublishAsync result %v, want the record's store failure", err)
+	}
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("sync")}); !errors.As(err, &se) || se.Op != "put outbound" {
+		t.Fatalf("Publish returned %v, want the record's store failure", err)
+	}
+	st.fail.Store(false)
+	if err := cli.Publish(ctx, PublishOptions{Topic: "t", QoS: 1, Payload: []byte("kept")}); err != nil {
+		t.Fatalf("Publish once the store works: %v", err)
+	}
+	if got := qb.payloads(); !slices.Equal(got, []string{"kept"}) {
+		t.Fatalf("broker received %q, want only [kept]", got)
+	}
+	select {
+	case err := <-failures:
+		t.Fatalf("OnStoreFailure fired for one unstored record: %v", err)
+	default:
+	}
+	if !cli.Connected() {
+		t.Fatal("an unstored record disconnected the client")
+	}
+	waitEmpty(t, st)
 }
 
 // A store write that fails after a message was accepted stops the
@@ -847,52 +901,54 @@ func TestQueueAckFailureKeepsTheExchange(t *testing.T) {
 	}
 }
 
-// registerGate holds the first AwaitPuback Put until release is closed
-// and fails every AwaitPubcomp Put.
-type registerGate struct {
+// phaseGate holds the first Apply with an AwaitPubcomp Put until
+// release is closed, then fails it and every later one.
+type phaseGate struct {
 	*session.MemoryStore
 	held, release chan struct{}
 	once          sync.Once
 }
 
-func (s *registerGate) Put(ctx context.Context, r session.Record) error {
-	if r.Phase == session.AwaitPuback {
-		s.once.Do(func() {
-			close(s.held)
-			<-s.release
-		})
+func (s *phaseGate) Apply(ctx context.Context, changes ...session.Change) error {
+	for _, c := range changes {
+		if r, put := c.Record(); put && r.Phase == session.AwaitPubcomp {
+			s.once.Do(func() {
+				close(s.held)
+				<-s.release
+			})
+			return errors.New("disk full")
+		}
 	}
-	if r.Phase == session.AwaitPubcomp {
-		return errors.New("disk full")
-	}
-	return s.MemoryStore.Put(ctx, r)
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
-// A store failure while a queued message's record is being written ends
-// that message's exchange once: the QueuePublisher sees one outcome, so
-// its count of running exchanges holds and it closes cleanly.
-func TestQueuePublisherSurvivesStoreFailureDuringRegister(t *testing.T) {
-	st := &registerGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
-	triggered, pubrec := make(chan struct{}), make(chan struct{})
+// A store failure while a queued message's record waits to be written
+// ends that message's exchange once: the QueuePublisher sees one
+// outcome, so its count of running exchanges holds and it closes
+// cleanly.
+func TestQueuePublisherSurvivesStoreFailureBeforeItsRecord(t *testing.T) {
+	st := &phaseGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
 	b := testbroker.New(t, func(c *testbroker.Conn) {
 		c.AcceptConnect(wire.ConnackOpts{})
 		p := c.Expect(wire.PUBLISH, 0)
-		close(triggered)
-		<-pubrec
 		c.Pubrec(p.PacketID, wire.ReasonSuccess)
 		c.ServeAuto()
 	})
 	cli := tbClient(t, b, WithStore(st), WithOnStoreFailure(func(error) {}))
 	failed := make(chan error, 1)
 	go func() { failed <- cli.Publish(context.Background(), PublishOptions{Topic: "trigger", QoS: 2}) }()
-	// PUBLISHes go out in order: the queued message, held below, must
-	// come after the trigger.
-	<-triggered
+	// The trigger's AwaitPubcomp write holds the store writer, so the
+	// queued message's record waits behind it.
+	<-st.held
 	q := NewMemoryPublisherQueue()
 	p := newQueuePublisher(t, cli, q)
 	enqueueAll(t, p, 1, "registering")
-	<-st.held
-	close(pubrec) // the QoS 2 phase write fails and ends the session
+	for deadline := time.Now().Add(3 * time.Second); cli.engine.OutboundLen() < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the queued message was never registered")
+		}
+	}
+	close(st.release) // the phase write fails and ends the session
 	select {
 	case err := <-failed:
 		if !errors.Is(err, ErrStoreFailed) {
@@ -901,7 +957,6 @@ func TestQueuePublisherSurvivesStoreFailureDuringRegister(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the store failure did not end the session")
 	}
-	close(st.release)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := cli.engine.Drain(ctx); err != nil {
@@ -985,11 +1040,16 @@ func TestStoreFailureDuringActivation(t *testing.T) {
 	}
 }
 
-// failDeleteStore fails every Delete.
+// failDeleteStore fails every Apply with a Delete.
 type failDeleteStore struct{ *session.MemoryStore }
 
-func (s *failDeleteStore) Delete(context.Context, session.RecordKey) error {
-	return errors.New("disk full")
+func (s *failDeleteStore) Apply(ctx context.Context, changes ...session.Change) error {
+	for _, c := range changes {
+		if _, put := c.Record(); !put {
+			return errors.New("disk full")
+		}
+	}
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
 // A store failure while Connect is still connecting the publisher pool

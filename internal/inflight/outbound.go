@@ -91,8 +91,8 @@ func (o *Out) wake(err error) {
 // identifier, the outcome offered again to the next Adopt of its Ref, in
 // this process or, from the stored record, after a restart. A
 // SettleFunc must not block: it may run on the connection's read
-// goroutine. For a flow a session failure or Discard drops, done changes
-// nothing.
+// goroutine or the store writer. For a flow a session failure or Discard
+// drops, or one whose record could not be stored, done changes nothing.
 type SettleFunc func(outcome error, done func(error))
 
 // ignoreDone is the done of an outcome nothing waits for.
@@ -113,7 +113,9 @@ type Message struct {
 	// record is deleted only after the producer has recorded the outcome
 	// (see [SettleFunc]), so a crash never loses it. When the session
 	// fails (see [Config.OnFailure]) Settle gets the [*StoreError]; the
-	// record is kept and Adopt finds the flow again after Restore.
+	// record is kept and Adopt finds the flow again after Restore. When
+	// the flow's own record cannot be stored, Settle gets that
+	// [*StoreError], and there is no record.
 	Settle SettleFunc
 	// OnDone, when set, is called once when the flow's Done closes, with
 	// what Err reports from then on, unless Withdraw closes it: the
@@ -136,13 +138,16 @@ type Message struct {
 // While a flow with the same Ref is retiring — its producer has recorded
 // its outcome and its record is being deleted — it waits for that too,
 // so the store never holds two records for one Ref.
-// The record is stored before the flow can be sent; if that fails the
-// flow is removed, the identifier released, and a [*StoreError]
-// returned. An error means the flow does not exist and m.Settle is never
-// called; otherwise the flow completes through Done and Settle, also
-// when the session fails meanwhile. The returned Link, when non-nil, is
-// the live connection: the caller passes out.Seq() to its SendOrdered so
-// the PUBLISH keeps its place relative to other writes.
+//
+// Register does not wait for the flow's record to be stored: the store
+// writer stores it together with the other writes due (see writeLoop),
+// and the flow is not sent before. If storing fails, the flow completes
+// with a [*StoreError] — never sent, its identifier released — and the
+// session goes on. An error means the flow does not exist and m.Settle
+// is never called; otherwise the flow completes through Done and
+// Settle, also when the session fails meanwhile. The returned Link, when
+// non-nil, is the live connection: the caller passes out.Seq() to its
+// SendOrdered so the PUBLISH keeps its place relative to other writes.
 func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) (*Out, Link, error) {
 	idAt, ok := wire.PublishPacketIDOffset(m.Packet)
 	if !ok || m.QoS > 2 || m.Packet[0]>>1&0x03 != m.QoS {
@@ -192,7 +197,6 @@ func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) 
 	if !o.expiresAt.IsZero() {
 		o.expiry = secondsUntil(o.expiresAt, e.cfg.Now())
 	}
-	epoch := e.epoch
 	o.seq = e.nextSeq
 	o.pubSeq = o.seq
 	e.nextSeq++
@@ -209,51 +213,40 @@ func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) 
 		e.mu.Unlock()
 		return o, link, nil
 	}
-	var putErr error
-	r := o.record()
-	// A fresh flow has no earlier write, so this Put is first in line
-	// and runs below on the caller's goroutine, under its ctx.
+	c := session.Put(o.record())
 	put := e.queueLocked(outKey(o.id), o, &job{
-		op: "put outbound",
-		do: func(context.Context) error { return e.store.Put(ctx, r) },
-		after: func(err error) error {
-			if err == nil {
-				return nil
+		op: "put outbound", change: &c,
+		after: func(err error) (func(), error) {
+			if err != nil {
+				return e.unstoredLocked(o, &StoreError{Op: "put outbound", Err: err}), nil
 			}
-			// Never stored: the caller learns it was not accepted, and
-			// writes queued for it since (a reconnect's) never run.
-			putErr = &StoreError{Op: "put outbound", Err: err}
-			e.cancelLocked(outKey(o.id), o)
-			e.unlinkLocked(o)
-			delete(e.out, o.id)
-			if len(o.ref) > 0 {
-				delete(e.refs, string(o.ref))
-				// A session loss may have ended it meanwhile.
-				if e.orphans[string(o.ref)] == o {
-					delete(e.orphans, string(o.ref))
-				}
-			}
-			o.finished = true
-			e.ids.release(o.id, OwnerPublish)
-			return nil
+			return nil, nil
 		},
 	})
+	link := e.link
 	e.mu.Unlock()
+	e.start(put)
+	return o, link, nil
+}
 
-	if put != nil {
-		e.run(put)
+// unstoredLocked ends o, whose record could not be stored, with err. It
+// was never sent, so it goes without a trace: its identifier is
+// released, and writes queued for it since (a reconnect's) never run.
+// It returns the call that gives o's Settle the outcome, to make once
+// e.mu is released. A flow something else finished meanwhile is left to
+// the jobs that retire it, queued behind the failed write.
+func (e *Engine) unstoredLocked(o *Out, err error) func() {
+	if o.finished {
+		return nil
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	switch {
-	case putErr != nil:
-		return nil, nil, putErr
-	case e.epoch != epoch:
-		// The session failed while the record was written. o was part of
-		// it, so it has completed, and its Settle run, with the failure.
-		return o, nil, nil
+	e.cancelLocked(outKey(o.id), o)
+	e.unlinkLocked(o)
+	e.finishLocked(o, err)
+	e.ids.release(o.id, OwnerPublish)
+	if settle := o.settle; settle != nil {
+		return func() { settle(err, ignoreDone) }
 	}
-	return o, e.link, nil
+	return nil
 }
 
 // Withdraw removes o if it has never been handed to a connection, so a
@@ -510,18 +503,12 @@ func (e *Engine) settleLocked(o *Out) *job {
 	k := outKey(o.id)
 	j := &job{
 		op: "delete outbound",
-		do: func(ctx context.Context) error {
-			if e.store == nil {
-				return nil
-			}
-			return e.store.Delete(ctx, k)
-		},
-		after: func(err error) error {
+		after: func(err error) (func(), error) {
 			o.settling = false
 			var se *settleError
 			failed := errors.As(err, &se)
 			if err != nil && !failed {
-				return &StoreError{Op: "delete outbound", Err: err}
+				return nil, &StoreError{Op: "delete outbound", Err: err}
 			}
 			if failed {
 				// Queued behind this job, which starts it.
@@ -542,8 +529,12 @@ func (e *Engine) settleLocked(o *Out) *job {
 				}
 				e.ids.release(o.id, OwnerPublish)
 			}
-			return nil
+			return nil, nil
 		},
+	}
+	if e.store != nil {
+		c := session.Delete(k)
+		j.change = &c
 	}
 	o.settleJob = j
 	if settle != nil {
@@ -623,8 +614,8 @@ func (e *Engine) putOutLocked(o *Out) *job {
 	if e.store == nil {
 		return nil
 	}
-	r := o.record()
-	return e.queueLocked(outKey(o.id), o, &job{op: "put outbound", do: func(ctx context.Context) error { return e.store.Put(ctx, r) }})
+	c := session.Put(o.record())
+	return e.queueLocked(outKey(o.id), o, &job{op: "put outbound", change: &c})
 }
 
 func sortByPubSeq(flows []*Out) {

@@ -111,6 +111,7 @@ Normal message traffic logs nothing.
 | Messages missing on a subscription | `Stats().InboundDropped`; `SubOnDrop` | The consumer is slower than the stream. Only QoS 0 messages are dropped, unless `SubAutoAck` or `DropOldest` is set: raise `SubBuffer` / `SubMaxQueueSize`, subscribe at QoS 1, consume faster, or use a callback (backpressure) |
 | Duplicate messages after a restart | Session Present in `OnConnectionUp`; the store | Without a durable `WithStore`, a restart loses QoS 1/2 state; `WithSessionLossPolicy` decides what happens to unacknowledged publishes |
 | `ErrLocked` from `store/file` / `queue/file` | another process holds the file | One process per store directory |
+| `Publish` or a `PublishAsync` result returns `ErrStoreFailed` with `Op` `put outbound`, client still connected; or Warn log `publishing a queued message failed; will retry` with a `*StoreError` | the `*StoreError`'s `Err`; the Error log `mqttv5: session store put outbound failed`; `Stats().StoreErrors` | The store refused that message's record and nothing was sent. A store that refuses one write usually refuses the next kind too and stops the client (next row): check free space and permissions. A `QueuePublisher` retries the message by itself |
 | Client stopped, `WithOnStoreFailure` fired, `Publish` returns `ErrStoreFailed` | the `*StoreError`'s `Op` and `Err`; the Error log; free space and permissions on the store directory | Fix the store, then `Connect` again: it reloads the session from the store (see [Store failures](#store-failures)) |
 | Memory grows with large messages | the broker's message sizes | Set `WithMaximumPacketSize` to the largest message you expect |
 | A publish pool is no faster than one connection | `Stats().PoolConnected` against the pool size; `PoolFallbacks` | Members not connected: check the broker's connection limit and that its ACLs admit `<ClientID>-pub-<n>`; members log with `component=publisher-pool`. All connected: the round trip is not what limits publishing ([Publish pool](publisher-pool.md#publish-pool-withpublisherpool)) |
@@ -127,11 +128,24 @@ AwaitPubcomp phase, a PUBREC for the inbound AwaitPubrel record and a
 PUBCOMP for that record's deletion. One flow's writes reach the store in
 the order the client decided them, also across a reconnect.
 
-A failed write of a new message's record fails that `Publish` with a
-`*StoreError`. Any other failed write means the store no longer holds
-what the session has done, so the client stops instead of carrying on
-without the guarantee the store is there for, much as a crash would
-stop it:
+The client writes to the store from one goroutine, which gives it every
+change that is due in one `Apply`: the records of messages published
+meanwhile, and the phase writes and deletions of exchanges that moved
+on. With `store/file` that is one transaction and one fsync for all of
+them. A burst larger than 1,024 changes or 4 MiB of packets goes in
+several `Apply`s, so the first messages go out after the first commit. When an `Apply` of several changes fails, the client logs a Warn
+(`session store apply failed; applying each change on its own`) and
+applies each change again on its own, so a record the store refuses
+fails only its own exchange.
+
+A failed write of a new message's record fails that message alone,
+which is never sent: `Publish` returns the `*StoreError`, a
+`PublishAsync` result completes with it, and a `QueuePublisher` keeps
+the message and tries it again after `WithQueueRetryBackoff` (Warn log
+`publishing a queued message failed; will retry`). Any other failed
+write means the store no longer holds what the session has done, so the
+client stops instead of carrying on without the guarantee the store is
+there for, much as a crash would stop it:
 
 1. it drops the session state it holds in memory and sends nothing more
    that depends on it;
@@ -145,6 +159,9 @@ stop it:
 
 The client treats every store error as final. A `session.Store` over a
 backend with transient failures (a network database, say) retries them
-itself within the ctx it is given. `store/file` returns an error only
+itself within the ctx it is given. A custom store must make each
+`Apply` atomic, all of its changes or none: the client relies on that
+when it applies a failed batch's changes again one by one. Check a
+custom store with `github.com/ashtonian/mqttv5/session/storetest`. `store/file` returns an error only
 when the file system does: check free space and the Error log, then
 `Connect` again.

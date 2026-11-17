@@ -106,7 +106,7 @@ func TestCorruptEntriesAreQuarantined(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := q.Peek(ctx, 0, 10)
+	got, err := q.Peek(ctx, 0, mqttv5.PeekLimit{Entries: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

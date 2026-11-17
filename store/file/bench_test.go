@@ -43,7 +43,7 @@ func BenchmarkPut(b *testing.B) {
 								Key: session.RecordKey{Dir: session.Outbound, PacketID: uint16(i%65535) + 1},
 								Seq: i, QoS: 1, Phase: session.AwaitPuback, Packet: packet,
 							}
-							if err := s.Put(ctx, r); err != nil {
+							if err := s.Apply(ctx, session.Put(r)); err != nil {
 								b.Error(err)
 								return
 							}

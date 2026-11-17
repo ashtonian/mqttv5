@@ -72,12 +72,16 @@ for _, r := range outstanding {
   dropped connection resends it — and every outcome comes through the
   result. `Done()` closes when the PUBACK (QoS 1) or PUBCOMP (QoS 2)
   arrives; `Err()` is nil until then, and afterwards nil or what
-  `Publish` would have returned, a refusal as a `*ReasonCodeError`.
+  `Publish` would have returned, a refusal as a `*ReasonCodeError`. With
+  `WithStore`, a message whose record the store refuses is never sent,
+  and its result completes with the `*StoreError` (see
+  [Store failures](operations.md#store-failures)).
   `Wait(ctx)` waits for `Done()` and returns `Err()`.
 - **ctx.** The ctx of `PublishAsync` bounds the start only: the wait for
   a connection (with `WithPublishWaitForConnection`), for a packet
-  identifier, for the session store's write and for room in the write
-  queue. If it ends before the message is queued, the message is taken
+  identifier and for room in the write queue. It does not wait for the
+  session store: the message's record is written in the background,
+  together with the others due, and the PUBLISH goes out once it is. If it ends before the message is queued, the message is taken
   back and the call returns ctx's error. Nothing withdraws an accepted
   message; the ctx of `Wait` bounds that wait alone.
 - **Order and writes.** Messages go out in the order they are accepted,

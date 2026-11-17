@@ -203,6 +203,10 @@ type Engine struct {
 	queues     map[session.RecordKey][]*job
 	writes     int
 	writesIdle chan struct{}
+	// due are the jobs whose change waits for the store writer, which
+	// runs while writing is set (see writeLoop).
+	due     []*job
+	writing bool
 	// epoch changes when the session fails; a write from an earlier
 	// epoch no longer touches the state in memory.
 	epoch   uint64
@@ -504,9 +508,8 @@ func (e *Engine) sessionLostLocked() []*job {
 		in.dead = true
 		if in.state == inAwaitPubrel && e.store != nil {
 			k := inKey(id)
-			jobs = append(jobs, e.queueLocked(k, in, &job{
-				op: "delete inbound", do: func(ctx context.Context) error { return e.store.Delete(ctx, k) },
-			}))
+			c := session.Delete(k)
+			jobs = append(jobs, e.queueLocked(k, in, &job{op: "delete inbound", change: &c}))
 		}
 	}
 	clear(e.in)

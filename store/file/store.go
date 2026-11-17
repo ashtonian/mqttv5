@@ -13,12 +13,12 @@
 // this process or another — fails with [ErrLocked] instead of two
 // clients corrupting one session.
 //
-// Durability: every Put and Delete returns only after its change is
-// committed according to the SyncPolicy. The default, [SyncGroupCommit],
-// commits a write immediately when no commit is running and otherwise
-// joins it to the next one, so a lone writer pays one fsync and
-// concurrent writers share fsyncs while each still waits for its own
-// write to reach stable storage.
+// Durability: Apply writes its changes in one transaction and returns
+// only after it is committed according to the SyncPolicy. The default,
+// [SyncGroupCommit], commits a write immediately when no commit is
+// running and otherwise joins it to the next one, so a lone writer pays
+// one fsync and concurrent writers share fsyncs while each still waits
+// for its own write to reach stable storage.
 package file
 
 import (
@@ -204,20 +204,37 @@ func (s *Store) Load(ctx context.Context) (session.Meta, []session.Record, error
 	return meta, recs, nil
 }
 
-// Put implements [session.Store].
-func (s *Store) Put(ctx context.Context, r session.Record) error {
-	if err := r.Validate(); err != nil {
-		return err
+// Apply implements [session.Store]: the changes go in one transaction.
+func (s *Store) Apply(ctx context.Context, changes ...session.Change) error {
+	if len(changes) == 0 {
+		return nil
 	}
-	v := encodeRecord(r)
-	k := idKey(r.Key.PacketID)
-	return s.db.Update(ctx, func(tx *bolt.Tx) error { return tx.Bucket(bucketFor(r.Key.Dir)).Put(k, v) })
-}
-
-// Delete implements [session.Store].
-func (s *Store) Delete(ctx context.Context, k session.RecordKey) error {
-	key := idKey(k.PacketID)
-	return s.db.Update(ctx, func(tx *bolt.Tx) error { return tx.Bucket(bucketFor(k.Dir)).Delete(key) })
+	// Validated and encoded outside the transaction, which holds bbolt's
+	// writer lock.
+	values := make([][]byte, len(changes))
+	for i, c := range changes {
+		if err := c.Validate(); err != nil {
+			return err
+		}
+		if r, ok := c.Record(); ok {
+			values[i] = encodeRecord(r)
+		}
+	}
+	return s.db.Update(ctx, func(tx *bolt.Tx) error {
+		for i, c := range changes {
+			b, k := tx.Bucket(bucketFor(c.Key().Dir)), idKey(c.Key().PacketID)
+			var err error
+			if values[i] != nil {
+				err = b.Put(k, values[i])
+			} else {
+				err = b.Delete(k)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // SetMeta implements [session.Store].
