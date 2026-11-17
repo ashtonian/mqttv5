@@ -2,6 +2,7 @@ package mqttv5
 
 import (
 	"cmp"
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -95,6 +96,9 @@ type QueuePublisher struct {
 
 	mu      sync.Mutex
 	pending map[uint64]*queuedMessage // claimed and unfinished, at most cfg.window
+	// waiting are the pending messages not in flight, to be started again
+	// at their retryAt; the others have an exchange running.
+	waiting waitingMessages
 	// pendingBytes is the total size of pending, held to cfg.windowBytes
 	// but for the message that crossed it.
 	pendingBytes int
@@ -137,7 +141,6 @@ type exchangeOutcome struct {
 type queuedMessage struct {
 	entry    QueueEntry
 	size     int       // entry.Size(), counted in pendingBytes
-	inFlight bool      // an exchange is running
 	attempts int       // exchanges started, or outcomes recorded again, in this process
 	retryAt  time.Time // when to start the next; zero: once connected
 	// accepted and deadLettered are set once the broker accepted the
@@ -568,15 +571,11 @@ func (p *QueuePublisher) due() (due []*queuedMessage, next time.Time, room PeekL
 	now := p.clk.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, m := range p.pending {
-		switch {
-		case m.inFlight:
-		case !m.retryAt.After(now):
-			m.inFlight = true
-			due = append(due, m)
-		case next.IsZero() || m.retryAt.Before(next):
-			next = m.retryAt
-		}
+	for len(p.waiting) > 0 && !p.waiting[0].retryAt.After(now) {
+		due = append(due, heap.Pop(&p.waiting).(*queuedMessage))
+	}
+	if len(p.waiting) > 0 {
+		next = p.waiting[0].retryAt
 	}
 	slices.SortFunc(due, func(a, b *queuedMessage) int { return cmp.Compare(a.entry.Seq, b.entry.Seq) })
 	room.Entries = p.cfg.window - len(p.pending)
@@ -611,7 +610,7 @@ func (p *QueuePublisher) claim(room PeekLimit) (claimed []*queuedMessage, readRe
 	out := make([]*queuedMessage, len(entries))
 	p.mu.Lock()
 	for i, e := range entries {
-		m := &queuedMessage{entry: e, size: e.Size(), inFlight: true}
+		m := &queuedMessage{entry: e, size: e.Size()}
 		p.pending[e.Seq] = m
 		p.pendingBytes += m.size
 		out[i] = m
@@ -780,11 +779,33 @@ func (p *QueuePublisher) decide(m *queuedMessage, err error) (gone bool, retryAt
 	}
 }
 
-// reschedule makes m wait, out of flight, to be started at retryAt.
+// reschedule makes m, whose exchange has ended, wait to be started
+// again at retryAt.
 func (p *QueuePublisher) reschedule(m *queuedMessage, retryAt time.Time) {
 	p.mu.Lock()
-	m.inFlight, m.retryAt = false, retryAt
+	m.retryAt = retryAt
+	heap.Push(&p.waiting, m)
 	p.mu.Unlock()
+}
+
+// waitingMessages is a min-heap of messages by retryAt, so the drain
+// finds those due without visiting the window's messages in flight.
+type waitingMessages []*queuedMessage
+
+func (w waitingMessages) Len() int           { return len(w) }
+func (w waitingMessages) Less(i, j int) bool { return w[i].retryAt.Before(w[j].retryAt) }
+func (w waitingMessages) Swap(i, j int)      { w[i], w[j] = w[j], w[i] }
+
+// Push implements heap.Interface.
+func (w *waitingMessages) Push(x any) { *w = append(*w, x.(*queuedMessage)) }
+
+// Pop implements heap.Interface.
+func (w *waitingMessages) Pop() any {
+	old := *w
+	m := old[len(old)-1]
+	old[len(old)-1] = nil
+	*w = old[:len(old)-1]
+	return m
 }
 
 // removalRetry is when to retry taking m out of the queue after it

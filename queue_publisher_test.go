@@ -563,6 +563,52 @@ func TestQueuePublisherRetriesAnUnstorableRecord(t *testing.T) {
 	}
 }
 
+// Each message waiting for a retry starts when its own retry is due, not
+// when the latest one waiting is.
+func TestQueuePublisherRetriesEachMessageWhenDue(t *testing.T) {
+	qb := newQueueBroker()
+	refused := make(map[string]bool)
+	qb.answer = func(p testbroker.Packet) wire.ReasonCode {
+		if !refused[string(p.Payload)] {
+			refused[string(p.Payload)] = true
+			return wire.ReasonQuotaExceeded
+		}
+		return wire.ReasonSuccess
+	}
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	clk := clock.NewFake(time.Unix(1_000, 0))
+	cli := tbClient(t, b, withClock(clk))
+	q := NewMemoryPublisherQueue()
+	// The first refusal recorded waits 20 s, the second 10 s.
+	var decided atomic.Int32
+	backoff := BackoffFunc(func(int) time.Duration {
+		if decided.Add(1) == 1 {
+			return 20 * time.Second
+		}
+		return 10 * time.Second
+	})
+	p := newQueuePublisher(t, cli, q, WithQueueRetryBackoff(backoff))
+	enqueueAll(t, p, 2, "a", "b")
+	for deadline := time.Now().Add(3 * time.Second); decided.Load() < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("both refusals were not recorded")
+		}
+	}
+	clk.Advance(10 * time.Second)
+	waitQueueLen(t, q, 1)
+	if got := qb.payloads(); len(got) != 3 {
+		t.Fatalf("broker received %q, want each message once and the one due again", got)
+	}
+	clk.Advance(10 * time.Second)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); len(got) != 4 {
+		t.Fatalf("broker received %q, want each message twice", got)
+	}
+}
+
 type keptQueue struct{ *MemoryPublisherQueue }
 
 func (keptQueue) Close() error { return nil }
