@@ -128,18 +128,27 @@ func (e *Engine) start(jobs ...*job) {
 func (e *Engine) run(j *job) {
 	for j != nil {
 		if j.begin != nil {
-			j.begin(func(err error) {
-				if j.begun.CompareAndSwap(false, true) {
-					if err == nil {
-						j.begunOK.Store(true)
-					}
-					e.proceed(j, err)
-				}
-			})
+			// Not a closure here: one capturing j, which this loop
+			// reassigns, would move j to the heap on every call, the
+			// acknowledgements' run(nil) included.
+			e.begin(j)
 			return
 		}
 		j = e.write(j)
 	}
+}
+
+// begin calls j's begin with the finish that goes on with j: the first
+// call proceeds, later ones do nothing.
+func (e *Engine) begin(j *job) {
+	j.begin(func(err error) {
+		if j.begun.CompareAndSwap(false, true) {
+			if err == nil {
+				j.begunOK.Store(true)
+			}
+			e.proceed(j, err)
+		}
+	})
 }
 
 // proceed goes on with j once its begin has finished with err: its

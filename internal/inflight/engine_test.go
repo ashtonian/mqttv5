@@ -320,6 +320,41 @@ func TestQoS2PubrelAfterPubrecAndOnResume(t *testing.T) {
 	}
 }
 
+// Without a session store an acknowledgement has nothing to write, and
+// the read goroutine handles it without allocating.
+func TestAcknowledgementsWithoutStoreDoNotAllocate(t *testing.T) {
+	const runs = 100
+	for _, qos := range []byte{1, 2} {
+		t.Run(fmt.Sprintf("qos=%d", qos), func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.connect(false, 0)
+			// AllocsPerRun makes one more call than runs, to warm up.
+			ids := make([]uint16, 0, runs+1)
+			for range runs + 1 {
+				ids = append(ids, h.publish(qos, "x").PacketID())
+			}
+			h.collect()
+			next := 0
+			allocs := testing.AllocsPerRun(runs, func() {
+				id := ids[next]
+				next++
+				if qos == 1 {
+					h.e.HandlePuback(id, 0, nil)
+					return
+				}
+				h.e.HandlePubrec(id, 0, nil)
+				h.e.HandlePubcomp(id)
+			})
+			if allocs != 0 {
+				t.Fatalf("acknowledging a QoS %d flow made %v allocations, want 0", qos, allocs)
+			}
+			if n := h.e.OutboundLen(); n != 0 {
+				t.Fatalf("%d flows left after their acknowledgements", n)
+			}
+		})
+	}
+}
+
 func TestPubrelOrderFollowsPubrecOrder(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.connect(false, 0)
