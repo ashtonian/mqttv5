@@ -500,7 +500,7 @@ type exchange struct {
 	// onDone runs when the wait on the flow ends; see
 	// [inflight.Message.OnDone].
 	onDone func(error)
-	// beforeWait queues the marker for flows the caller registered
+	// beforeWait sends the marker for flows the caller registered
 	// before this one; see [inflight.Message.BeforeWait].
 	beforeWait func()
 }

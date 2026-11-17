@@ -124,7 +124,7 @@ type Message struct {
 	// if Register has to wait — for a packet identifier, or for the
 	// previous flow with the same Ref to retire — before it waits. A
 	// caller that releases the flows it registers together, with one
-	// marker (see [Link.QueueOrdered]), queues that marker here: those
+	// marker (see [Link.SendOrdered]), sends that marker here: those
 	// flows' acknowledgements may be what frees an identifier.
 	BeforeWait func()
 }
