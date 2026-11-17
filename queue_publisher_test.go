@@ -470,9 +470,9 @@ type failingPeek struct {
 	failed chan struct{}
 }
 
-func (q *failingPeek) Peek(ctx context.Context, after uint64, n int) ([]QueueEntry, error) {
+func (q *failingPeek) Peek(ctx context.Context, after uint64, limit PeekLimit) ([]QueueEntry, error) {
 	q.peeks.Add(1)
-	entries, err := q.MemoryPublisherQueue.Peek(ctx, after, n)
+	entries, err := q.MemoryPublisherQueue.Peek(ctx, after, limit)
 	if err != nil || len(entries) == 0 {
 		return entries, err
 	}
@@ -675,6 +675,129 @@ func TestQueueDefaultWindow(t *testing.T) {
 	}
 }
 
+func TestNewQueuePublisherRejectsInvalidOptions(t *testing.T) {
+	cli, err := New(WithBroker("mqtt://127.0.0.1:1883"), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		opt  QueueOption
+	}{
+		{"window of 0", WithQueueWindow(0)},
+		{"negative window bytes", WithQueueWindowBytes(-1)},
+		{"negative max size", WithQueueMaxSize(-1)},
+		{"negative TTL", WithQueueTTL(-time.Second)},
+		{"unknown drop policy", WithQueueDropPolicy(DropPolicy(9))},
+		{"nil classifier", WithQueueClassifier(nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if p, err := NewQueuePublisher(cli, NewMemoryPublisherQueue(), tt.opt); err == nil {
+				_ = p.Close(context.Background())
+				t.Fatal("NewQueuePublisher accepted it")
+			}
+		})
+	}
+}
+
+func TestQueuePublisherDefaults(t *testing.T) {
+	cli, err := New(WithBroker("mqtt://127.0.0.1:1883"), WithLogger(quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewQueuePublisher(cli, NewMemoryPublisherQueue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close(context.Background())
+	if p.cfg.window != DefaultQueueWindow || p.cfg.windowBytes != DefaultQueueWindowBytes {
+		t.Fatalf("window %d messages, %d bytes; want %d and %d", p.cfg.window, p.cfg.windowBytes, DefaultQueueWindow, DefaultQueueWindowBytes)
+	}
+}
+
+func TestQueueEntrySize(t *testing.T) {
+	tests := []struct {
+		name string
+		e    QueueEntry
+		want int
+	}{
+		{"empty", QueueEntry{}, 0},
+		{"ID, topic and payload", QueueEntry{ID: "id", Publish: PublishOptions{Topic: "a/b", Payload: make([]byte, 10)}}, 15},
+		{"properties", QueueEntry{Publish: PublishOptions{
+			ContentType: "json", ResponseTopic: "r", CorrelationData: []byte{1, 2},
+			UserProperties: []UserProperty{{Key: "k", Value: "vv"}, {Key: "kk", Value: ""}},
+		}}, 12},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.e.Size(); got != tt.want {
+				t.Fatalf("Size() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// enqueueSized stores messages of one size directly in q, before a
+// QueuePublisher starts on it, so its first claim takes as many as its
+// window allows at once. It returns their Size.
+func enqueueSized(t *testing.T, q PublisherQueue, payloads ...string) int {
+	t.Helper()
+	size := 0
+	for _, s := range payloads {
+		e := QueueEntry{ID: "id-" + s, Publish: PublishOptions{Topic: "q/t", QoS: 1, Payload: []byte(s)}}
+		if _, _, err := q.Enqueue(context.Background(), e, QueueLimit{}); err != nil {
+			t.Fatal(err)
+		}
+		size = e.Size()
+	}
+	return size
+}
+
+// The drain holds no more messages than WithQueueWindowBytes allows, and
+// takes more as they leave.
+func TestQueuePublisherWindowBytes(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	q := NewMemoryPublisherQueue()
+	size := enqueueSized(t, q, "0", "1", "2", "3", "4", "5")
+	p := newQueuePublisher(t, tbClient(t, b), q, WithQueueWindowBytes(3*size))
+	for range 3 {
+		qb.next(t)
+	}
+	p.mu.Lock()
+	held, bytes := len(p.pending), p.pendingBytes
+	p.mu.Unlock()
+	if held != 3 || bytes != 3*size {
+		t.Fatalf("drain holds %d messages of %d bytes, want 3 of %d", held, bytes, 3*size)
+	}
+	close(qb.gate)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"0", "1", "2", "3", "4", "5"}) {
+		t.Fatalf("broker received %q", got)
+	}
+}
+
+// A message larger than the byte bound is published on its own.
+func TestQueuePublisherMessageLargerThanWindowBytes(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	q := NewMemoryPublisherQueue()
+	enqueueSized(t, q, "0", "1", "2")
+	newQueuePublisher(t, tbClient(t, b), q, WithQueueWindowBytes(1))
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"0", "1", "2"}) {
+		t.Fatalf("broker received %q", got)
+	}
+}
+
 // Under DropOldest the default window leaves part of a small queue
 // outside it, so a full queue still evicts rather than refusing.
 func TestQueuePublisherDefaultWindowLeavesRoomToEvict(t *testing.T) {
@@ -684,16 +807,8 @@ func TestQueuePublisherDefaultWindowLeavesRoomToEvict(t *testing.T) {
 		c.AcceptConnect(wire.ConnackOpts{})
 		qb.serve(c)
 	})
-	ctx := context.Background()
 	q := NewMemoryPublisherQueue()
-	// Queued before the publisher starts, so its first claim takes as many
-	// as the window holds at once.
-	for _, s := range []string{"0", "1", "2", "3"} {
-		e := QueueEntry{ID: s, Publish: PublishOptions{Topic: "q/t", QoS: 1, Payload: []byte(s)}}
-		if _, _, err := q.Enqueue(ctx, e, QueueLimit{}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	enqueueSized(t, q, "0", "1", "2", "3")
 	var dl deadLetters
 	p := newQueuePublisher(t, tbClient(t, b), q, WithQueueMaxSize(4),
 		WithQueueDropPolicy(DropOldest), WithDeadLetter(dl.record))
@@ -941,7 +1056,7 @@ func TestQueuePublisherIdempotencyKeyAndOwnership(t *testing.T) {
 // messages per second. With a window of W the drain approaches W/RTT.
 func BenchmarkQueuePublisherRTT(b *testing.B) {
 	for _, rtt := range []time.Duration{25 * time.Millisecond, 300 * time.Millisecond} {
-		for _, window := range []int{1, 16, 32, DefaultQueueWindow} {
+		for _, window := range []int{1, 16, 32, 256, DefaultQueueWindow} {
 			b.Run(fmt.Sprintf("rtt=%v/window=%d", rtt, window), func(b *testing.B) {
 				broker := rttBroker(b, rtt)
 				cli, err := New(WithBroker(broker.URL()), WithClientID("rtt"), WithLogger(quietLogger()))
@@ -1032,7 +1147,7 @@ func TestMemoryQueueReclaimsAckedEntriesBehindTheHead(t *testing.T) {
 	if _, _, err := q.Enqueue(ctx, QueueEntry{ID: "last", Publish: PublishOptions{Topic: "q", QoS: 1}}, limit); err != nil {
 		t.Fatal(err)
 	}
-	got, err := q.Peek(ctx, 0, 10)
+	got, err := q.Peek(ctx, 0, PeekLimit{Entries: 10})
 	if err != nil || len(got) != 2 || got[0].ID != "head" || got[1].ID != "last" {
 		t.Fatalf("Peek after reclaiming: %+v, %v", got, err)
 	}

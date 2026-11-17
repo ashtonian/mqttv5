@@ -104,15 +104,17 @@ fsync-bound rows vary by up to 60%):
 | one goroutine calling `Publish` | 2.1 ms | 1 |
 | 64 goroutines calling `Publish` | 38 µs | 32 |
 | `QueuePublisher` draining a backlog, window 32, `queue/file` on `SyncNone` | 72 µs | 16 |
-| `QueuePublisher` draining a backlog, window 256 (the default), `queue/file` on `SyncNone` | 15 µs | 112 |
+| `QueuePublisher` draining a backlog, window 256, `queue/file` on `SyncNone` | 15 µs | 112 |
 
 Each message's writes take two commits, the record's and its
 deletion's, so about half of the messages in flight share a commit. The
 broker's Receive Maximum caps how many are sent and unacknowledged, not
 how many are stored at once. With `queue/file` also on group commit, the
-queue's Acks take fsyncs of their own on the same disk: the drain took
-159 µs per message with a window of 32 and 29 µs with 256 (medians of 6
-runs; up to 3× more in runs where this disk's syncs were slow). See
+queue's Acks take fsyncs of their own on the same disk: against a
+broker with a Receive Maximum of 20 the drain took 311 µs per message
+with a window of 32, 27 µs with 256 and 8.4 µs with the default 4,096,
+where about 400 messages share each session fsync (medians of 6 runs;
+up to 3× more in runs where this disk's syncs were slow). See
 [sizing the window](../../docs/durable-publishing.md#sizing-the-window).
 Size the policy, and the number of messages in flight, to your publish
 rate and latency budget.

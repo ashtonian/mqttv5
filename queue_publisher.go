@@ -31,7 +31,11 @@ const (
 	// DefaultQueueWindow is how many queued messages a QueuePublisher
 	// holds at once when [WithQueueWindow] is not set (see there); under
 	// [DropOldest], at most half of [WithQueueMaxSize].
-	DefaultQueueWindow = 256
+	DefaultQueueWindow = 4096
+	// DefaultQueueWindowBytes bounds the total [QueueEntry.Size] of the
+	// messages a QueuePublisher holds at once when [WithQueueWindowBytes]
+	// is not set.
+	DefaultQueueWindowBytes = 8 << 20
 )
 
 // DefaultQueueRetryBackoff spaces the attempts of a message whose
@@ -45,7 +49,8 @@ var DefaultQueueRetryBackoff = ExponentialBackoff{Initial: time.Second, Max: tim
 //
 // [QueuePublisher.Publish] returns once the message is stored. A drain
 // goroutine publishes the queue's messages in order while the client is
-// connected, holding up to [WithQueueWindow] at once, and a recorder
+// connected, holding up to [WithQueueWindow] messages and
+// [WithQueueWindowBytes] bytes of them at once, and a recorder
 // goroutine removes them from the queue once the broker has accepted
 // them: the outcomes that come in together leave in one [PublisherQueue]
 // Ack. A message holds its place in the window until it has left the
@@ -90,6 +95,9 @@ type QueuePublisher struct {
 
 	mu      sync.Mutex
 	pending map[uint64]*queuedMessage // claimed and unfinished, at most cfg.window
+	// pendingBytes is the total size of pending, held to cfg.windowBytes
+	// but for the message that crossed it.
+	pendingBytes int
 	// windowFull is set when the drain last found no room in the window:
 	// a place the recorder frees then has to wake it. Otherwise the drain
 	// claimed all the queue had, and a free place changes nothing for it.
@@ -128,6 +136,7 @@ type exchangeOutcome struct {
 
 type queuedMessage struct {
 	entry    QueueEntry
+	size     int       // entry.Size(), counted in pendingBytes
 	inFlight bool      // an exchange is running
 	attempts int       // exchanges started, or outcomes recorded again, in this process
 	retryAt  time.Time // when to start the next; zero: once connected
@@ -141,6 +150,7 @@ type queuedMessage struct {
 type queueConfig struct {
 	window      int
 	windowSet   bool
+	windowBytes int
 	maxSize     int
 	dropPolicy  DropPolicy
 	ttl         time.Duration
@@ -175,13 +185,26 @@ type QueueOption func(*queueConfig)
 // the window per sync, so a slow disk needs a larger window than the
 // round trip alone does.
 //
-// The window's messages are held in memory. Without [WithStore], a
-// restart publishes again the ones the broker had accepted that were
-// still in the queue, at most the window; under [DropOldest] they cannot
-// be evicted. Default [DefaultQueueWindow], or under DropOldest at most
-// half of [WithQueueMaxSize].
+// The window's messages are held in memory, which [WithQueueWindowBytes]
+// bounds as well. Without [WithStore], a restart publishes again the ones
+// the broker had accepted that were still in the queue, at most the
+// window; under [DropOldest] they cannot be evicted. Default
+// [DefaultQueueWindow], or under DropOldest at most half of
+// [WithQueueMaxSize].
 func WithQueueWindow(n int) QueueOption {
 	return func(c *queueConfig) { c.window, c.windowSet = n, true }
+}
+
+// WithQueueWindowBytes bounds the window by the total [QueueEntry.Size]
+// of its messages as well as by their number ([WithQueueWindow]): the
+// drain takes no more once the messages it holds reach n bytes. It
+// always takes the next message when it holds none, so a message larger
+// than n is published on its own. While a message is published and
+// stored the client also holds its encoded packet and write buffers: the
+// window's live memory measured two to three times n. Default
+// [DefaultQueueWindowBytes]; 0 means no byte bound.
+func WithQueueWindowBytes(n int) QueueOption {
+	return func(c *queueConfig) { c.windowBytes = n }
 }
 
 // WithQueueMaxSize bounds the queue at n entries; at the bound
@@ -270,7 +293,7 @@ func PermanentPublishError(err error) bool {
 // client. Entries already in the queue are published in order once the
 // client is connected; nothing is removed by construction.
 func NewQueuePublisher(client *Client, queue PublisherQueue, opts ...QueueOption) (*QueuePublisher, error) {
-	cfg := queueConfig{dropPolicy: DropNewest, permanent: PermanentPublishError, backoff: DefaultQueueRetryBackoff}
+	cfg := queueConfig{windowBytes: DefaultQueueWindowBytes, dropPolicy: DropNewest, permanent: PermanentPublishError, backoff: DefaultQueueRetryBackoff}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -280,6 +303,8 @@ func NewQueuePublisher(client *Client, queue PublisherQueue, opts ...QueueOption
 	switch {
 	case cfg.window < 1:
 		return nil, fmt.Errorf("mqttv5: WithQueueWindow(%d): must be at least 1", cfg.window)
+	case cfg.windowBytes < 0:
+		return nil, fmt.Errorf("mqttv5: WithQueueWindowBytes(%d): must not be negative", cfg.windowBytes)
 	case cfg.maxSize < 0:
 		return nil, fmt.Errorf("mqttv5: WithQueueMaxSize(%d): must not be negative", cfg.maxSize)
 	case cfg.ttl < 0:
@@ -489,7 +514,7 @@ func (p *QueuePublisher) fill() time.Time {
 		for _, m := range due {
 			rel.add(p.start(m, flush))
 		}
-		if room <= 0 || p.client.cur.Load() == nil || p.ctx.Err() != nil {
+		if room.Entries <= 0 || p.client.cur.Load() == nil || p.ctx.Err() != nil {
 			rel.flush()
 			return next
 		}
@@ -537,8 +562,9 @@ func (r *release) flush() {
 }
 
 // due returns the pending messages to start now, in queue order, when
-// the next one waiting for a retry is due, and the window's free room.
-func (p *QueuePublisher) due() (due []*queuedMessage, next time.Time, room int) {
+// the next one waiting for a retry is due, and the window's free room:
+// none once either of its bounds is reached.
+func (p *QueuePublisher) due() (due []*queuedMessage, next time.Time, room PeekLimit) {
 	now := p.clk.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -553,18 +579,25 @@ func (p *QueuePublisher) due() (due []*queuedMessage, next time.Time, room int) 
 		}
 	}
 	slices.SortFunc(due, func(a, b *queuedMessage) int { return cmp.Compare(a.entry.Seq, b.entry.Seq) })
-	room = p.cfg.window - len(p.pending)
-	p.windowFull = room <= 0
+	room.Entries = p.cfg.window - len(p.pending)
+	if p.cfg.windowBytes > 0 {
+		room.Bytes = p.cfg.windowBytes - p.pendingBytes
+		if room.Bytes <= 0 {
+			room.Entries = 0
+		}
+	}
+	p.windowFull = room.Entries <= 0
 	return due, next, room
 }
 
-// claim takes up to n entries after the last claimed one into pending.
-// When reading the queue fails it returns when to read it again, spaced
-// by the retry backoff: nothing else would wake the drain for it.
-func (p *QueuePublisher) claim(n int) (claimed []*queuedMessage, readRetry time.Time) {
+// claim takes the entries after the last claimed one that room allows
+// into pending. When reading the queue fails it returns when to read it
+// again, spaced by the retry backoff: nothing else would wake the drain
+// for it.
+func (p *QueuePublisher) claim(room PeekLimit) (claimed []*queuedMessage, readRetry time.Time) {
 	p.claimMu.Lock()
 	defer p.claimMu.Unlock()
-	entries, err := p.queue.Peek(p.ctx, p.claimed, n)
+	entries, err := p.queue.Peek(p.ctx, p.claimed, room)
 	if err != nil {
 		if errors.Is(err, ErrQueueClosed) || p.ctx.Err() != nil {
 			return nil, time.Time{}
@@ -578,8 +611,9 @@ func (p *QueuePublisher) claim(n int) (claimed []*queuedMessage, readRetry time.
 	out := make([]*queuedMessage, len(entries))
 	p.mu.Lock()
 	for i, e := range entries {
-		m := &queuedMessage{entry: e, inFlight: true}
+		m := &queuedMessage{entry: e, size: e.Size(), inFlight: true}
 		p.pending[e.Seq] = m
+		p.pendingBytes += m.size
 		out[i] = m
 	}
 	p.mu.Unlock()
@@ -803,6 +837,7 @@ func (p *QueuePublisher) remove(ms ...*queuedMessage) error {
 	p.mu.Lock()
 	for _, m := range ms {
 		delete(p.pending, m.entry.Seq)
+		p.pendingBytes -= m.size
 	}
 	p.mu.Unlock()
 	return nil
@@ -852,6 +887,18 @@ type QueueEntry struct {
 	ExpiresAt time.Time
 }
 
+// Size is the length of the message's variable content in bytes: its ID,
+// topic, payload and properties. It is what [WithQueueWindowBytes] and
+// [PeekLimit.Bytes] count.
+func (e QueueEntry) Size() int {
+	o := e.Publish
+	n := len(e.ID) + len(o.Topic) + len(o.Payload) + len(o.ContentType) + len(o.ResponseTopic) + len(o.CorrelationData)
+	for _, up := range o.UserProperties {
+		n += len(up.Key) + len(up.Value)
+	}
+	return n
+}
+
 // clone returns a deep copy of e.
 func (e QueueEntry) clone() QueueEntry {
 	e.Publish = e.Publish.clone()
@@ -870,6 +917,22 @@ type QueueLimit struct {
 	// Keep is the highest Seq DropOldest must not remove: the entries up
 	// to it are being published.
 	Keep uint64
+}
+
+// PeekLimit bounds the entries one [PublisherQueue] Peek returns.
+type PeekLimit struct {
+	// Entries is the most entries to return, at least 1.
+	Entries int
+	// Bytes, when positive, ends the entries returned with the one that
+	// brings their total [QueueEntry.Size] to Bytes or more. The first
+	// entry is returned whatever its size.
+	Bytes int
+}
+
+// Reached reports whether entries, of total size bytes, are all that l
+// allows: no further entry may follow them.
+func (l PeekLimit) Reached(entries, bytes int) bool {
+	return entries >= l.Entries || (l.Bytes > 0 && bytes >= l.Bytes)
 }
 
 // PublisherQueue stores the messages a [QueuePublisher] has accepted
@@ -892,8 +955,9 @@ type PublisherQueue interface {
 	// behind it.
 	Enqueue(ctx context.Context, e QueueEntry, limit QueueLimit) (seq uint64, evicted []QueueEntry, err error)
 
-	// Peek returns up to n entries with Seq above after, oldest first.
-	Peek(ctx context.Context, after uint64, n int) ([]QueueEntry, error)
+	// Peek returns entries with Seq above after, oldest first, until
+	// limit is reached (see [PeekLimit.Reached]).
+	Peek(ctx context.Context, after uint64, limit PeekLimit) ([]QueueEntry, error)
 
 	// Ack removes the entries with seqs, in one atomic step: all or, with
 	// an error, none. Acking a missing entry is not an error.
@@ -971,16 +1035,19 @@ func (q *MemoryPublisherQueue) Enqueue(_ context.Context, e QueueEntry, limit Qu
 }
 
 // Peek implements [PublisherQueue].
-func (q *MemoryPublisherQueue) Peek(_ context.Context, after uint64, n int) ([]QueueEntry, error) {
+func (q *MemoryPublisherQueue) Peek(_ context.Context, after uint64, limit PeekLimit) ([]QueueEntry, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
 		return nil, ErrQueueClosed
 	}
 	var out []QueueEntry
-	for i := q.search(after); i < len(q.entries) && len(out) < n; i++ {
+	size := 0
+	for i := q.search(after); i < len(q.entries) && !limit.Reached(len(out), size); i++ {
 		if !q.entries[i].acked {
-			out = append(out, q.entries[i].e.clone())
+			e := q.entries[i].e.clone()
+			out = append(out, e)
+			size += e.Size()
 		}
 	}
 	return out, nil
