@@ -3,11 +3,11 @@ module github.com/ashtonian/mqttv5/conformance
 go 1.27.2
 
 require (
-	github.com/ashtonian/mqttv5 v0.16.0
-	github.com/ashtonian/mqttv5/codec/json v0.16.0
-	github.com/ashtonian/mqttv5/tlsrevocation v0.16.0
-	github.com/ashtonian/mqttv5/transport/quic v0.16.0
-	github.com/ashtonian/mqttv5/transport/ws v0.16.0
+	github.com/ashtonian/mqttv5 v0.16.1
+	github.com/ashtonian/mqttv5/codec/json v0.16.1
+	github.com/ashtonian/mqttv5/tlsrevocation v0.16.1
+	github.com/ashtonian/mqttv5/transport/quic v0.16.1
+	github.com/ashtonian/mqttv5/transport/ws v0.16.1
 )
 
 require (

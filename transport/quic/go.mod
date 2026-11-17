@@ -3,7 +3,7 @@ module github.com/ashtonian/mqttv5/transport/quic
 go 1.27.2
 
 require (
-	github.com/ashtonian/mqttv5 v0.16.0
+	github.com/ashtonian/mqttv5 v0.16.1
 	github.com/quic-go/quic-go v0.65.0
 )
 
