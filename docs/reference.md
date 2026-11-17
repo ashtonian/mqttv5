@@ -240,7 +240,7 @@ after five seconds.
 | `WithQueueTTL(d)` | `time.Duration` | 0 (none) | Longest a message may wait, from `Publish`; the remaining lifetime is sent as Message Expiry Interval. |
 | `WithDeadLetter(fn)` | `func(QueueEntry, error)` | none | Messages removed without the broker accepting them, with the reason. Called from internal goroutines, possibly concurrently; must not block. |
 | `WithQueueClassifier(fn)` | `func(error) bool` | `PermanentPublishError` | Which failures are dead-lettered rather than retried. |
-| `WithQueueRetryBackoff(b)` | `Backoff` | `DefaultQueueRetryBackoff` (`ExponentialBackoff{Initial: 1s, Max: 1min, Jitter: 0.5}`) | Delay before retrying a message whose publish failed for a reason that may pass; see [Backoff policies](#backoff-policies). |
+| `WithQueueRetryBackoff(b)` | `Backoff` | `DefaultQueueRetryBackoff` (`ExponentialBackoff{Initial: 1s, Max: 1min, Jitter: 0.5}`) | Delay before retrying a message whose publish failed for a reason that may pass, or reading a queue that failed; see [Backoff policies](#backoff-policies). |
 | `WithQueueIdempotencyKey()` | — | off | Adds the `mqttv5-msg-id` user property with the message's ID. |
 
 ### Per-`ClientGroup`

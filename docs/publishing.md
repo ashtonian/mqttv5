@@ -138,8 +138,10 @@ Which call to use:
   uncopied.
 - If ctx ends during a write, the writer goroutine finishes the packet,
   so it may still reach the broker after `Publish` returned ctx's error.
-- `QueuePublisher` hands its window's messages to the writer goroutine
-  as `PublishAsync` does, so they share writes too.
+- `QueuePublisher`'s drain releases the messages it starts in one pass
+  together: on an idle TCP or Unix connection it writes them itself, in
+  one `writev`, and otherwise the writer goroutine sends them in one
+  write.
 
 ## Broker limits
 
