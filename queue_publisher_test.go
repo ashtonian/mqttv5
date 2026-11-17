@@ -654,6 +654,62 @@ func TestQueuePublisherDropOldestSparesInFlight(t *testing.T) {
 	}
 }
 
+func TestQueueDefaultWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  queueConfig
+		want int
+	}{
+		{"unbounded", queueConfig{}, DefaultQueueWindow},
+		{"bounded, DropNewest", queueConfig{maxSize: 10, dropPolicy: DropNewest}, DefaultQueueWindow},
+		{"DropOldest, large bound", queueConfig{maxSize: 1_000_000, dropPolicy: DropOldest}, DefaultQueueWindow},
+		{"DropOldest, small bound", queueConfig{maxSize: 100, dropPolicy: DropOldest}, 50},
+		{"DropOldest, bound of one", queueConfig{maxSize: 1, dropPolicy: DropOldest}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.defaultWindow(); got != tt.want {
+				t.Fatalf("default window %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// Under DropOldest the default window leaves part of a small queue
+// outside it, so a full queue still evicts rather than refusing.
+func TestQueuePublisherDefaultWindowLeavesRoomToEvict(t *testing.T) {
+	qb := newQueueBroker()
+	qb.gate = make(chan struct{})
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	ctx := context.Background()
+	q := NewMemoryPublisherQueue()
+	// Queued before the publisher starts, so its first claim takes as many
+	// as the window holds at once.
+	for _, s := range []string{"0", "1", "2", "3"} {
+		e := QueueEntry{ID: s, Publish: PublishOptions{Topic: "q/t", QoS: 1, Payload: []byte(s)}}
+		if _, _, err := q.Enqueue(ctx, e, QueueLimit{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var dl deadLetters
+	p := newQueuePublisher(t, tbClient(t, b), q, WithQueueMaxSize(4),
+		WithQueueDropPolicy(DropOldest), WithDeadLetter(dl.record))
+	qb.next(t)
+	qb.next(t)
+	enqueueAll(t, p, 1, "4", "5")
+	if got, errs := dl.get(); !slices.Equal(got, []string{"2", "3"}) || !errors.Is(errs[0], ErrQueueFull) {
+		t.Fatalf("evicted %q %v, want 2 and 3 with ErrQueueFull", got, errs)
+	}
+	close(qb.gate)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"0", "1", "4", "5"}) {
+		t.Fatalf("broker received %q", got)
+	}
+}
+
 // A message carries the lifetime it has left, and one that ran out
 // while queued is dead-lettered instead of sent.
 func TestQueuePublisherSendsRemainingLifetime(t *testing.T) {
@@ -885,7 +941,7 @@ func TestQueuePublisherIdempotencyKeyAndOwnership(t *testing.T) {
 // messages per second. With a window of W the drain approaches W/RTT.
 func BenchmarkQueuePublisherRTT(b *testing.B) {
 	for _, rtt := range []time.Duration{25 * time.Millisecond, 300 * time.Millisecond} {
-		for _, window := range []int{1, 16, 32} {
+		for _, window := range []int{1, 16, 32, DefaultQueueWindow} {
 			b.Run(fmt.Sprintf("rtt=%v/window=%d", rtt, window), func(b *testing.B) {
 				broker := rttBroker(b, rtt)
 				cli, err := New(WithBroker(broker.URL()), WithClientID("rtt"), WithLogger(quietLogger()))

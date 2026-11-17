@@ -5,27 +5,17 @@
 `QueuePublisher` decouples the caller from broker availability:
 
 - `Publish` returns as soon as the message is stored in the queue.
-- A drain goroutine keeps up to `WithQueueWindow` messages in flight
-  (default 32), in queue order, whenever the client is connected, and a
-  recorder goroutine removes them from the queue once the broker has
-  accepted them. The acknowledgements that arrive together are recorded
-  together, in one `Ack` — one transaction, and with `queue/file` one
-  sync — so removal keeps pace with the broker. Throughput
-  approaches window ÷ round-trip time, the window capped by the broker's
-  Receive Maximum (20 on mosquitto): against a broker that allows the
-  whole window, at 25 ms, about 1,200 msg/s with the default window and
-  600 with a window of 16, against 38 msg/s one at a time
-  (`BenchmarkQueuePublisherRTT`).
+- A drain goroutine publishes the queue's messages in order whenever the
+  client is connected, holding up to `WithQueueWindow` of them at once
+  (default 256), and a recorder goroutine removes them from the queue
+  once the broker has accepted them. The acknowledgements that arrive
+  together are recorded together, in one `Ack` — one transaction, and
+  with `queue/file` one sync — so removal keeps pace with the broker.
 - With a durable session store (`WithStore`), the records of the
-  messages in flight share the store's writes: about half the window
-  goes in each `Apply`, with `store/file` one transaction and one fsync.
-  Draining a backlog with `store/file`'s group commit (macOS, in-process
-  broker without a Receive Maximum) took 73 µs per message with the
-  default window, 16 messages to each fsync, and 15 µs with a window of
-  256, with `queue/file` on `SyncNone`; with `queue/file` also on group
-  commit, whose Acks take fsyncs of their own, 0.42 ms and 85 µs. Raise
-  the window when the disk's sync rate, rather than the broker, limits
-  the drain.
+  messages taken together are stored together, in one `Apply`: with
+  `store/file`, one transaction and one sync.
+- Throughput approaches the window ÷ the time each message holds its
+  place in it; see [Sizing the window](#sizing-the-window).
 
 ```go
 import (
@@ -72,7 +62,9 @@ the next process) without publishing the message again. `Close` waits,
 until its ctx ends, for the exchanges in flight and their outcomes; one
 that finishes later keeps its outcome in the session, and the next
 `QueuePublisher` on the queue records it. A message is
-published again as new only if the broker lost the session; enable
+published again as new only if the broker lost the session, or, without
+a durable session store, if the process stopped while it was in flight
+or accepted and not yet removed: at most the window. Enable
 `WithQueueIdempotencyKey` to add the message ID as the `mqttv5-msg-id`
 user property so consumers can drop that copy.
 
@@ -80,7 +72,9 @@ user property so consumers can drop that copy.
 concurrent producers cannot exceed it. At the bound `DropNewest`
 (default) returns `ErrQueueFull`; `DropOldest` evicts the oldest
 messages not yet being published and dead-letters them with
-`ErrQueueFull`. Constructing a `QueuePublisher` never removes anything.
+`ErrQueueFull`. The window's messages are never evicted, so under
+`DropOldest` the default window is at most half the bound. Constructing
+a `QueuePublisher` never removes anything.
 Only `DropOldest` with a bound can evict a message the drain is about
 to take, so only then does the drain wait for each `Publish` whose
 `Enqueue` is still writing, which with a syncing `queue/file` is a disk
@@ -105,3 +99,54 @@ sequence order however many `Enqueue` calls run at once: assign the
 sequence number and store the entry in one atomic step. The drain peeks
 after the last sequence number it took while producers enqueue, and
 would never see an entry that appeared behind it.
+
+## Sizing the window
+
+A message holds its place in the window from when the drain takes it
+until it has left the queue:
+
+- the broker's round trip, PUBLISH to PUBACK (to PUBCOMP for QoS 2);
+- with a syncing `queue/file` (`SyncGroupCommit`, the default), the sync
+  that removes it. A group commit removes the messages accepted while
+  the one before it ran, so a message waits about two syncs and each
+  sync removes about half the window;
+- with a syncing session store such as `store/file`, the sync that
+  stores its record, which comes before the PUBLISH is sent.
+
+The drain approaches window ÷ that time, so size the window as the rate
+you need × that time. The broker's Receive Maximum (20 on mosquitto) and
+`WithMaxInflight` bound only the messages sent and not yet
+acknowledged; the rest of the window waits to be stored, sent or removed, so
+a window larger than the Receive Maximum still pays.
+
+Draining a backlog of 64-byte QoS 1 messages, `queue/file` and
+`store/file` both on group commit, against an in-process broker (macOS
+M2 Max, medians of 6 interleaved runs), per message:
+
+| Drain | Window 32 | Window 256 (default) |
+|---|---:|---:|
+| `queue/file`, no session store | 66 µs | 12 µs |
+| the same, broker Receive Maximum 20 | 71 µs | 12 µs |
+| `queue/file` and `store/file` | 159 µs | 29 µs |
+| the same, broker Receive Maximum 20 | 169 µs | 31 µs |
+
+This disk's syncs took up to three times longer in some runs, and every
+time here with them; the ratio between the two windows stayed at 5–6×.
+A disk whose syncs take longer needs a proportionally larger window for
+the same rate. Against a broker 25 ms away, with a memory queue, the
+drain approaches window ÷ round trip: 39 msg/s with a window of 1, 1,250
+with 32 and 9,900 with 256 (`BenchmarkQueuePublisherRTT`).
+
+A larger window costs:
+
+- **Memory:** the window's messages are held in memory, payloads
+  included. 256 messages of 64 KiB are 16 MiB.
+- **Duplicates without a durable session store:** a restart publishes
+  again the messages that were in flight or accepted and not yet
+  removed, at most the window. QoS 1 allows the copy;
+  `WithQueueIdempotencyKey` lets consumers drop it.
+- **Eviction:** under `DropOldest` the window's messages are never
+  evicted, so the default window is at most half of `WithQueueMaxSize`.
+
+Lower the window to bound memory with large payloads; raise it for a
+long round trip or a slow disk.

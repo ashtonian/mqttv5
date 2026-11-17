@@ -29,8 +29,9 @@ const QueueIDProperty = "mqttv5-msg-id"
 
 const (
 	// DefaultQueueWindow is how many queued messages a QueuePublisher
-	// publishes at once when [WithQueueWindow] is not set.
-	DefaultQueueWindow = 32
+	// holds at once when [WithQueueWindow] is not set (see there); under
+	// [DropOldest], at most half of [WithQueueMaxSize].
+	DefaultQueueWindow = 256
 )
 
 // DefaultQueueRetryBackoff spaces the attempts of a message whose
@@ -43,10 +44,12 @@ var DefaultQueueRetryBackoff = ExponentialBackoff{Initial: time.Second, Max: tim
 // publishes them in the background, many at a time.
 //
 // [QueuePublisher.Publish] returns once the message is stored. A drain
-// goroutine keeps up to [WithQueueWindow] messages in flight, in queue
-// order, while the client is connected, and a recorder goroutine removes
-// them from the queue once the broker has accepted them: the outcomes
-// that come in together leave in one [PublisherQueue] Ack. A refusal that
+// goroutine publishes the queue's messages in order while the client is
+// connected, holding up to [WithQueueWindow] at once, and a recorder
+// goroutine removes them from the queue once the broker has accepted
+// them: the outcomes that come in together leave in one [PublisherQueue]
+// Ack. A message holds its place in the window until it has left the
+// queue. A refusal that
 // cannot pass (see
 // [WithQueueClassifier]) and a message that expired go to the
 // [WithDeadLetter] callback and are removed; other failures are retried
@@ -137,6 +140,7 @@ type queuedMessage struct {
 
 type queueConfig struct {
 	window      int
+	windowSet   bool
 	maxSize     int
 	dropPolicy  DropPolicy
 	ttl         time.Duration
@@ -149,14 +153,35 @@ type queueConfig struct {
 // evicts reports whether Enqueue may remove entries to make room.
 func (c queueConfig) evicts() bool { return c.maxSize > 0 && c.dropPolicy == DropOldest }
 
+// defaultWindow is the window when WithQueueWindow is not set. A queue
+// that evicts gets at most half its bound, so that eviction always finds
+// messages the window does not hold.
+func (c queueConfig) defaultWindow() int {
+	if c.evicts() {
+		return max(1, min(DefaultQueueWindow, c.maxSize/2))
+	}
+	return DefaultQueueWindow
+}
+
 // QueueOption customises a QueuePublisher.
 type QueueOption func(*queueConfig)
 
-// WithQueueWindow sets how many messages are published at once.
-// Default [DefaultQueueWindow]; the broker's Receive Maximum still
-// applies on top.
+// WithQueueWindow sets how many messages a QueuePublisher holds at once,
+// each from when the drain takes it until it has left the queue: the
+// broker's round trip and, with a durable queue, the sync of its
+// removal. The broker's Receive Maximum and [WithMaxInflight] still bound
+// the messages sent and not yet acknowledged. Throughput approaches
+// window ÷ (round trip + removal), and a group commit removes about half
+// the window per sync, so a slow disk needs a larger window than the
+// round trip alone does.
+//
+// The window's messages are held in memory. Without [WithStore], a
+// restart publishes again the ones the broker had accepted that were
+// still in the queue, at most the window; under [DropOldest] they cannot
+// be evicted. Default [DefaultQueueWindow], or under DropOldest at most
+// half of [WithQueueMaxSize].
 func WithQueueWindow(n int) QueueOption {
-	return func(c *queueConfig) { c.window = n }
+	return func(c *queueConfig) { c.window, c.windowSet = n, true }
 }
 
 // WithQueueMaxSize bounds the queue at n entries; at the bound
@@ -245,9 +270,12 @@ func PermanentPublishError(err error) bool {
 // client. Entries already in the queue are published in order once the
 // client is connected; nothing is removed by construction.
 func NewQueuePublisher(client *Client, queue PublisherQueue, opts ...QueueOption) (*QueuePublisher, error) {
-	cfg := queueConfig{window: DefaultQueueWindow, dropPolicy: DropNewest, permanent: PermanentPublishError, backoff: DefaultQueueRetryBackoff}
+	cfg := queueConfig{dropPolicy: DropNewest, permanent: PermanentPublishError, backoff: DefaultQueueRetryBackoff}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if !cfg.windowSet {
+		cfg.window = cfg.defaultWindow()
 	}
 	switch {
 	case cfg.window < 1:

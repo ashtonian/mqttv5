@@ -234,7 +234,7 @@ after five seconds.
 
 | Option | Type | Default | Effect |
 |---|---|---|---|
-| `WithQueueWindow(n)` | `int` | 32 (`DefaultQueueWindow`) | Messages in flight at once; the broker's Receive Maximum and `WithMaxInflight` still apply. Must be ≥ 1. |
+| `WithQueueWindow(n)` | `int` | 256 (`DefaultQueueWindow`); under `DropOldest`, at most half of `WithQueueMaxSize` | Messages held at once, each from when the drain takes it until it has left the queue (the broker's round trip and, on a syncing queue, the sync of its removal). Held in memory; without `WithStore`, a restart publishes the accepted ones again. The broker's Receive Maximum and `WithMaxInflight` still bound those sent and unacknowledged. Must be ≥ 1. See [sizing the window](durable-publishing.md#sizing-the-window). |
 | `WithQueueMaxSize(n)` | `int` | 0 (unbounded) | Bound on queued messages, enforced atomically by the queue. |
 | `WithQueueDropPolicy(p)` | `DropPolicy` | `DropNewest` | At the bound: `DropNewest` returns `ErrQueueFull`; `DropOldest` evicts the oldest messages not in flight and dead-letters them. |
 | `WithQueueTTL(d)` | `time.Duration` | 0 (none) | Longest a message may wait, from `Publish`; the remaining lifetime is sent as Message Expiry Interval. |
