@@ -81,9 +81,16 @@ type QueuePublisher struct {
 	// it alone, so the drain never waits for an Enqueue's write.
 	claimMu sync.RWMutex
 	claimed uint64 // highest Seq handed to pending
+	// readFailures counts the queue reads that failed in a row, which
+	// space the drain's retries (see claim).
+	readFailures int
 
 	mu      sync.Mutex
 	pending map[uint64]*queuedMessage // claimed and unfinished, at most cfg.window
+	// windowFull is set when the drain last found no room in the window:
+	// a place the recorder frees then has to wake it. Otherwise the drain
+	// claimed all the queue had, and a free place changes nothing for it.
+	windowFull bool
 	// outcomes are the outcomes of finished exchanges, waiting for the
 	// recorder; running counts the exchanges started whose outcome it has
 	// not recorded. Once the recorder has stopped, stopped is set and an
@@ -194,7 +201,8 @@ func WithQueueClassifier(fn func(err error) bool) QueueOption {
 }
 
 // WithQueueRetryBackoff spaces the attempts of a message whose publish
-// failed for a reason that may pass. [NewQueuePublisher] rejects an
+// failed for a reason that may pass, and the drain's attempts to read a
+// queue that failed. [NewQueuePublisher] rejects an
 // invalid [ExponentialBackoff] or [ConstantBackoff]. Default
 // [DefaultQueueRetryBackoff].
 func WithQueueRetryBackoff(b Backoff) QueueOption {
@@ -442,8 +450,8 @@ func (p *QueuePublisher) stop() {
 
 // fill starts every pending message that is due and claims more from the
 // queue while the window has room, until the connection or the
-// QueuePublisher goes away. It returns when the next retry is due, or
-// zero.
+// QueuePublisher goes away. It returns when the next retry is due — of a
+// message, or of reading the queue — or zero.
 func (p *QueuePublisher) fill() time.Time {
 	rel := &release{ctx: p.ctx}
 	flush := rel.flush
@@ -456,20 +464,23 @@ func (p *QueuePublisher) fill() time.Time {
 			rel.flush()
 			return next
 		}
-		claimed := p.claim(room)
+		claimed, readRetry := p.claim(room)
 		for _, m := range claimed {
 			rel.add(p.start(m, flush))
 		}
 		rel.flush()
+		if !readRetry.IsZero() && (next.IsZero() || readRetry.Before(next)) {
+			next = readRetry
+		}
 		if len(claimed) == 0 || p.client.cur.Load() == nil {
 			return next
 		}
 	}
 }
 
-// release is the one marker that lets the writer send the exchanges fill
-// started since the last, together: the last one's, on the connection it
-// was registered on. It releases every flow before it there, and a flow
+// release lets the exchanges fill started since the last go out
+// together, with one marker: the last one's, on the connection it was
+// registered on. It releases every flow before it there, and a flow
 // registered before that connection came up went out when it did.
 type release struct {
 	ctx  context.Context
@@ -483,12 +494,15 @@ func (r *release) add(seq uint64, link inflight.Link) {
 	}
 }
 
-// flush queues the marker, if there is one. One that fails leaves the
-// flows to the next marker or connection: each is stored with its Ref,
-// and Adopt finds it.
+// flush sends the marker, if there is one. The flows it releases are
+// the whole batch, so on an idle TCP or Unix connection they go out in
+// one write on the drain's goroutine rather than waking the writer's;
+// otherwise the writer sends them. A marker that fails leaves the flows
+// to the next marker or connection: each is stored with its Ref, and
+// Adopt finds it.
 func (r *release) flush() {
 	if r.link != nil {
-		_ = r.link.QueueOrdered(r.ctx, r.seq)
+		_ = r.link.SendOrdered(r.ctx, r.seq)
 		r.link = nil
 	}
 }
@@ -510,20 +524,28 @@ func (p *QueuePublisher) due() (due []*queuedMessage, next time.Time, room int) 
 		}
 	}
 	slices.SortFunc(due, func(a, b *queuedMessage) int { return cmp.Compare(a.entry.Seq, b.entry.Seq) })
-	return due, next, p.cfg.window - len(p.pending)
+	room = p.cfg.window - len(p.pending)
+	p.windowFull = room <= 0
+	return due, next, room
 }
 
 // claim takes up to n entries after the last claimed one into pending.
-func (p *QueuePublisher) claim(n int) []*queuedMessage {
+// When reading the queue fails it returns when to read it again, spaced
+// by the retry backoff: nothing else would wake the drain for it.
+func (p *QueuePublisher) claim(n int) (claimed []*queuedMessage, readRetry time.Time) {
 	p.claimMu.Lock()
 	defer p.claimMu.Unlock()
 	entries, err := p.queue.Peek(p.ctx, p.claimed, n)
 	if err != nil {
-		if !errors.Is(err, ErrQueueClosed) && p.ctx.Err() == nil {
-			p.logger.Error("reading the queue failed", slog.Any("error", err))
+		if errors.Is(err, ErrQueueClosed) || p.ctx.Err() != nil {
+			return nil, time.Time{}
 		}
-		return nil
+		p.readFailures++
+		p.logger.Error("reading the queue failed; will retry",
+			slog.Int("attempt", p.readFailures), slog.Any("error", err))
+		return nil, p.clk.Now().Add(p.cfg.backoff.Delay(p.readFailures - 1))
 	}
+	p.readFailures = 0
 	out := make([]*queuedMessage, len(entries))
 	p.mu.Lock()
 	for i, e := range entries {
@@ -535,7 +557,7 @@ func (p *QueuePublisher) claim(n int) []*queuedMessage {
 	if len(entries) > 0 {
 		p.claimed = entries[len(entries)-1].Seq
 	}
-	return out
+	return out, time.Time{}
 }
 
 // start begins an exchange for m, which the caller has marked in
@@ -634,24 +656,32 @@ func (p *QueuePublisher) record() {
 		}
 	}
 	err := p.remove(gone...)
+	// The drain has work when a message waits to start again, or when it
+	// found the window full and the removals made room.
+	wake := false
 	for _, o := range outcomes {
 		switch {
 		case !o.gone:
 			o.done(nil)
 			p.reschedule(o.m, o.retryAt)
+			wake = true
 		case err != nil:
 			// The session keeps the exchange; the retry adopts it and
 			// gets the outcome again.
 			o.done(err)
 			p.reschedule(o.m, p.removalRetry(o.m))
+			wake = true
 		default:
 			o.done(nil)
 		}
 	}
 	p.mu.Lock()
 	p.running -= len(outcomes)
+	wake = wake || p.windowFull
 	p.mu.Unlock()
-	p.signal()
+	if wake {
+		p.signal()
+	}
 }
 
 // decide acts on err, the outcome of m's exchange or why it could not

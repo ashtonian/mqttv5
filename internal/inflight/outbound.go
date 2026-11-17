@@ -29,8 +29,10 @@ type Out struct {
 	finished  bool
 	// settling is set while the producer records the outcome; adopted,
 	// when Adopt replaced settle meanwhile, so the new one gets it too.
-	settling bool
-	adopted  bool
+	// settleJob is the job that gives the outcome to the producer.
+	settling  bool
+	adopted   bool
+	settleJob *job
 	// reason is the reason code of the broker's refusal, when err is one;
 	// outcome is the stored form of the outcome once the flow is Completed.
 	reason  wire.ReasonCode
@@ -83,7 +85,8 @@ func (o *Out) wake(err error) {
 
 // SettleFunc gives a finished flow's outcome to its producer, which
 // records it and then calls done, once, from any goroutine: with nil once
-// it has, and the session forgets the flow; or with the error that kept
+// it has, and the session forgets the flow — Adopt stops finding it at
+// once, and its record is deleted behind; or with the error that kept
 // it from recording the outcome, and the flow keeps its record and packet
 // identifier, the outcome offered again to the next Adopt of its Ref, in
 // this process or, from the stored record, after a restart. A
@@ -118,9 +121,10 @@ type Message struct {
 	// mutex held, so it must return quickly and must not call the engine.
 	OnDone func(err error)
 	// BeforeWait, when set, is called once, without the engine's mutex,
-	// if Register has to wait for a packet identifier, before it waits. A
+	// if Register has to wait — for a packet identifier, or for the
+	// previous flow with the same Ref to retire — before it waits. A
 	// caller that releases the flows it registers together, with one
-	// marker (see [Link.QueueOrdered]), queues that marker here: those
+	// marker (see [Link.SendOrdered]), sends that marker here: those
 	// flows' acknowledgements may be what frees an identifier.
 	BeforeWait func()
 }
@@ -129,6 +133,9 @@ type Message struct {
 // and adds an outbound flow for it, in one critical section. While every
 // identifier is in use it waits for one, until ctx ends
 // ([ErrIDsExhausted]) or stop closes ([ErrStopped]; nil never does).
+// While a flow with the same Ref is retiring — its producer has recorded
+// its outcome and its record is being deleted — it waits for that too,
+// so the store never holds two records for one Ref.
 // The record is stored before the flow can be sent; if that fails the
 // flow is removed, the identifier released, and a [*StoreError]
 // returned. An error means the flow does not exist and m.Settle is never
@@ -152,7 +159,15 @@ func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) 
 	}
 
 	e.mu.Lock()
-	for e.failure == nil && e.ids.full() {
+	for e.failure == nil {
+		// A retiring flow with the same Ref releases its identifier once
+		// its record is deleted. Waiting for that keeps one record per
+		// Ref in the store: a restart never finds the old exchange beside
+		// the new one and runs both.
+		full, previous := e.ids.full(), e.retiringLocked(m.Ref)
+		if !full && !previous {
+			break
+		}
 		if before := m.BeforeWait; before != nil {
 			m.BeforeWait = nil
 			e.mu.Unlock()
@@ -160,8 +175,11 @@ func (e *Engine) Register(ctx context.Context, m Message, stop <-chan struct{}) 
 			e.mu.Lock()
 			continue
 		}
-		if err := e.awaitIDLocked(ctx, stop); err != nil {
+		if err := e.awaitReleaseLocked(ctx, stop); err != nil {
 			e.mu.Unlock()
+			if full && !errors.Is(err, ErrStopped) {
+				err = errors.Join(ErrIDsExhausted, err)
+			}
 			return nil, nil, err
 		}
 	}
@@ -260,7 +278,10 @@ func (e *Engine) Withdraw(o *Out) bool {
 // restored from the store, or one an earlier producer started and gave
 // up on — and reports whether there is such a flow. If it has finished
 // without its outcome being recorded, settle gets that outcome, possibly
-// before Adopt returns. The Settle it replaces is never called.
+// before Adopt returns. The Settle it replaces is never called. A flow
+// whose producer has recorded its outcome is over, though its record
+// may still be being deleted: Adopt does not find it, and Register
+// with its Ref waits for the deletion.
 func (e *Engine) Adopt(ref []byte, settle SettleFunc) bool {
 	e.mu.Lock()
 	if o := e.refs[string(ref)]; o != nil {
@@ -269,7 +290,7 @@ func (e *Engine) Adopt(ref []byte, settle SettleFunc) bool {
 		return true
 	}
 	o := e.orphans[string(ref)]
-	if o == nil {
+	if o == nil || o.retiring() {
 		e.mu.Unlock()
 		return false
 	}
@@ -511,6 +532,8 @@ func (e *Engine) settleLocked(o *Out) *job {
 				o.adopted = false
 				// Queued behind this job, which starts it.
 				e.settleLocked(o)
+				// No longer retiring: a Register waiting for it looks again.
+				e.ids.wake()
 			case failed:
 				o.settle = nil
 			default:
@@ -522,6 +545,7 @@ func (e *Engine) settleLocked(o *Out) *job {
 			return nil
 		},
 	}
+	o.settleJob = j
 	if settle != nil {
 		j.begin = func(finish func(error)) {
 			settle(outcome, func(err error) {
@@ -534,6 +558,22 @@ func (e *Engine) settleLocked(o *Out) *job {
 		}
 	}
 	return e.queueLocked(k, o, j)
+}
+
+// retiring reports whether o's producer has recorded its outcome, so o
+// is over and only waits for its record to be deleted and its
+// identifier released.
+func (o *Out) retiring() bool {
+	return o.settling && o.settleJob != nil && o.settleJob.begunOK.Load()
+}
+
+// retiringLocked reports whether the flow with Ref ref is retiring.
+func (e *Engine) retiringLocked(ref []byte) bool {
+	if len(ref) == 0 {
+		return false
+	}
+	o := e.orphans[string(ref)]
+	return o != nil && o.retiring()
 }
 
 // creditLocked returns the unit of send quota o's PUBLISH took on this

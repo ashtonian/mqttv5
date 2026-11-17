@@ -286,7 +286,7 @@ func (c *Client) publishConnection(ctx context.Context) (*connState, error) {
 // [inflight.SettleFunc]) and x.ref is stored with the session record so
 // the exchange can be adopted after a restart. The publisher pool is not
 // used. The flow waits on link (nil when there is none) for a marker,
-// QueueOrdered with seq or a later one, which the caller queues once for
+// SendOrdered with seq or a later one, which the caller sends once for
 // all it started, so they go out in one write — or, should registering
 // one have to wait for a packet identifier, in x.beforeWait.
 func (c *Client) publishTracked(ctx context.Context, po PublishOptions, x exchange) (seq uint64, link inflight.Link, err error) {
@@ -500,7 +500,7 @@ type exchange struct {
 	// onDone runs when the wait on the flow ends; see
 	// [inflight.Message.OnDone].
 	onDone func(error)
-	// beforeWait queues the marker for flows the caller registered
+	// beforeWait sends the marker for flows the caller registered
 	// before this one; see [inflight.Message.BeforeWait].
 	beforeWait func()
 }

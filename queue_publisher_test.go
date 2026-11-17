@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -461,6 +462,70 @@ func TestQueuePublisherRemovesFinishedMessagesTogether(t *testing.T) {
 }
 
 // keptQueue survives Close, as a durable queue's contents do.
+// failingPeek fails the first Peek that would return entries.
+type failingPeek struct {
+	*MemoryPublisherQueue
+	peeks  atomic.Int32
+	once   sync.Once
+	failed chan struct{}
+}
+
+func (q *failingPeek) Peek(ctx context.Context, after uint64, n int) ([]QueueEntry, error) {
+	q.peeks.Add(1)
+	entries, err := q.MemoryPublisherQueue.Peek(ctx, after, n)
+	if err != nil || len(entries) == 0 {
+		return entries, err
+	}
+	fail := false
+	q.once.Do(func() {
+		fail = true
+		close(q.failed)
+	})
+	if fail {
+		return nil, errors.New("queue unavailable")
+	}
+	return entries, nil
+}
+
+// A failed queue read is retried after the retry backoff, though no
+// exchange is running whose outcome would wake the drain.
+func TestQueuePublisherRetriesFailedQueueRead(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	clk := clock.NewFake(time.Unix(1_000, 0))
+	cli := tbClient(t, b, withClock(clk))
+	q := &failingPeek{MemoryPublisherQueue: NewMemoryPublisherQueue(), failed: make(chan struct{})}
+	p := newQueuePublisher(t, cli, q, WithQueueRetryBackoff(ConstantBackoff(time.Second)))
+	// While connected and idle, the keep-alive is the clock's one timer.
+	if !clk.WaitPending(1, 3*time.Second) {
+		t.Fatal("keep-alive timer not armed")
+	}
+	// The drain has read the empty queue once, so the read that fails is
+	// the one Publish wakes it for, and nothing wakes it after.
+	for deadline := time.Now().Add(3 * time.Second); q.peeks.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the drain never read the queue")
+		}
+	}
+	enqueueAll(t, p, 1, "m")
+	select {
+	case <-q.failed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the drain never read the published message")
+	}
+	if !clk.WaitPending(2, 3*time.Second) {
+		t.Fatal("no retry scheduled after the failed read")
+	}
+	clk.Advance(time.Second)
+	waitQueueLen(t, q, 0)
+	if got := qb.payloads(); !slices.Equal(got, []string{"m"}) {
+		t.Fatalf("broker received %q, want [m]", got)
+	}
+}
+
 type keptQueue struct{ *MemoryPublisherQueue }
 
 func (keptQueue) Close() error { return nil }

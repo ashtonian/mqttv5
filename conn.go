@@ -188,10 +188,11 @@ func (cs *connState) SendOrdered(ctx context.Context, seq uint64) error {
 }
 
 // QueueOrdered implements inflight.Link: SendOrdered for a publish
-// nobody waits for, which always goes through the writer goroutine. A
-// caller that goes on publishing would otherwise find the writer idle
-// each time and write every PUBLISH on its own, one syscall each,
-// where the writer sends the ones released meanwhile in one write.
+// nobody waits for, released one at a time, which always goes through
+// the writer goroutine. A caller that goes on publishing would otherwise
+// find the writer idle each time and write every PUBLISH on its own, one
+// syscall each, where the writer sends the ones released meanwhile in
+// one write.
 func (cs *connState) QueueOrdered(ctx context.Context, seq uint64) error {
 	if err := cs.awaitResumed(ctx); err != nil {
 		return err

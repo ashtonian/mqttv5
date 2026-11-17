@@ -82,12 +82,13 @@ type Link interface {
 	// SendOrdered queues a marker in the connection's write order; when
 	// the writer reaches it, flows up to seq may be sent. With nothing
 	// queued the connection may write them on the caller's goroutine,
-	// for a caller about to wait for its flow. It blocks while the write
-	// queue is full.
+	// which saves waking the writer: for a caller about to wait for its
+	// flow, or one releasing a batch of flows at once. It blocks while
+	// the write queue is full.
 	SendOrdered(ctx context.Context, seq uint64) error
-	// QueueOrdered is SendOrdered for a caller that does not wait for
-	// its flow: the marker always goes to the writer, which sends the
-	// flows released meanwhile together.
+	// QueueOrdered is SendOrdered for a caller that releases one flow at
+	// a time and does not wait for it: the marker always goes to the
+	// writer, which sends the flows released meanwhile together.
 	QueueOrdered(ctx context.Context, seq uint64) error
 }
 
@@ -925,7 +926,8 @@ func (t *idTable) release(id uint16, o Owner) bool {
 	return true
 }
 
-// wake lets the callers waiting for an identifier try again.
+// wake lets the callers waiting for an identifier, or for a flow to
+// retire, try again.
 func (t *idTable) wake() {
 	if t.freed != nil {
 		close(t.freed)
@@ -933,10 +935,11 @@ func (t *idTable) wake() {
 	}
 }
 
-// awaitIDLocked waits, without e.mu, for the identifier table to change:
-// a release, Restore replacing it, or the session failing. It returns
-// with e.mu held again, and an error once ctx ends or stop closes.
-func (e *Engine) awaitIDLocked(ctx context.Context, stop <-chan struct{}) error {
+// awaitReleaseLocked waits, without e.mu, for the identifier table to
+// change: a release, a retiring flow being adopted again, Restore
+// replacing the table, or the session failing. It returns with e.mu held
+// again, and an error once ctx ends or stop closes.
+func (e *Engine) awaitReleaseLocked(ctx context.Context, stop <-chan struct{}) error {
 	if e.ids.freed == nil {
 		e.ids.freed = make(chan struct{})
 	}
@@ -947,7 +950,7 @@ func (e *Engine) awaitIDLocked(ctx context.Context, stop <-chan struct{}) error 
 	case <-freed:
 		return nil
 	case <-ctx.Done():
-		return errors.Join(ErrIDsExhausted, ctx.Err())
+		return ctx.Err()
 	case <-stop:
 		return ErrStopped
 	}
@@ -960,7 +963,10 @@ func (e *Engine) AllocateID(ctx context.Context, o Owner, stop <-chan struct{}) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for e.ids.full() {
-		if err := e.awaitIDLocked(ctx, stop); err != nil {
+		if err := e.awaitReleaseLocked(ctx, stop); err != nil {
+			if !errors.Is(err, ErrStopped) {
+				err = errors.Join(ErrIDsExhausted, err)
+			}
 			return 0, err
 		}
 	}

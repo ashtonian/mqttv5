@@ -1304,6 +1304,93 @@ func TestSettleWaitsForTheProducer(t *testing.T) {
 	}
 }
 
+// heldDeletes holds every Delete until release is closed, and logs each
+// write when it takes effect.
+type heldDeletes struct {
+	*session.MemoryStore
+	held, release chan struct{}
+	once          sync.Once
+	mu            sync.Mutex
+	log           []string
+}
+
+func (s *heldDeletes) Put(ctx context.Context, r session.Record) error {
+	err := s.MemoryStore.Put(ctx, r)
+	s.note(fmt.Sprintf("put %d", r.Key.PacketID))
+	return err
+}
+
+func (s *heldDeletes) Delete(ctx context.Context, k session.RecordKey) error {
+	s.once.Do(func() { close(s.held) })
+	<-s.release
+	err := s.MemoryStore.Delete(ctx, k)
+	s.note(fmt.Sprintf("delete %d", k.PacketID))
+	return err
+}
+
+func (s *heldDeletes) note(op string) {
+	s.mu.Lock()
+	s.log = append(s.log, op)
+	s.mu.Unlock()
+}
+
+// Once the producer has recorded a flow's outcome, the flow is over even
+// while its record is being deleted: Adopt does not offer the outcome
+// again, and a new flow for the same Ref is stored only after the old
+// record is gone, so a restart in between never finds both.
+func TestRecordedOutcomeIsNotOfferedAgain(t *testing.T) {
+	st := &heldDeletes{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
+	h := newHarness(t, Config{Store: st})
+	h.connect(false, 0)
+	ref := []byte("r")
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+	recording := make(chan func(error), 1)
+	old, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: ref,
+		Settle: func(_ error, done func(error)) { recording <- done }}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.collect()
+	h.e.HandlePuback(old.PacketID(), wire.ReasonQuotaExceeded, errors.New("quota exceeded"))
+	go (<-recording)(nil)
+	<-st.held
+
+	if h.e.Adopt(ref, func(error, func(error)) { t.Error("the recorded outcome was offered again") }) {
+		t.Fatal("Adopt found a flow whose outcome its producer had recorded")
+	}
+
+	waiting := make(chan struct{})
+	registered := make(chan *Out, 1)
+	go func() {
+		pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+		o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: ref,
+			Settle: func(error, func(error)) {}, BeforeWait: func() { close(waiting) }}, nil)
+		if err != nil {
+			t.Error(err)
+		}
+		registered <- o
+	}()
+	select {
+	case <-waiting:
+	case <-registered:
+		t.Fatal("Register stored a new flow for the Ref while the old record was being deleted")
+	}
+	close(st.release)
+	next := <-registered
+	h.drain()
+
+	st.mu.Lock()
+	log := slices.Clone(st.log)
+	st.mu.Unlock()
+	want := []string{fmt.Sprintf("put %d", old.PacketID()), fmt.Sprintf("delete %d", old.PacketID()), fmt.Sprintf("put %d", next.PacketID())}
+	if !slices.Equal(log, want) {
+		t.Fatalf("store writes %q, want %q", log, want)
+	}
+	if recs := records(t, st); len(recs) != 1 || recs[0].Key.PacketID != next.PacketID() {
+		t.Fatalf("records %+v, want only the new flow's", recs)
+	}
+}
+
 func TestSettleOnSessionLoss(t *testing.T) {
 	t.Run("fail policy", func(t *testing.T) {
 		h := newHarness(t, Config{SessionLoss: Fail})

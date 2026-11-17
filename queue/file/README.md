@@ -72,7 +72,7 @@ bucket and reported instead of blocking the entries behind it.
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `WithSyncPolicy(p)` | `SyncPolicy` | `SyncGroupCommit` | When an Enqueue or Ack reaches stable storage; see below. |
-| `WithCommitWindow(d)` | `time.Duration` | `0` | Extra wait before each group commit to gather more writes per fsync. Only used by `SyncGroupCommit`. |
+| `WithCommitWindow(d)` | `time.Duration` | `0` | Extra wait before each group commit to gather more writes into it. Used by `SyncGroupCommit` and `SyncNone`. |
 | `WithLockTimeout(d)` | `time.Duration` | `1s` | How long `Open` waits for another holder of the directory before returning `ErrLocked`. |
 | `WithFileMode(m)` | `os.FileMode` | `0600` | Permissions of a newly created `queue.db`. The directory is created `0700`. |
 | `WithOnCorrupt(fn)` | `func(seq uint64, err error)` | none | Called for each entry quarantined as corrupt. |
@@ -83,15 +83,30 @@ them with every Enqueue (`mqttv5.WithQueueMaxSize`,
 
 ### Sync policies
 
-| Policy | Guarantee when Enqueue/Ack returns | Measured (macOS, M2 Max, 64-byte payload) |
-|---|---|---|
-| `SyncGroupCommit` | On stable storage: survives process crash and power loss. `Open` syncs the directories it creates entries in, so a new queue survives power loss too (on Windows, as far as NTFS journaling keeps new names). | 180/s with one producer, 5,300–6,050/s with 64 |
-| `SyncEveryWrite` | Same as group commit. | ~180/s at any concurrency |
-| `SyncNone` | In the OS page cache: survives a process crash, not power loss. | 3,500–10,400/s |
+| Policy | Guarantee when Enqueue/Ack returns |
+|---|---|
+| `SyncGroupCommit` | On stable storage: survives process crash and power loss. Concurrent writes share a transaction and its fsync. `Open` syncs the directories it creates entries in, so a new queue survives power loss too (on Windows, as far as NTFS journaling keeps new names). |
+| `SyncEveryWrite` | Same as group commit, with one transaction and fsync per write. |
+| `SyncNone` | In the OS page cache: survives a process crash, not power loss. Concurrent writes share a transaction. |
 
-macOS fsync is `F_FULLFSYNC` (~5.5 ms); fsync latency varies by orders
-of magnitude between drives and file systems, so these figures do not
-carry over to other hardware. Measure on your own hardware with
+Measured on 2026-11-16 with `BenchmarkEnqueue` (64-byte payload, three
+runs of 2 s each), enqueues per second:
+
+| Policy, producers | macOS, Apple M2 Max internal SSD | Linux VM (OrbStack) on the same Mac |
+|---|---:|---:|
+| group commit, 1 | 400–900 | 48–104 |
+| group commit, 64 | 27,300–28,300 | 670–1,030 |
+| every write, 1–64 | 390–900 | 27–100 |
+| none, 1 | 28,600–33,200 | 26,200–27,300 |
+| none, 64 | 266,000–362,000 | 47,200–52,200 |
+
+macOS fsync is `F_FULLFSYNC`, which waits for the drive's cache. fsync
+latency varies by orders of magnitude between drives and file systems,
+so these figures do not carry over to other hardware. Without fsync,
+what concurrent producers share is the transaction's page writes; how
+much that saves depends on the file system (it is most of the cost on
+APFS, less in the Linux VM, where bbolt's work on each key dominates).
+Measure on your own hardware with
 `go -C queue/file test -run '^$' -bench BenchmarkEnqueue`.
 
 ## External dependencies

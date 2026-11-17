@@ -54,7 +54,7 @@ reported by `Store.Corrupt()` rather than stopping the client.
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `WithSyncPolicy(p)` | `SyncPolicy` | `SyncGroupCommit` | When a write reaches stable storage; see below. |
-| `WithCommitWindow(d)` | `time.Duration` | `0` | Extra wait before each group commit to gather more writes per fsync. Zero commits as soon as the previous commit finishes. Only used by `SyncGroupCommit`. |
+| `WithCommitWindow(d)` | `time.Duration` | `0` | Extra wait before each group commit to gather more writes into it. Zero commits as soon as the previous commit finishes. Used by `SyncGroupCommit` and `SyncNone`. |
 | `WithLockTimeout(d)` | `time.Duration` | `1s` | How long `Open` waits for another holder of the directory before returning `ErrLocked`. |
 | `WithFileMode(m)` | `os.FileMode` | `0600` | Permissions of a newly created `session.db`. The directory is created `0700`. |
 
@@ -64,23 +64,29 @@ reported by `Store.Corrupt()` rather than stopping the client.
 |---|---|---|
 | `SyncGroupCommit` | On stable storage: survives process crash and power loss. `Open` syncs the directories it creates entries in, so a new store survives power loss too (on Windows, as far as NTFS journaling keeps new names). | One fsync per transaction; concurrent writes share a transaction. A lone writer pays one fsync, no batching delay. |
 | `SyncEveryWrite` | Same as group commit. | One fsync per write, regardless of concurrency. |
-| `SyncNone` | In the operating system's page cache: survives a process crash, not power loss or a kernel crash. | No fsync. |
+| `SyncNone` | In the operating system's page cache: survives a process crash, not power loss or a kernel crash. | No fsync; concurrent writes share a transaction. |
 
-Measured on 2026-10-07 with `BenchmarkPut` (256-byte packets, three
-runs of 2 s each):
+Measured on 2026-11-16 with `BenchmarkPut` (256-byte packets, medians
+of three runs of 2 s each; the fsync rows vary by up to 3× between
+runs):
 
 | Policy, writers | macOS, Apple M2 Max internal SSD | Linux VM (OrbStack) on the same Mac |
 |---|---:|---:|
-| group commit, 1 | 5.7 ms/write | 6.1 ms/write |
-| group commit, 8 | 1.5 ms/write | 2.2 ms/write |
-| group commit, 64 | 0.14 ms/write (~7,000/s) | 0.32 ms/write (~3,100/s) |
-| every write, 1–64 | 4.7–5.1 ms/write (~200/s) | 2.8–5.8 ms/write |
-| none, 1–64 | 0.026–0.033 ms/write | 0.036–0.042 ms/write |
+| group commit, 1 | 1.8 ms/write | 9.1 ms/write |
+| group commit, 8 | 0.45 ms/write | 3.7 ms/write |
+| group commit, 64 | 0.054 ms/write (~18,700/s) | 0.91 ms/write (~1,100/s) |
+| every write, 1–64 | 1.2–2.4 ms/write | 14–27 ms/write |
+| none, 1 | 0.032 ms/write | 0.039 ms/write |
+| none, 8 | 0.0092 ms/write | 0.036 ms/write |
+| none, 64 | 0.0023 ms/write | 0.018 ms/write |
 
 macOS fsync is `F_FULLFSYNC`, which waits for the drive's cache. fsync
 latency varies by orders of magnitude between drives and file systems,
-so these figures do not carry over to other hardware: measure on your
-own with `go test -run '^$' -bench BenchmarkPut ./store/file`.
+so these figures do not carry over to other hardware. Without fsync,
+what concurrent writers share is the transaction's page writes; how much
+that saves depends on the file system (it is most of the cost on APFS,
+less in the Linux VM, where bbolt's work on each key dominates). Measure
+on your own with `go test -run '^$' -bench BenchmarkPut ./store/file`.
 
 For the client, every QoS 1/2 Publish waits for one store write before
 the PUBLISH is sent, and a QoS 2 exchange writes twice more; inbound QoS

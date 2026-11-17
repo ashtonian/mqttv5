@@ -23,14 +23,21 @@ may change in any release.
   because bbolt syncs the file's contents but not its name. Windows
   cannot sync a directory; there a new name is as durable as NTFS's
   metadata journaling makes it.
-- **Group commit.** Under `SyncGroupCommit` a write that finds no commit
-  running starts one; writes that arrive meanwhile queue and commit
-  together in the next transaction, with one fsync. A lone writer is
-  never delayed (unlike `bolt.DB.Batch`), unless `CommitWindow` asks for
-  a wait. If one write fails a shared transaction, each write of that
-  batch is committed on its own, so only the failing one reports an
-  error — which is why a write function may run twice and must be
-  idempotent within a transaction.
+- **Group commit.** Under `SyncGroupCommit` and `SyncNone` a write that
+  finds no commit running leads one: on its own goroutine it commits
+  every write pending, its own among them, in one transaction (one fsync
+  under `SyncGroupCommit`). Writes that arrive meanwhile wait. When the
+  commit ends the lead is free: the oldest waiter is woken to take it,
+  but a write that arrives first takes it and commits the waiter's write
+  with its own, so a busy goroutine never waits for a parked one to be
+  scheduled. A lone writer is never delayed (unlike `bolt.DB.Batch`) and
+  never hands its write to another goroutine, unless `CommitWindow` asks
+  for a wait. Without fsync a commit is still a transaction's page
+  writes and the writer lock, so `SyncNone` groups too. If one write
+  fails a shared transaction, each write of that batch is committed on
+  its own, so only the failing one reports an error — which is why a
+  write function may run twice and must be idempotent within a
+  transaction. `SyncEveryWrite` commits each write alone.
 - **Checksums.** `Seal` appends a CRC32C to a value and `Unseal` checks
   it, so the stores can tell a corrupt record (`ErrCorrupt`) from a
   valid one.
@@ -41,8 +48,8 @@ may change in any release.
 
 | Field | Type | Default (set by the stores) | Description |
 |---|---|---|---|
-| `Sync` | `SyncPolicy` | `SyncGroupCommit` | `SyncGroupCommit`, `SyncEveryWrite` (fsync per write), or `SyncNone` (no fsync: survives a process crash, not power loss). |
-| `CommitWindow` | `time.Duration` | 0 | Extra wait before each group commit to gather more writes. |
+| `Sync` | `SyncPolicy` | `SyncGroupCommit` | `SyncGroupCommit`, `SyncEveryWrite` (fsync per write, no grouping), or `SyncNone` (grouped, no fsync: survives a process crash, not power loss). |
+| `CommitWindow` | `time.Duration` | 0 | Extra wait before each group commit (`SyncGroupCommit`, `SyncNone`) to gather more writes. |
 | `LockTimeout` | `time.Duration` | the store's `DefaultLockTimeout` | Wait for the file lock before `ErrLocked`. |
 | `Mode` | `os.FileMode` | 0600 | Permission of a newly created file. |
 
@@ -70,8 +77,10 @@ go -C internal/filedb test -race ./...
 ```
 
 The tests cover the lock, concurrent writes persisting across a reopen
-under every sync policy, the group-commit fallback when one write fails
-a batch, the directories `Open` syncs, closed handles, and checksums.
+under every sync policy, writes that arrive during a commit sharing the
+next transaction and the fallback when one write fails a batch (under
+both grouping policies), the directories `Open` syncs, closed handles,
+and checksums.
 The stores' own suites (`session/storetest`, `queue/queuetest`, crash tests)
 exercise it end to end.
 
