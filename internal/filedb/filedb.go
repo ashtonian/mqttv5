@@ -42,8 +42,8 @@ const (
 	SyncGroupCommit SyncPolicy = iota
 	// SyncEveryWrite commits and fsyncs each write on its own.
 	SyncEveryWrite
-	// SyncNone commits without fsync: writes survive a process crash but
-	// not power loss or a kernel crash.
+	// SyncNone commits concurrent writes together, without fsync: writes
+	// survive a process crash but not power loss or a kernel crash.
 	SyncNone
 )
 
@@ -51,7 +51,7 @@ const (
 type Config struct {
 	Sync SyncPolicy
 	// CommitWindow is an extra wait before each group commit to gather
-	// more writes.
+	// more writes. SyncEveryWrite does not group commits.
 	CommitWindow time.Duration
 	// LockTimeout bounds the wait for the file lock.
 	LockTimeout time.Duration
@@ -154,17 +154,17 @@ var syncDir = syncDirEntries
 func (d *DB) Path() string { return d.path }
 
 // Update runs fn in a write transaction and returns once it is committed
-// as the SyncPolicy promises. Under SyncGroupCommit fn may share its
-// transaction with other writes and may run twice: once in a shared
-// transaction that another write failed, then alone.
+// as the SyncPolicy promises. Unless the policy is SyncEveryWrite, fn may
+// share its transaction with other writes and may run twice: once in a
+// shared transaction that another write failed, then alone.
 func (d *DB) Update(ctx context.Context, fn func(*bolt.Tx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if d.sync == SyncGroupCommit {
-		return mapErr(d.commit.do(fn))
+	if d.sync == SyncEveryWrite {
+		return mapErr(d.bolt.Update(fn))
 	}
-	return mapErr(d.bolt.Update(fn))
+	return mapErr(d.commit.do(fn))
 }
 
 // View runs fn in a read transaction.
@@ -180,71 +180,108 @@ func mapErr(err error) error {
 	return err
 }
 
-// committer is a leader/follower group commit. A write that finds no
-// commit running starts one; writes arriving meanwhile queue and go into
-// the next transaction together. Unlike bbolt's Batch it never delays a
-// lone writer.
+// committer is a group commit. A write that finds no commit running
+// leads: on its own goroutine it commits every pending write, its own
+// among them, in one transaction. Writes that arrive meanwhile wait.
+// When the commit ends the lead is free, and the first write to take it
+// commits all that are pending: a waiter woken to take it, or a write
+// that arrives before the waiter runs, which then commits the waiter's
+// write too instead of waiting for its goroutine to be scheduled. Unlike
+// bbolt's Batch it never delays a lone writer, which also never waits on
+// another goroutine.
 type committer struct {
 	db     *bolt.DB
 	window time.Duration
 
 	mu      sync.Mutex
 	pending []*commitOp
-	running bool
+	leading bool
 }
 
 type commitOp struct {
-	fn   func(*bolt.Tx) error
-	done chan error
+	fn func(*bolt.Tx) error
+	// wake asks the write's goroutine to look again: its write has
+	// committed (done, with err), or the lead is free.
+	wake chan struct{}
+	done bool
+	err  error
 }
 
 func (c *committer) do(fn func(*bolt.Tx) error) error {
-	op := &commitOp{fn: fn, done: make(chan error, 1)}
+	op := &commitOp{fn: fn, wake: make(chan struct{}, 1)}
 	c.mu.Lock()
 	c.pending = append(c.pending, op)
-	start := !c.running
-	c.running = true
-	c.mu.Unlock()
-	if start {
-		go c.run()
-	}
-	return <-op.done
-}
-
-func (c *committer) run() {
-	for {
-		if c.window > 0 {
-			time.Sleep(c.window)
-		}
-		c.mu.Lock()
-		batch := c.pending
-		c.pending = nil
-		if len(batch) == 0 {
-			c.running = false
+	for !op.done {
+		if c.leading {
 			c.mu.Unlock()
-			return
-		}
-		c.mu.Unlock()
-
-		err := c.db.Update(func(tx *bolt.Tx) error {
-			for _, op := range batch {
-				if err := op.fn(tx); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err == nil {
-			for _, op := range batch {
-				op.done <- nil
-			}
+			<-op.wake
+			c.mu.Lock()
 			continue
 		}
-		// One write failed the shared transaction: commit each on its
-		// own so only the failing write reports the error.
+		c.leading = true
+		c.mu.Unlock()
+		c.commitPending()
+		c.mu.Lock()
+	}
+	c.mu.Unlock()
+	return op.err
+}
+
+// commitPending commits every pending write, then frees the lead and
+// wakes the oldest write still waiting to take it.
+func (c *committer) commitPending() {
+	if c.window > 0 {
+		time.Sleep(c.window)
+	}
+	c.mu.Lock()
+	batch := c.pending
+	c.pending = nil
+	c.mu.Unlock()
+
+	c.commit(batch)
+
+	c.mu.Lock()
+	for _, op := range batch {
+		op.done = true
+		nudge(op)
+	}
+	c.leading = false
+	if len(c.pending) > 0 {
+		nudge(c.pending[0])
+	}
+	c.mu.Unlock()
+}
+
+// nudge wakes op's goroutine unless a wake is already waiting for it;
+// it looks at op's state when it runs.
+func nudge(op *commitOp) {
+	select {
+	case op.wake <- struct{}{}:
+	default:
+	}
+}
+
+// commit commits batch in one transaction and sets each write's err,
+// which its goroutine reads once done is set under c.mu.
+func (c *committer) commit(batch []*commitOp) {
+	err := c.db.Update(func(tx *bolt.Tx) error {
 		for _, op := range batch {
-			op.done <- c.db.Update(op.fn)
+			if err := op.fn(tx); err != nil {
+				return err
+			}
 		}
+		return nil
+	})
+	if err == nil || len(batch) == 1 {
+		for _, op := range batch {
+			op.err = err
+		}
+		return
+	}
+	// One write failed the shared transaction: commit each on its own so
+	// only the failing write reports the error.
+	for _, op := range batch {
+		op.err = c.db.Update(op.fn)
 	}
 }
 

@@ -64,14 +64,14 @@ const (
 	// guarantee as SyncGroupCommit with no batching delay, at a
 	// throughput of one fsync per write.
 	SyncEveryWrite = filedb.SyncEveryWrite
-	// SyncNone commits without fsync. Writes survive a process crash
-	// (they are in the operating system's cache) but not power loss or
-	// a kernel crash.
+	// SyncNone commits concurrent writes together, without fsync.
+	// Writes survive a process crash (they are in the operating system's
+	// cache) but not power loss or a kernel crash.
 	SyncNone = filedb.SyncNone
 )
 
 const (
-	// DefaultCommitWindow is the extra time SyncGroupCommit waits to
+	// DefaultCommitWindow is the extra time a group commit waits to
 	// gather writes before committing: none.
 	DefaultCommitWindow = 0
 	// DefaultLockTimeout is how long Open waits for another holder to
@@ -90,9 +90,9 @@ type Option func(*options)
 // WithSyncPolicy sets the durability policy. Default SyncGroupCommit.
 func WithSyncPolicy(p SyncPolicy) Option { return func(o *options) { o.db.Sync = p } }
 
-// WithCommitWindow adds a wait before each SyncGroupCommit transaction
-// to gather more writes per fsync, at the cost of that much latency.
-// Default DefaultCommitWindow.
+// WithCommitWindow adds a wait before each transaction that groups
+// writes (SyncGroupCommit and SyncNone) to gather more of them into it,
+// at the cost of that much latency. Default DefaultCommitWindow.
 func WithCommitWindow(d time.Duration) Option { return func(o *options) { o.db.CommitWindow = d } }
 
 // WithLockTimeout sets how long Open waits for the directory lock.

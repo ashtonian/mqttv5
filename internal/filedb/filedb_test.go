@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -33,34 +35,109 @@ func TestSecondOpenIsLocked(t *testing.T) {
 	}
 }
 
+// The policies whose writes share transactions.
+var grouping = []struct {
+	name string
+	sync SyncPolicy
+}{{"group commit", SyncGroupCommit}, {"none", SyncNone}}
+
 // A write that fails does not fail the writes committed with it.
 func TestGroupCommitIsolatesFailures(t *testing.T) {
-	db := open(t, t.TempDir(), Config{Sync: SyncGroupCommit})
-	bad := errors.New("refused")
-	var wg sync.WaitGroup
-	errs := make([]error, 64)
-	for i := range errs {
-		wg.Go(func() {
-			errs[i] = db.Update(context.Background(), func(tx *bolt.Tx) error {
-				if i%8 == 0 {
-					return bad
+	for _, tt := range grouping {
+		t.Run(tt.name, func(t *testing.T) {
+			db := open(t, t.TempDir(), Config{Sync: tt.sync})
+			bad := errors.New("refused")
+			var wg sync.WaitGroup
+			errs := make([]error, 64)
+			for i := range errs {
+				wg.Go(func() {
+					errs[i] = db.Update(context.Background(), func(tx *bolt.Tx) error {
+						if i%8 == 0 {
+							return bad
+						}
+						return tx.Bucket(bucket).Put(fmt.Appendf(nil, "%02d", i), []byte{byte(i)})
+					})
+				})
+			}
+			wg.Wait()
+			n := 0
+			if err := db.View(func(tx *bolt.Tx) error { n = tx.Bucket(bucket).Stats().KeyN; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			for i, err := range errs {
+				if (i%8 == 0) != errors.Is(err, bad) {
+					t.Fatalf("write %d: %v", i, err)
 				}
-				return tx.Bucket(bucket).Put(fmt.Appendf(nil, "%02d", i), []byte{byte(i)})
-			})
+			}
+			if n != 56 {
+				t.Fatalf("%d keys committed, want 56", n)
+			}
 		})
 	}
-	wg.Wait()
-	n := 0
-	if err := db.View(func(tx *bolt.Tx) error { n = tx.Bucket(bucket).Stats().KeyN; return nil }); err != nil {
-		t.Fatal(err)
+}
+
+// Writes that arrive while a transaction commits all go into the next
+// one.
+func TestWritesArrivingDuringACommitShareTheNext(t *testing.T) {
+	for _, tt := range grouping {
+		t.Run(tt.name, func(t *testing.T) {
+			db := open(t, t.TempDir(), Config{Sync: tt.sync})
+			entered, hold := make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(hold) })
+			first := make(chan error, 1)
+			go func() {
+				first <- db.Update(context.Background(), func(tx *bolt.Tx) error {
+					close(entered)
+					<-hold
+					return tx.Bucket(bucket).Put([]byte("first"), []byte{0})
+				})
+			}()
+			<-entered
+
+			const n = 16
+			txs := make([]int, n)
+			var wg sync.WaitGroup
+			// On failure, let every write finish before the file closes.
+			t.Cleanup(wg.Wait)
+			t.Cleanup(release)
+			for i := range n {
+				wg.Go(func() {
+					if err := db.Update(context.Background(), func(tx *bolt.Tx) error {
+						txs[i] = tx.ID()
+						return tx.Bucket(bucket).Put(fmt.Appendf(nil, "%02d", i), []byte{byte(i)})
+					}); err != nil {
+						t.Errorf("write %d: %v", i, err)
+					}
+				})
+			}
+			waitPending(t, db, n)
+			release()
+			wg.Wait()
+			if err := <-first; err != nil {
+				t.Fatal(err)
+			}
+			if txs = slices.Compact(txs); len(txs) != 1 {
+				t.Fatalf("the waiting writes committed in transactions %v, want one", txs)
+			}
+		})
 	}
-	for i, err := range errs {
-		if (i%8 == 0) != errors.Is(err, bad) {
-			t.Fatalf("write %d: %v", i, err)
+}
+
+// waitPending waits until n writes are queued behind the running commit.
+func waitPending(t *testing.T, db *DB, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		db.commit.mu.Lock()
+		got := len(db.commit.pending)
+		db.commit.mu.Unlock()
+		if got == n {
+			return
 		}
-	}
-	if n != 56 {
-		t.Fatalf("%d keys committed, want 56", n)
+		if time.Now().After(deadline) {
+			t.Fatalf("%d writes queued, want %d", got, n)
+		}
+		runtime.Gosched()
 	}
 }
 
