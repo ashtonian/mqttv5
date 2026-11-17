@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +29,9 @@ type faultStore struct {
 	held     chan struct{}
 	heldOnce sync.Once
 	release  chan struct{}
+
+	mu      sync.Mutex
+	applied [][]string // the Refs of each Apply's Puts, failed ones too
 }
 
 var errDiskFull = errors.New("disk full")
@@ -34,22 +40,33 @@ func newFaultStore() *faultStore {
 	return &faultStore{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
 }
 
-func (s *faultStore) Put(ctx context.Context, r session.Record) error {
-	if s.hold != nil && s.hold(r) {
-		s.heldOnce.Do(func() { close(s.held) })
-		<-s.release
+// Apply fails, changing nothing, when one of its changes fails, as an
+// atomic store does.
+func (s *faultStore) Apply(ctx context.Context, changes ...session.Change) error {
+	var refs []string
+	for _, c := range changes {
+		if r, put := c.Record(); put {
+			refs = append(refs, string(r.Ref))
+		}
 	}
-	if s.failPut != nil && s.failPut(r) {
-		return errDiskFull
+	if refs != nil {
+		s.mu.Lock()
+		s.applied = append(s.applied, refs)
+		s.mu.Unlock()
 	}
-	return s.MemoryStore.Put(ctx, r)
-}
-
-func (s *faultStore) Delete(ctx context.Context, k session.RecordKey) error {
-	if s.failDelete.Load() {
-		return errDiskFull
+	for _, c := range changes {
+		if r, put := c.Record(); put && s.hold != nil && s.hold(r) {
+			s.heldOnce.Do(func() { close(s.held) })
+			<-s.release
+		}
 	}
-	return s.MemoryStore.Delete(ctx, k)
+	for _, c := range changes {
+		r, put := c.Record()
+		if put && s.failPut != nil && s.failPut(r) || !put && s.failDelete.Load() {
+			return errDiskFull
+		}
+	}
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
 func (s *faultStore) SetMeta(ctx context.Context, m session.Meta) error {
@@ -59,8 +76,18 @@ func (s *faultStore) SetMeta(ctx context.Context, m session.Meta) error {
 	return s.MemoryStore.SetMeta(ctx, m)
 }
 
+func (s *faultStore) puts() [][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.applied)
+}
+
 func phaseIs(p session.Phase) func(session.Record) bool {
 	return func(r session.Record) bool { return r.Phase == p }
+}
+
+func refIs(ref string) func(session.Record) bool {
+	return func(r session.Record) bool { return string(r.Ref) == ref }
 }
 
 // failures records OnFailure calls.
@@ -97,6 +124,151 @@ func records(t *testing.T, st session.Store) []session.Record {
 		t.Fatal(err)
 	}
 	return recs
+}
+
+// registerRef registers a QoS 1 flow with ref as its Ref and does not
+// wait for its record.
+func (h *harness) registerRef(ref string) *Out {
+	h.t.Helper()
+	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte(ref)}, nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return o
+}
+
+func publishes(flows ...*Out) []string {
+	var s []string
+	for _, o := range flows {
+		s = append(s, fmt.Sprintf("PUBLISH#%d", o.PacketID()))
+	}
+	return s
+}
+
+// The record writes that come due while the store is busy reach it
+// together, in one Apply, and each flow is sent once its record is in.
+func TestDueWritesShareOneApply(t *testing.T) {
+	st := newFaultStore()
+	st.hold = refIs("a")
+	h := newHarness(t, Config{Store: st})
+	h.connect(false, 10)
+	a := h.registerRef("a")
+	<-st.held
+	b, c, d := h.registerRef("b"), h.registerRef("c"), h.registerRef("d")
+	want(t, h.collect())
+	close(st.release)
+	h.drain()
+	if got := st.puts(); !reflect.DeepEqual(got, [][]string{{"a"}, {"b", "c", "d"}}) {
+		t.Fatalf("Applies %q, want a alone, then b, c and d together", got)
+	}
+	want(t, h.collect(), publishes(a, b, c, d)...)
+}
+
+func TestNextBatchIsBounded(t *testing.T) {
+	jobs := func(sizes ...int) []*job {
+		var out []*job
+		for i, n := range sizes {
+			c := session.Put(session.Record{Key: outKey(uint16(i + 1)), Packet: make([]byte, n)})
+			out = append(out, &job{change: &c})
+		}
+		return out
+	}
+	many := make([]int, maxApplyChanges+6)
+	del := session.Delete(outKey(9))
+	tests := []struct {
+		name string
+		due  []*job
+		want int
+	}{
+		{"a few small changes", jobs(10, 10, 10), 3},
+		{"more changes than the cap", jobs(many...), maxApplyChanges},
+		{"up to the byte cap", jobs(maxApplyBytes/2, maxApplyBytes/2, 1), 2},
+		{"one change over the byte cap", jobs(maxApplyBytes+1, 1), 1},
+		{"deletes count no bytes", append(jobs(maxApplyBytes), &job{change: &del}), 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := len(nextBatch(tt.due)); got != tt.want {
+				t.Fatalf("batch of %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// A burst of writes larger than one Apply may take reaches the store in
+// bounded Applies, in order, none lost.
+func TestBurstSplitsIntoBoundedApplies(t *testing.T) {
+	st := newFaultStore()
+	st.hold = refIs("a")
+	h := newHarness(t, Config{Store: st})
+	h.connect(false, 10)
+	h.registerRef("a")
+	<-st.held
+	var refs []string
+	for i := range maxApplyChanges + 6 {
+		refs = append(refs, strconv.Itoa(i))
+		h.registerRef(refs[i])
+	}
+	close(st.release)
+	h.drain()
+	want := [][]string{{"a"}, refs[:maxApplyChanges], refs[maxApplyChanges:]}
+	if got := st.puts(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Applies of %d changes, want 1, %d and 6 in registration order", lens(got), maxApplyChanges)
+	}
+	if n := len(records(t, st)); n != maxApplyChanges+7 {
+		t.Fatalf("%d records stored, want %d", n, maxApplyChanges+7)
+	}
+}
+
+func lens(batches [][]string) []int {
+	var out []int
+	for _, b := range batches {
+		out = append(out, len(b))
+	}
+	return out
+}
+
+// When an Apply of several writes fails, each is applied again on its
+// own: only the flow whose record cannot be stored fails, unsent, and
+// the session goes on.
+func TestOneUnstorableRecordFailsOnlyItsFlow(t *testing.T) {
+	st := newFaultStore()
+	st.hold = refIs("a")
+	st.failPut = refIs("c")
+	var failed failures
+	h := newHarness(t, Config{Store: st, OnFailure: failed.add})
+	h.connect(false, 10)
+	a := h.registerRef("a")
+	<-st.held
+	b, c, d := h.registerRef("b"), h.registerRef("c"), h.registerRef("d")
+	close(st.release)
+	h.drain()
+
+	if got := st.puts(); !reflect.DeepEqual(got, [][]string{{"a"}, {"b", "c", "d"}, {"b"}, {"c"}, {"d"}}) {
+		t.Fatalf("Applies %q, want the failed batch applied again one change at a time", got)
+	}
+	if err := done(t, c); !errors.Is(err, ErrStoreFailed) || !errors.Is(err, errDiskFull) {
+		t.Fatalf("unstorable flow ended with %v", err)
+	}
+	for _, o := range []*Out{a, b, d} {
+		notDone(t, o)
+	}
+	if errs := failed.list(); len(errs) != 0 {
+		t.Fatalf("the session failed: %v", errs)
+	}
+	want(t, h.collect(), publishes(a, b, d)...)
+	var stored []string
+	for _, r := range records(t, st) {
+		stored = append(stored, string(r.Ref))
+	}
+	slices.Sort(stored)
+	if !slices.Equal(stored, []string{"a", "b", "d"}) {
+		t.Fatalf("stored records %q, want a, b and d", stored)
+	}
+	if h.e.ids.used != 3 {
+		t.Fatalf("%d identifiers in use, want 3", h.e.ids.used)
+	}
 }
 
 // A Register waiting for a packet identifier returns the failure when
@@ -509,19 +681,24 @@ func TestAdoptWhileSettling(t *testing.T) {
 	}
 }
 
-// deleteGate holds the first Delete until release is closed.
+// deleteGate holds the first Apply with a Delete until release is
+// closed.
 type deleteGate struct {
 	*session.MemoryStore
 	held, release chan struct{}
 	once          sync.Once
 }
 
-func (s *deleteGate) Delete(ctx context.Context, k session.RecordKey) error {
-	s.once.Do(func() {
-		close(s.held)
-		<-s.release
-	})
-	return s.MemoryStore.Delete(ctx, k)
+func (s *deleteGate) Apply(ctx context.Context, changes ...session.Change) error {
+	for _, c := range changes {
+		if _, put := c.Record(); !put {
+			s.once.Do(func() {
+				close(s.held)
+				<-s.release
+			})
+		}
+	}
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
 // A new inbound flow that reuses a packet identifier stores its record
@@ -642,24 +819,29 @@ func TestFailureDuringRegisterCompletesOnce(t *testing.T) {
 	}
 }
 
-// putGate fails the first Put after holding it until release is closed.
+// putGate fails the first Apply with a Put after holding it until
+// release is closed.
 type putGate struct {
 	*session.MemoryStore
 	held, release chan struct{}
 	first         sync.Once
 }
 
-func (s *putGate) Put(ctx context.Context, r session.Record) error {
+func (s *putGate) Apply(ctx context.Context, changes ...session.Change) error {
 	failed := false
-	s.first.Do(func() {
-		close(s.held)
-		<-s.release
-		failed = true
-	})
+	for _, c := range changes {
+		if _, put := c.Record(); put {
+			s.first.Do(func() {
+				close(s.held)
+				<-s.release
+				failed = true
+			})
+		}
+	}
 	if failed {
 		return errDiskFull
 	}
-	return s.MemoryStore.Put(ctx, r)
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
 // A message whose first record write fails leaves nothing behind, also
@@ -669,19 +851,18 @@ func TestFailedFirstPutCancelsLaterWrites(t *testing.T) {
 	h := newHarness(t, Config{Store: st})
 	h.connect(false, 10)
 	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
-	returned := make(chan error, 1)
-	go func() {
-		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil)
-		returned <- err
-	}()
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
 	<-st.held
 	h.disconnect()
 	h.connect(false, 10) // queues a rewrite of the flow's record
 	close(st.release)
-	if err := <-returned; !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("Register: %v", err)
-	}
 	h.drain()
+	if err := done(t, o); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("flow ended with %v, want the store failure", err)
+	}
 	if recs := records(t, st); len(recs) != 0 {
 		t.Fatalf("a message never accepted left a record: %+v", recs)
 	}
@@ -796,38 +977,45 @@ func TestRestoredOutcomeKeptUntilAdopted(t *testing.T) {
 	}
 }
 
-// A registration rejected because its record could not be written leaves
-// nothing to adopt, also when a session loss ended it meanwhile.
-func TestRejectedRegistrationLeavesNoOrphan(t *testing.T) {
+// A flow whose record could not be stored, but which a session loss
+// ended first, settles once, with that outcome, and leaves nothing to
+// adopt.
+func TestUnstoredFlowEndedMeanwhileSettlesOnce(t *testing.T) {
 	st := &putGate{MemoryStore: session.NewMemoryStore(), held: make(chan struct{}), release: make(chan struct{})}
 	h := newHarness(t, Config{Store: st, SessionLoss: Fail})
 	h.connect(false, 10)
 	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
 	settled := make(chan error, 2)
-	returned := make(chan error, 1)
-	go func() {
-		_, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
-			Settle: func(err error, done func(error)) { settled <- err; done(nil) }}, nil)
-		returned <- err
-	}()
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt, Ref: []byte("entry"),
+		Settle: func(err error, done func(error)) { settled <- err; done(nil) }}, nil)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
 	<-st.held
 	h.disconnect()
 	h.connect(false, 10) // the Fail policy ends the flow while its Put runs
 	close(st.release)
-	if err := <-returned; err == nil {
-		t.Fatal("Register accepted a message whose record was never written")
-	}
 	h.drain()
-	if h.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
-		t.Fatal("a rejected registration is adoptable")
+	if err := done(t, o); !errors.Is(err, ErrSessionLost) {
+		t.Fatalf("flow ended with %v, want ErrSessionLost", err)
 	}
-	select {
-	case err := <-settled:
-		t.Fatalf("a rejected registration settled with %v", err)
-	default:
+	for i := range 2 {
+		select {
+		case err := <-settled:
+			if i > 0 || !errors.Is(err, ErrSessionLost) {
+				t.Fatalf("settle %d with %v, want one with ErrSessionLost", i+1, err)
+			}
+		default:
+			if i == 0 {
+				t.Fatal("never settled")
+			}
+		}
+	}
+	if h.e.Adopt([]byte("entry"), func(err error, done func(error)) { settled <- err; done(nil) }) {
+		t.Fatal("the flow is adoptable")
 	}
 	if h.e.HasState() || h.e.ids.used != 0 {
-		t.Fatal("a rejected registration left state behind")
+		t.Fatal("the flow left state behind")
 	}
 }
 

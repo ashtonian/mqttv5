@@ -11,27 +11,31 @@
 //
 // The client writes a record before it acts on the network:
 //
-//   - outbound PUBLISH: Put (phase [AwaitPuback] or [AwaitPubrec]), then send;
+//   - outbound PUBLISH: [Put] (phase [AwaitPuback] or [AwaitPubrec]), then send;
 //   - PUBREC received: Put (phase [AwaitPubcomp]), then send PUBREL;
-//   - PUBACK / PUBCOMP received, or a refusal: Delete — or, when the
+//   - PUBACK / PUBCOMP received, or a refusal: [Delete] — or, when the
 //     message's producer could not yet record the outcome, Put (phase
 //     [Completed], with the [Record.Outcome]) until it has;
 //   - inbound QoS 2 acknowledged by the application: Put (phase
 //     [AwaitPubrel]), then send PUBREC;
 //   - PUBREL received: Delete, then send PUBCOMP.
 //
-// Put and Delete must therefore not return before the change is as
+// [Store.Apply] must therefore not return before its changes are as
 // durable as the implementation promises; a Store that buffers writes
-// weakens the guarantee to whatever survives its buffering. Writes for
-// one record arrive in the order the client decided them, never
-// concurrently.
+// weakens the guarantee to whatever survives its buffering. The client
+// gives Apply every change that is due at once, up to 1,024 changes and
+// 4 MiB of packets, so a store that writes a batch for about the cost of
+// one change (one transaction, one fsync) keeps up with many flows. Changes for one record arrive in the order
+// the client decided them, never concurrently.
 //
 // # Errors
 //
-// The client treats an error from Put, Delete or SetMeta as final: a
-// failed Put of a new outbound record fails that publish, and any other
-// failed write stops the client, which drops its session state in memory
-// as a crash would and reloads it with Load on the next Connect. A Store
+// The client treats an error from Apply or SetMeta as final. When an
+// Apply of several changes fails, the client applies each again on its
+// own, so that only the failing change's flow is affected: a failed Put
+// of a new outbound record fails that publish, and any other failed
+// change stops the client, which drops its session state in memory as a
+// crash would and reloads it with Load on the next Connect. A Store
 // whose backend has transient failures (a network database, say)
 // retries them itself, within the ctx it is given, before it reports an
 // error.
@@ -147,9 +151,9 @@ type Record struct {
 	Phase Phase
 
 	// Packet is the encoded outbound PUBLISH with DUP=0, as first sent.
-	// Nil for inbound records. A Store keeps its own copy: the slice
-	// passed to Put may be reused by the caller after Put returns, and
-	// the slice returned by Load is owned by the caller.
+	// Nil for inbound records. A Store keeps its own copy: the slice in
+	// a Put given to Apply may be reused by the caller after Apply
+	// returns, and the slice returned by Load is owned by the caller.
 	Packet []byte
 
 	// ExpiresAt is when the outbound message's Message Expiry Interval
@@ -193,6 +197,35 @@ type Meta struct {
 	SessionExpiry uint32
 }
 
+// Change is one write to a [Store]'s records, made with [Put] or
+// [Delete].
+type Change struct {
+	record Record
+	delete bool
+}
+
+// Put is the Change that inserts r, or replaces the record with r.Key.
+func Put(r Record) Change { return Change{record: r} }
+
+// Delete is the Change that removes the record with key k. Deleting a
+// missing record is not an error.
+func Delete(k RecordKey) Change { return Change{record: Record{Key: k}, delete: true} }
+
+// Key is the key of the record c writes.
+func (c Change) Key() RecordKey { return c.record.Key }
+
+// Record returns the record c puts, and false when c is a Delete.
+func (c Change) Record() (Record, bool) { return c.record, !c.delete }
+
+// Validate reports why c cannot be applied: for a Put, why its record
+// cannot be stored (see [Record.Validate]).
+func (c Change) Validate() error {
+	if c.delete {
+		return nil
+	}
+	return c.record.Validate()
+}
+
 // Store persists session state. Implementations must be safe for
 // concurrent use and must keep the copies of byte slices they are given.
 type Store interface {
@@ -200,13 +233,11 @@ type Store interface {
 	// ordered by Seq. An empty store returns a zero Meta and no records.
 	Load(ctx context.Context) (Meta, []Record, error)
 
-	// Put inserts or replaces the record with r.Key. A record that fails
-	// [Record.Validate] is refused with its error.
-	Put(ctx context.Context, r Record) error
-
-	// Delete removes the record with key k. Deleting a missing record is
-	// not an error.
-	Delete(ctx context.Context, k RecordKey) error
+	// Apply makes changes, in order, as one atomic write: when it
+	// returns nil all of them are stored, and when it returns an error
+	// none is. A Put whose record fails [Record.Validate] fails Apply
+	// with that error. Apply with no changes does nothing.
+	Apply(ctx context.Context, changes ...Change) error
 
 	// SetMeta replaces the stored meta.
 	SetMeta(ctx context.Context, m Meta) error
@@ -263,30 +294,34 @@ func (s *MemoryStore) Load(context.Context) (Meta, []Record, error) {
 	return s.meta, out, nil
 }
 
-// Put implements [Store].
-func (s *MemoryStore) Put(_ context.Context, r Record) error {
-	if err := r.Validate(); err != nil {
-		return err
+// Apply implements [Store].
+func (s *MemoryStore) Apply(_ context.Context, changes ...Change) error {
+	if len(changes) == 0 {
+		return nil
 	}
-	r.Packet = bytes.Clone(r.Packet)
-	r.Ref = bytes.Clone(r.Ref)
+	puts := make([]Record, len(changes))
+	for i, c := range changes {
+		if err := c.Validate(); err != nil {
+			return err
+		}
+		if r, ok := c.Record(); ok {
+			r.Packet = bytes.Clone(r.Packet)
+			r.Ref = bytes.Clone(r.Ref)
+			puts[i] = r
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return ErrClosed
 	}
-	s.records[r.Key] = r
-	return nil
-}
-
-// Delete implements [Store].
-func (s *MemoryStore) Delete(_ context.Context, k RecordKey) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrClosed
+	for i, c := range changes {
+		if c.delete {
+			delete(s.records, c.Key())
+			continue
+		}
+		s.records[c.Key()] = puts[i]
 	}
-	delete(s.records, k)
 	return nil
 }
 

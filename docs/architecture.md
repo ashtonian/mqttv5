@@ -69,8 +69,12 @@ handle is acked.
 **Session engine** (`internal/inflight`). Owns packet identifiers, the
 send quota (the broker's Receive Maximum), outbound and inbound QoS 1/2
 state machines, ordered acknowledgements, replay on resumption, and
-writes to the `session.Store`. Store writes run off the read goroutine
-and are drained on `Disconnect`.
+writes to the `session.Store`. Store writes run on one store-writer
+goroutine, which gives the store every change that is due in one
+`Apply` (up to 1,024 changes and 4 MiB of packets), so the flows that
+run at once share a transaction and an fsync; each packet that depends on a record waits until it is stored.
+Writes are drained on `Disconnect`. With `session.MemoryStore` they run
+in place.
 
 **Subscriptions.** One broker subscription per exact filter, shared by
 the client's subscriptions with that filter; a topic trie maps topics

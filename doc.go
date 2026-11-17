@@ -43,9 +43,10 @@
 // publishing those messages again (a lost broker session aside).
 //
 // With [WithStore], every packet that depends on a session record is
-// sent only once the record is written, and a failed write stops the
-// client as a crash would: the next [Client.Connect] reloads the
-// session from the store (see [WithOnStoreFailure]).
+// sent only once the record is written. A failed write of a new
+// message's record fails that message; any other failed write stops the
+// client as a crash would: the next [Client.Connect] reloads the session
+// from the store (see [WithOnStoreFailure]).
 //
 // Operator surface:
 //

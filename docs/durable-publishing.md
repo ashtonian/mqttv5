@@ -16,6 +16,13 @@
   whole window, at 25 ms, about 1,200 msg/s with the default window and
   600 with a window of 16, against 38 msg/s one at a time
   (`BenchmarkQueuePublisherRTT`).
+- With a durable session store (`WithStore`), the records of the
+  messages in flight share the store's writes: about half the window
+  goes in each `Apply`, with `store/file` one transaction and one fsync.
+  Draining a backlog with `store/file`'s group commit (macOS, in-process
+  broker) took 73 µs per message with the default window, 16 messages
+  to each fsync, and 15 µs with a window of 256. Raise the window when
+  the disk's sync rate, rather than the broker, limits the drain.
 
 ```go
 import (

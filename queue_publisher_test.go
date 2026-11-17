@@ -526,6 +526,43 @@ func TestQueuePublisherRetriesFailedQueueRead(t *testing.T) {
 	}
 }
 
+// A queued message whose record cannot be stored is not sent; it is
+// tried again, as a new exchange, after the retry backoff.
+func TestQueuePublisherRetriesAnUnstorableRecord(t *testing.T) {
+	qb := newQueueBroker()
+	b := testbroker.New(t, func(c *testbroker.Conn) {
+		c.AcceptConnect(wire.ConnackOpts{})
+		qb.serve(c)
+	})
+	st := &phaseFailStore{MemoryStore: session.NewMemoryStore(), phase: session.AwaitPuback}
+	st.fail.Store(true)
+	clk := clock.NewFake(time.Unix(1_000, 0))
+	cli := tbClient(t, b, WithStore(st), withClock(clk))
+	q := NewMemoryPublisherQueue()
+	p := newQueuePublisher(t, cli, q, WithQueueRetryBackoff(ConstantBackoff(time.Second)))
+	// While connected and idle, the keep-alive is the clock's one timer.
+	if !clk.WaitPending(1, 3*time.Second) {
+		t.Fatal("keep-alive timer not armed")
+	}
+	enqueueAll(t, p, 1, "m")
+	if !clk.WaitPending(2, 3*time.Second) {
+		t.Fatal("no retry scheduled after the failed write")
+	}
+	if got := qb.payloads(); len(got) != 0 {
+		t.Fatalf("broker received %q before the record was stored", got)
+	}
+	st.fail.Store(false)
+	clk.Advance(time.Second)
+	waitQueueLen(t, q, 0)
+	waitEmpty(t, st)
+	if got := qb.payloads(); !slices.Equal(got, []string{"m"}) {
+		t.Fatalf("broker received %q, want [m]", got)
+	}
+	if !cli.Connected() {
+		t.Fatal("the failed write disconnected the client")
+	}
+}
+
 type keptQueue struct{ *MemoryPublisherQueue }
 
 func (keptQueue) Close() error { return nil }

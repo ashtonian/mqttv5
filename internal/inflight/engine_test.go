@@ -168,7 +168,19 @@ func (h *harness) publish(qos byte, payload string, opts ...func(*wire.PublishOp
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	h.waitStored(o)
 	return o
+}
+
+// waitStored waits until o's record writes have finished, so the next
+// Collect may send its PUBLISH; Register does not wait for them.
+func (h *harness) waitStored(o *Out) {
+	h.t.Helper()
+	waitFor(h.t, func() bool {
+		h.e.mu.Lock()
+		defer h.e.mu.Unlock()
+		return h.e.storedLocked(outKey(o.id))
+	})
 }
 
 func want(t *testing.T, got []frame, wantStr ...string) {
@@ -895,24 +907,23 @@ func TestRegisterRejectsAnythingButAQoS12Publish(t *testing.T) {
 	}
 }
 
-// blockingStore lets a test hold store writes to check what waits on them.
+// blockingStore lets a test hold store writes to check what waits on
+// them: each Apply takes one value from gate. While fail is set, an
+// Apply with a Put fails.
 type blockingStore struct {
 	*session.MemoryStore
 	gate chan struct{}
 	fail atomic.Bool
 }
 
-func (s *blockingStore) Put(ctx context.Context, r session.Record) error {
+func (s *blockingStore) Apply(ctx context.Context, changes ...session.Change) error {
 	<-s.gate
-	if s.fail.Load() {
-		return errors.New("disk full")
+	for _, c := range changes {
+		if _, put := c.Record(); put && s.fail.Load() {
+			return errors.New("disk full")
+		}
 	}
-	return s.MemoryStore.Put(ctx, r)
-}
-
-func (s *blockingStore) Delete(ctx context.Context, k session.RecordKey) error {
-	<-s.gate
-	return s.MemoryStore.Delete(ctx, k)
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
 // headCtrlReady reports whether the next acknowledgement can be written.
@@ -950,6 +961,7 @@ func TestPacketsWaitForTheirRecords(t *testing.T) {
 	want(t, h.collect()) // PUBLISH waits for its record
 	st.gate <- struct{}{}
 	o := <-registered
+	h.waitStored(o)
 	want(t, h.collect(), fmt.Sprintf("PUBLISH#%d", o.PacketID()))
 
 	h.e.HandlePubrec(o.PacketID(), 0, nil)
@@ -981,18 +993,28 @@ func TestPacketsWaitForTheirRecords(t *testing.T) {
 	}
 }
 
-func TestRegisterFailsWhenStoreFails(t *testing.T) {
+// A flow whose record cannot be stored completes with the store's error
+// without being sent, and the session goes on.
+func TestUnstorableFlowFailsAlone(t *testing.T) {
 	st := &blockingStore{MemoryStore: session.NewMemoryStore(), gate: make(chan struct{})}
 	close(st.gate)
 	st.fail.Store(true)
 	h := newHarness(t, Config{Store: st})
 	h.connect(false, 0)
 	pkt, _ := wire.MarshalPublish(wire.PublishOpts{Topic: "t", QoS: 1, PacketID: 1})
-	if _, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil); err == nil {
-		t.Fatal("Register succeeded although the store failed")
+	o, _, err := h.e.Register(context.Background(), Message{QoS: 1, Packet: pkt}, nil)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.drain()
+	if err := done(t, o); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("flow ended with %v, want the store failure", err)
 	}
 	if h.e.OutboundLen() != 0 || h.e.ids.used != 0 {
-		t.Fatal("failed registration left state behind")
+		t.Fatal("the unstored flow left state behind")
+	}
+	if err := h.e.Failure(); err != nil {
+		t.Fatalf("one record that could not be stored ended the session: %v", err)
 	}
 	want(t, h.collect())
 }
@@ -1187,14 +1209,15 @@ func (s *opLog) log() []string {
 	return slices.Clone(s.ops)
 }
 
-func (s *opLog) Put(ctx context.Context, r session.Record) error {
-	s.add(fmt.Sprintf("put %d ref=%s", r.Key.PacketID, r.Ref))
-	return s.MemoryStore.Put(ctx, r)
-}
-
-func (s *opLog) Delete(ctx context.Context, k session.RecordKey) error {
-	s.add(fmt.Sprintf("delete %d", k.PacketID))
-	return s.MemoryStore.Delete(ctx, k)
+func (s *opLog) Apply(ctx context.Context, changes ...session.Change) error {
+	for _, c := range changes {
+		if r, put := c.Record(); put {
+			s.add(fmt.Sprintf("put %d ref=%s", r.Key.PacketID, r.Ref))
+		} else {
+			s.add(fmt.Sprintf("delete %d", c.Key().PacketID))
+		}
+	}
+	return s.MemoryStore.Apply(ctx, changes...)
 }
 
 // register publishes with a Ref and a Settle that logs into st.
@@ -1215,6 +1238,7 @@ func (h *harness) register(st *opLog, qos byte, ref string) (*Out, chan error) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	h.waitStored(o)
 	return o, settled
 }
 
@@ -1304,8 +1328,8 @@ func TestSettleWaitsForTheProducer(t *testing.T) {
 	}
 }
 
-// heldDeletes holds every Delete until release is closed, and logs each
-// write when it takes effect.
+// heldDeletes holds every Apply with a Delete until release is closed,
+// and logs each change once it has taken effect.
 type heldDeletes struct {
 	*session.MemoryStore
 	held, release chan struct{}
@@ -1314,17 +1338,21 @@ type heldDeletes struct {
 	log           []string
 }
 
-func (s *heldDeletes) Put(ctx context.Context, r session.Record) error {
-	err := s.MemoryStore.Put(ctx, r)
-	s.note(fmt.Sprintf("put %d", r.Key.PacketID))
-	return err
-}
-
-func (s *heldDeletes) Delete(ctx context.Context, k session.RecordKey) error {
-	s.once.Do(func() { close(s.held) })
-	<-s.release
-	err := s.MemoryStore.Delete(ctx, k)
-	s.note(fmt.Sprintf("delete %d", k.PacketID))
+func (s *heldDeletes) Apply(ctx context.Context, changes ...session.Change) error {
+	for _, c := range changes {
+		if _, put := c.Record(); !put {
+			s.once.Do(func() { close(s.held) })
+			<-s.release
+		}
+	}
+	err := s.MemoryStore.Apply(ctx, changes...)
+	for _, c := range changes {
+		if _, put := c.Record(); put {
+			s.note(fmt.Sprintf("put %d", c.Key().PacketID))
+		} else {
+			s.note(fmt.Sprintf("delete %d", c.Key().PacketID))
+		}
+	}
 	return err
 }
 
@@ -1350,6 +1378,7 @@ func TestRecordedOutcomeIsNotOfferedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.waitStored(old)
 	h.collect()
 	h.e.HandlePuback(old.PacketID(), wire.ReasonQuotaExceeded, errors.New("quota exceeded"))
 	go (<-recording)(nil)

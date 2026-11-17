@@ -374,7 +374,8 @@ func (p *QueuePublisher) signal() {
 // run is the drain goroutine: while connected it starts messages whose
 // turn has come and claims new ones until the window is full, then
 // sleeps until something changes. It may block meanwhile — on a packet
-// identifier, a store write, room in the write queue — which is why the
+// identifier, the deletion of a retried message's earlier record, room
+// in the write queue — which is why the
 // outcomes that free those are the recorder's to record, not its own.
 func (p *QueuePublisher) run() {
 	defer close(p.drained)

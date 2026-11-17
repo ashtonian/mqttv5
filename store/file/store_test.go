@@ -79,7 +79,7 @@ func TestCorruptRecordsAreSkippedAndReported(t *testing.T) {
 	}
 	ctx := context.Background()
 	good := session.Record{Key: session.RecordKey{Dir: session.Outbound, PacketID: 1}, Seq: 1, QoS: 1, Phase: session.AwaitPuback, Packet: []byte("ok")}
-	if err := s.Put(ctx, good); err != nil {
+	if err := s.Apply(ctx, session.Put(good)); err != nil {
 		t.Fatal(err)
 	}
 	path := s.Path()
@@ -121,8 +121,8 @@ func TestClosedStoreReturnsErrClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.Close()
-	if err := s.Delete(context.Background(), session.RecordKey{Dir: session.Outbound, PacketID: 1}); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Delete after Close = %v", err)
+	if err := s.Apply(context.Background(), session.Delete(session.RecordKey{Dir: session.Outbound, PacketID: 1})); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Apply after Close = %v", err)
 	}
 }
 
@@ -141,7 +141,7 @@ func TestGroupCommitUnderConcurrency(t *testing.T) {
 			for i := 0; i < 20; i++ {
 				id := uint16(w*20 + i + 1)
 				r := session.Record{Key: session.RecordKey{Dir: session.Outbound, PacketID: id}, Seq: uint64(id), QoS: 1, Phase: session.AwaitPuback, Packet: []byte{byte(id)}}
-				if err := s.Put(ctx, r); err != nil {
+				if err := s.Apply(ctx, session.Put(r)); err != nil {
 					t.Error(err)
 					return
 				}

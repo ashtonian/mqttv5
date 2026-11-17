@@ -45,6 +45,8 @@ func Run(t *testing.T, f Factory) {
 	t.Run("PutReplaces", func(t *testing.T) { testPutReplaces(t, open(t)) })
 	t.Run("OutboundOrderedBySeq", func(t *testing.T) { testOrder(t, open(t)) })
 	t.Run("Delete", func(t *testing.T) { testDelete(t, open(t)) })
+	t.Run("ApplyInOrder", func(t *testing.T) { testApplyInOrder(t, open(t)) })
+	t.Run("ApplyIsAtomic", func(t *testing.T) { testApplyIsAtomic(t, open(t)) })
 	t.Run("KeysAreDirectional", func(t *testing.T) { testDirectional(t, open(t)) })
 	t.Run("CopiesPackets", func(t *testing.T) { testCopies(t, open(t)) })
 	t.Run("Meta", func(t *testing.T) { testMeta(t, open(t)) })
@@ -92,11 +94,20 @@ func load(t *testing.T, s session.Store) (session.Meta, []session.Record) {
 	return m, recs
 }
 
+func apply(t *testing.T, s session.Store, changes ...session.Change) {
+	t.Helper()
+	if err := s.Apply(ctx, changes...); err != nil {
+		t.Fatalf("Apply of %d changes: %v", len(changes), err)
+	}
+}
+
 func put(t *testing.T, s session.Store, r session.Record) {
 	t.Helper()
-	if err := s.Put(ctx, r); err != nil {
-		t.Fatalf("Put(%+v): %v", r.Key, err)
-	}
+	apply(t, s, session.Put(r))
+}
+
+func outKey(id uint16) session.RecordKey {
+	return session.RecordKey{Dir: session.Outbound, PacketID: id}
 }
 
 func equal(a, b session.Record) bool {
@@ -140,9 +151,11 @@ func testRoundTrip(t *testing.T, s session.Store) {
 		}(),
 		inRec(4),
 	}
+	var puts []session.Change
 	for _, r := range want {
-		put(t, s, r)
+		puts = append(puts, session.Put(r))
 	}
+	apply(t, s, puts...)
 	_, got := load(t, s)
 	if len(got) != len(want) {
 		t.Fatalf("Load returned %d records, want %d", len(got), len(want))
@@ -158,12 +171,12 @@ func testRoundTrip(t *testing.T, s session.Store) {
 	}
 	bad := inRec(7)
 	bad.Phase = session.AwaitPuback
-	if err := s.Put(ctx, bad); !errors.Is(err, session.ErrInvalidRecord) {
+	if err := s.Apply(ctx, session.Put(bad)); !errors.Is(err, session.ErrInvalidRecord) {
 		t.Errorf("Put of an inbound record at an outbound phase: %v, want ErrInvalidRecord", err)
 	}
 	long := outRec(6, 14, session.AwaitPuback, "e")
 	long.Ref = make([]byte, session.MaxRefLen+1)
-	if err := s.Put(ctx, long); !errors.Is(err, session.ErrInvalidRecord) {
+	if err := s.Apply(ctx, session.Put(long)); !errors.Is(err, session.ErrInvalidRecord) {
 		t.Errorf("Put with a %d-byte Ref: %v, want ErrInvalidRecord", len(long.Ref), err)
 	}
 }
@@ -203,10 +216,8 @@ func testOrder(t *testing.T, s session.Store) {
 func testDelete(t *testing.T, s session.Store) {
 	put(t, s, outRec(1, 1, session.AwaitPuback, "a"))
 	put(t, s, outRec(2, 2, session.AwaitPuback, "b"))
-	if err := s.Delete(ctx, session.RecordKey{Dir: session.Outbound, PacketID: 1}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Delete(ctx, session.RecordKey{Dir: session.Outbound, PacketID: 999}); err != nil {
+	apply(t, s, session.Delete(outKey(1)))
+	if err := s.Apply(ctx, session.Delete(outKey(999))); err != nil {
 		t.Fatalf("deleting a missing record: %v", err)
 	}
 	_, got := load(t, s)
@@ -215,12 +226,56 @@ func testDelete(t *testing.T, s session.Store) {
 	}
 }
 
+// Changes take effect in the order Apply is given them, also for one key.
+func testApplyInOrder(t *testing.T, s session.Store) {
+	put(t, s, outRec(3, 3, session.AwaitPuback, "old"))
+	apply(t, s,
+		session.Put(outRec(1, 1, session.AwaitPubrec, "first")),
+		session.Put(outRec(1, 5, session.AwaitPubcomp, "first")),
+		session.Put(outRec(2, 2, session.AwaitPuback, "gone")),
+		session.Delete(outKey(2)),
+		session.Delete(outKey(3)),
+		session.Put(outRec(3, 4, session.AwaitPuback, "new")),
+	)
+	if err := s.Apply(ctx); err != nil {
+		t.Fatalf("Apply with no changes: %v", err)
+	}
+	_, got := load(t, s)
+	if len(got) != 2 {
+		t.Fatalf("after one Apply of six changes: %+v", got)
+	}
+	if r, _ := find(got, outKey(1)); r.Phase != session.AwaitPubcomp || r.Seq != 5 {
+		t.Errorf("record 1 = %+v, want the second Put", r)
+	}
+	if r, _ := find(got, outKey(3)); string(r.Packet) != "packet-new" {
+		t.Errorf("record 3 = %+v, want the Put after its Delete", r)
+	}
+}
+
+// An Apply that fails stores none of its changes.
+func testApplyIsAtomic(t *testing.T, s session.Store) {
+	keep := outRec(1, 1, session.AwaitPuback, "keep")
+	put(t, s, keep)
+	bad := inRec(7)
+	bad.Phase = session.AwaitPuback
+	err := s.Apply(ctx,
+		session.Put(outRec(2, 2, session.AwaitPuback, "new")),
+		session.Delete(outKey(1)),
+		session.Put(bad),
+	)
+	if !errors.Is(err, session.ErrInvalidRecord) {
+		t.Fatalf("Apply with an invalid record: %v, want ErrInvalidRecord", err)
+	}
+	_, got := load(t, s)
+	if len(got) != 1 || !equal(got[0], keep) {
+		t.Fatalf("a failed Apply changed the store: %+v", got)
+	}
+}
+
 func testDirectional(t *testing.T, s session.Store) {
 	put(t, s, outRec(5, 1, session.AwaitPubrec, "o"))
 	put(t, s, inRec(5))
-	if err := s.Delete(ctx, session.RecordKey{Dir: session.Inbound, PacketID: 5}); err != nil {
-		t.Fatal(err)
-	}
+	apply(t, s, session.Delete(session.RecordKey{Dir: session.Inbound, PacketID: 5}))
 	_, got := load(t, s)
 	if len(got) != 1 || got[0].Key.Dir != session.Outbound {
 		t.Fatalf("inbound and outbound records with the same packet ID interfere: %+v", got)
@@ -233,7 +288,7 @@ func testCopies(t *testing.T, s session.Store) {
 	copy(r.Packet, "XXXXXXXXXXX")
 	_, got := load(t, s)
 	if string(got[0].Packet) != "packet-orig" {
-		t.Fatalf("Put kept the caller's slice: %q", got[0].Packet)
+		t.Fatalf("Apply kept the caller's slice: %q", got[0].Packet)
 	}
 	copy(got[0].Packet, "YYYYYYYYYYY")
 	_, again := load(t, s)
@@ -282,17 +337,19 @@ func testConcurrent(t *testing.T, s session.Store) {
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Go(func() {
-			for i := 0; i < per; i++ {
+			for i := 0; i < per; i += 2 {
 				id := uint16(w*per + i + 1)
-				if err := s.Put(ctx, outRec(id, uint64(id), session.AwaitPuback, "c")); err != nil {
+				// Two records, one of them deleted again by the next Apply.
+				if err := s.Apply(ctx,
+					session.Put(outRec(id, uint64(id), session.AwaitPuback, "c")),
+					session.Put(outRec(id+1, uint64(id+1), session.AwaitPuback, "c")),
+				); err != nil {
 					t.Error(err)
 					return
 				}
-				if i%2 == 0 {
-					if err := s.Delete(ctx, session.RecordKey{Dir: session.Outbound, PacketID: id}); err != nil {
-						t.Error(err)
-						return
-					}
+				if err := s.Apply(ctx, session.Delete(outKey(id))); err != nil {
+					t.Error(err)
+					return
 				}
 			}
 		})
@@ -307,8 +364,8 @@ func testClosed(t *testing.T, s session.Store) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put(ctx, outRec(1, 1, session.AwaitPuback, "a")); err == nil {
-		t.Error("Put after Close succeeded")
+	if err := s.Apply(ctx, session.Put(outRec(1, 1, session.AwaitPuback, "a"))); err == nil {
+		t.Error("Apply after Close succeeded")
 	}
 	if _, _, err := s.Load(ctx); err == nil {
 		t.Error("Load after Close succeeded")
@@ -333,9 +390,7 @@ func testReopen(t *testing.T, s session.Store, reopen func(session.Store) sessio
 	if err := s.SetMeta(ctx, meta); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Delete(ctx, session.RecordKey{Dir: session.Outbound, PacketID: 9}); err != nil {
-		t.Fatal(err)
-	}
+	apply(t, s, session.Delete(outKey(9)))
 	r := reopen(s)
 	m, got := load(t, r)
 	if m != meta {

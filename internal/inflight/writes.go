@@ -39,15 +39,17 @@ type job struct {
 	op string
 	// begin, when set, starts the job, which goes on when something else
 	// calls finish: a producer that has recorded an outcome (see
-	// SettleFunc). With nil do follows; an error ends the job with it.
-	// The record's later writes wait meanwhile.
+	// SettleFunc). With nil the change follows; an error ends the job
+	// with it. The record's later writes wait meanwhile.
 	begin func(finish func(error))
-	do    func(ctx context.Context) error
+	// change is the write; nil writes nothing.
+	change *session.Change
 	// after runs with e.mu held once the job has ended, unless the
-	// session failed in between. It returns the error that fails the
-	// session: nil when the job succeeded or after has dealt with its
-	// error. Without an after, any error fails the session.
-	after func(err error) error
+	// session failed in between. It returns, optionally, then: a call to
+	// make once e.mu is released; and the error that fails the session —
+	// nil when the job succeeded or after has dealt with its error.
+	// Without an after, any error fails the session.
+	after func(err error) (then func(), failure error)
 
 	key   session.RecordKey
 	owner any // the flow the write is for; see cancelLocked
@@ -112,28 +114,17 @@ func inKey(id uint16) session.RecordKey {
 	return session.RecordKey{Dir: session.Inbound, PacketID: id}
 }
 
-// start runs jobs that queueLocked returned, each on this goroutine
-// when it may run here (see runsHere), otherwise on its own.
+// start runs the jobs queueLocked returned (see run).
 func (e *Engine) start(jobs ...*job) {
 	for _, j := range jobs {
-		switch {
-		case j == nil:
-		case e.runsHere(j):
-			e.run(j)
-		default:
-			go e.run(j)
-		}
+		e.run(j)
 	}
 }
 
-// runsHere reports whether j may start on whichever goroutine reaches
-// it: a store write when the store is in memory, and a job that begins
-// by handing something over.
-func (e *Engine) runsHere(j *job) bool { return e.inline || j.begin != nil }
-
-// run performs j, then each job queued behind it for the same record
-// that may run here. A job with a begin goes on from whoever finishes
-// it (see proceed).
+// run goes on with j, first in its record's queue, and then with the
+// jobs queued behind it: a begin on this goroutine, and a change here
+// when the store is in memory, otherwise on the store writer (see
+// writeLoop). A job with a begin goes on from whoever finishes it.
 func (e *Engine) run(j *job) {
 	for j != nil {
 		if j.begin != nil {
@@ -147,36 +138,133 @@ func (e *Engine) run(j *job) {
 			})
 			return
 		}
-		j = e.end(j, j.do(e.bg))
+		j = e.write(j)
 	}
 }
 
-// proceed goes on with j once its begin has finished with err: its do,
-// unless err ends it — on this goroutine when the store is in memory,
-// otherwise on one of its own — then the jobs queued behind it.
+// proceed goes on with j once its begin has finished with err: its
+// change, unless err ends it, then the jobs queued behind it.
 func (e *Engine) proceed(j *job, err error) {
-	switch {
-	case err != nil || j.do == nil:
+	if err != nil {
 		e.run(e.end(j, err))
+		return
+	}
+	e.run(e.write(j))
+}
+
+// write makes j's change: on this goroutine when the store is in memory,
+// returning the job queued behind it; otherwise it hands j to the store
+// writer and returns nil.
+func (e *Engine) write(j *job) *job {
+	switch {
+	case j.change == nil:
+		return e.end(j, nil)
 	case e.inline:
-		e.run(e.end(j, j.do(e.bg)))
-	default:
-		go func() { e.run(e.end(j, j.do(e.bg))) }()
+		return e.end(j, e.store.Apply(e.bg, *j.change))
+	}
+	e.mu.Lock()
+	e.due = append(e.due, j)
+	idle := !e.writing
+	e.writing = true
+	e.mu.Unlock()
+	if idle {
+		go e.writeLoop()
+	}
+	return nil
+}
+
+// Bounds on one Store.Apply, so a burst of flows registered at once
+// becomes several transactions of bounded size: the first flows go out
+// after the first commit rather than the last, and the store never
+// holds a second copy of the whole burst's packets at once.
+const (
+	maxApplyChanges = 1024
+	maxApplyBytes   = 4 << 20
+)
+
+// writeLoop is the store writer: it applies the changes that are due in
+// one Store.Apply, up to maxApplyChanges and maxApplyBytes, then those
+// that are due next, until none is left. One write of many changes costs
+// a durable store about what one change does — a transaction, an fsync —
+// so the flows that run at once share it.
+func (e *Engine) writeLoop() {
+	for {
+		e.mu.Lock()
+		if len(e.due) == 0 {
+			e.writing = false
+			e.mu.Unlock()
+			return
+		}
+		batch := nextBatch(e.due)
+		// Without spare capacity, the next append moves the rest to a new
+		// array and the old one, which holds the taken jobs, is freed.
+		e.due = e.due[len(batch):len(e.due):len(e.due)]
+		e.mu.Unlock()
+		errs := e.apply(batch)
+		for i, j := range batch {
+			e.run(e.end(j, errs[i]))
+		}
 	}
 }
 
-// end completes j with err and returns the job queued behind it when
-// that may run on this goroutine; otherwise it starts that job on its
-// own and returns nil.
+// nextBatch returns the jobs at the head of due that go in the next
+// Apply: at most maxApplyChanges, and no more packet and Ref bytes than
+// maxApplyBytes unless a single change has more on its own.
+func nextBatch(due []*job) []*job {
+	size := 0
+	for i, j := range due {
+		if i == maxApplyChanges {
+			return due[:i]
+		}
+		if r, put := j.change.Record(); put {
+			size += len(r.Packet) + len(r.Ref)
+		}
+		if size > maxApplyBytes && i > 0 {
+			return due[:i]
+		}
+	}
+	return due
+}
+
+// apply makes the changes of batch in one Store.Apply and returns each
+// job's error. When that fails, Apply being atomic, none of the changes
+// was made: each is applied again on its own, so only the jobs whose
+// change fails get an error.
+func (e *Engine) apply(batch []*job) []error {
+	errs := make([]error, len(batch))
+	changes := make([]session.Change, len(batch))
+	for i, j := range batch {
+		changes[i] = *j.change
+	}
+	err := e.store.Apply(e.bg, changes...)
+	switch {
+	case err == nil:
+	case len(changes) == 1:
+		errs[0] = err
+	default:
+		e.cfg.Logger.Warn("mqttv5: session store apply failed; applying each change on its own",
+			slog.Int("changes", len(changes)), slog.Any("error", err))
+		for i, c := range changes {
+			errs[i] = e.store.Apply(e.bg, c)
+		}
+	}
+	return errs
+}
+
+// end completes j with err and returns the job queued behind it, for the
+// caller to run.
 func (e *Engine) end(j *job, err error) *job {
 	if err != nil {
 		e.logWriteError(j.op, err)
 	}
 	e.mu.Lock()
-	var failure error
+	var (
+		failure error
+		then    func()
+	)
 	if j.epoch == e.epoch {
 		if j.after != nil {
-			failure = j.after(err)
+			then, failure = j.after(err)
 		} else if err != nil {
 			failure = &StoreError{Op: j.op, Err: err}
 		}
@@ -203,6 +291,9 @@ func (e *Engine) end(j *job, err error) *job {
 	}
 	e.mu.Unlock()
 
+	if then != nil {
+		then()
+	}
 	if first {
 		e.afterFailure(failure, dropped)
 	}
@@ -217,15 +308,7 @@ func (e *Engine) end(j *job, err error) *job {
 	if l != nil {
 		l.Wake()
 	}
-	switch {
-	case next == nil:
-		return nil
-	case e.runsHere(next):
-		return next
-	default:
-		go e.run(next)
-		return nil
-	}
+	return next
 }
 
 func (e *Engine) logWriteError(op string, err error) {
