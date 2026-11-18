@@ -855,9 +855,13 @@ nil check.
   otherwise `~`: the difference is within the noise of this run.
 - **Loopback through Docker.** On macOS the broker runs in a Linux VM;
   every round trip crosses that boundary, which sets the floor of every
-  QoS 1/2 timing. These results come from one host: on another, absolute
-  times differ, and so may the ratios between libraries, since syscall,
-  scheduler and batching costs do not scale alike.
+  QoS 1/2 timing. The `broker` line of a recording names the Docker
+  runtime (for example OrbStack or Docker Desktop); compare absolute
+  times across recordings only on the same one. Within a table every
+  library meets the same broker. These results come from one host: on
+  another, absolute times differ, and so may the ratios between
+  libraries, since syscall, scheduler and batching costs do not scale
+  alike.
 - **CPU, not only time.** When the broker limits the rate, two clients
   can show the same ns/op while one spends several times the CPU;
   `cpu-ns/op` shows that.
