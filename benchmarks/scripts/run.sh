@@ -118,7 +118,9 @@ broker() {
     if [ -n "${MQTT_BROKER:-}" ]; then
         echo "$MQTT_BROKER"
     elif docker inspect "$c" >/dev/null 2>&1; then
-        echo "$(docker inspect -f '{{.Config.Image}}' "$c") image $(docker inspect -f '{{.Image}}' "$c" | cut -c1-19)"
+        # The runtime's VM network path sets the floor of every round trip.
+        echo "$(docker inspect -f '{{.Config.Image}}' "$c") image $(docker inspect -f '{{.Image}}' "$c" | cut -c1-19)" \
+            "on $(docker info -f '{{.OperatingSystem}}, Docker {{.ServerVersion}}')"
     else
         echo none
     fi
