@@ -583,35 +583,35 @@ would measure the collector's pacing rather than the library.
 
 ### Codec
 
-<!-- benchtab file=results/2026-11-16-codec/codec.txt meta=date,commit,toolchain,host-cpu,runs,load-before,load-after -->
+<!-- benchtab file=results/2026-11-17-codec/codec.txt meta=date,commit,toolchain,host-cpu,runs,load-before,load-after -->
 
 | | |
 |---|---|
-| date | 2026-11-16T07:09:54Z |
-| commit | 989e13c76172f8350fc451edcd101276775f411d |
+| date | 2026-11-18T02:07:15Z |
+| commit | bf28c23d1cc0f396a9a6d640bfa8ae7756ff92cb |
 | toolchain | go1.27.4 |
 | host-cpu | Apple M2 Max |
 | runs | 10 |
-| load-before | 6.83 8.33 8.65 |
-| load-after | 8.79 6.66 6.68 |
+| load-before | 11.25 7.22 4.44 |
+| load-after | 6.43 5.90 5.34 |
 <!-- /benchtab -->
 
 Decode a PUBLISH, then read its properties:
 
-<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=sec/op compare=mqttv5:eclipse -->
+<!-- benchtab file=results/2026-11-17-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=sec/op compare=mqttv5:eclipse -->
 
 | props | size | eclipse | mqttv5 | mqttv5 vs eclipse |
 |---|---|---:|---:|---:|
-| none | 64B | 851.0ns ±29% | 59.26ns ±2% | -93.04% (p=0.000 n=10) |
-| none | 256B | 917.9ns ±26% | 71.22ns ±3% | -92.24% (p=0.000 n=10) |
-| none | 1KiB | 1.264µs ±22% | 94.59ns ±2% | -92.51% (p=0.000 n=10) |
-| none | 16KiB | 6.790µs ±21% | 362.4ns ±4% | -94.66% (p=0.000 n=10) |
-| five | 64B | 4.522µs ±15% | 179.8ns ±2% | -96.02% (p=0.000 n=10) |
-| five | 256B | 4.608µs ±20% | 188.3ns ±2% | -95.91% (p=0.000 n=10) |
-| five | 1KiB | 4.852µs ±9% | 209.9ns ±4% | -95.67% (p=0.000 n=10) |
-| five | 16KiB | 10.85µs ±10% | 473.6ns ±2% | -95.63% (p=0.000 n=10) |
+| none | 64B | 996.5ns ±4% | 61.18ns ±5% | -93.86% (p=0.000 n=10) |
+| none | 256B | 1.141µs ±11% | 72.71ns ±3% | -93.63% (p=0.000 n=10) |
+| none | 1KiB | 1.389µs ±18% | 96.27ns ±5% | -93.07% (p=0.000 n=10) |
+| none | 16KiB | 6.892µs ±25% | 368.9ns ±4% | -94.65% (p=0.000 n=10) |
+| five | 64B | 5.100µs ±8% | 184.1ns ±2% | -96.39% (p=0.000 n=10) |
+| five | 256B | 5.223µs ±20% | 189.4ns ±2% | -96.37% (p=0.000 n=10) |
+| five | 1KiB | 5.578µs ±10% | 213.9ns ±4% | -96.17% (p=0.000 n=10) |
+| five | 16KiB | 11.46µs ±29% | 475.5ns ±4% | -95.85% (p=0.000 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-18 at bf28c23d1cc0.</sub>
 <!-- /benchtab -->
 
 Encode a QoS 1 PUBLISH and write it. mqttv5 has three encoders, and
@@ -623,20 +623,20 @@ which one a publish uses depends on its path through the client:
 | pooled (`EncodePublish`) | copied into a pooled buffer | every other QoS 0 publish, queued for the writer goroutine; the caller may reuse its payload before the write |
 | owned (`MarshalPublish`) | copied into a buffer of its own | every QoS 1/2 publish: the session keeps the packet to send again until the broker acknowledges it |
 
-<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=sec/op compare=mqttv5-header:eclipse,mqttv5-pooled:eclipse,mqttv5-owned:eclipse -->
+<!-- benchtab file=results/2026-11-17-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=sec/op compare=mqttv5-header:eclipse,mqttv5-pooled:eclipse,mqttv5-owned:eclipse -->
 
 | props | size | eclipse | mqttv5-header | mqttv5-pooled | mqttv5-owned | mqttv5-header vs eclipse | mqttv5-pooled vs eclipse | mqttv5-owned vs eclipse |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| none | 64B | 166.1ns ±5% | 67.71ns ±6% | 68.79ns ±6% | 74.44ns ±18% | -59.22% (p=0.000 n=10) | -58.57% (p=0.000 n=10) | -55.17% (p=0.000 n=10) |
-| none | 256B | 163.0ns ±13% | 67.78ns ±3% | 73.11ns ±3% | 95.29ns ±21% | -58.40% (p=0.000 n=10) | -55.14% (p=0.000 n=10) | -41.52% (p=0.000 n=10) |
-| none | 1KiB | 161.2ns ±6% | 67.60ns ±5% | 83.82ns ±3% | 179.8ns ±13% | -58.08% (p=0.000 n=10) | -48.02% (p=0.000 n=10) | +11.50% (p=0.000 n=10) |
-| none | 16KiB | 162.3ns ±8% | 68.52ns ±2% | 300.6ns ±4% | 1.621µs ±8% | -57.78% (p=0.000 n=10) | +85.21% (p=0.000 n=10) | +898.77% (p=0.000 n=10) |
-| five | 64B | 372.1ns ±5% | 161.1ns ±9% | 163.0ns ±3% | 186.0ns ±3% | -56.72% (p=0.000 n=10) | -56.19% (p=0.000 n=10) | -50.00% (p=0.000 n=10) |
-| five | 256B | 359.5ns ±4% | 159.0ns ±1% | 165.1ns ±2% | 195.5ns ±12% | -55.77% (p=0.000 n=10) | -54.08% (p=0.000 n=10) | -45.62% (p=0.000 n=10) |
-| five | 1KiB | 361.9ns ±7% | 158.9ns ±2% | 176.5ns ±3% | 278.0ns ±2% | -56.09% (p=0.000 n=10) | -51.23% (p=0.000 n=10) | -23.18% (p=0.000 n=10) |
-| five | 16KiB | 366.4ns ±18% | 159.9ns ±3% | 406.1ns ±3% | 1.641µs ±4% | -56.37% (p=0.000 n=10) | ~ (p=0.105 n=10) | +347.73% (p=0.000 n=10) |
+| none | 64B | 175.5ns ±7% | 69.65ns ±4% | 68.99ns ±3% | 77.97ns ±5% | -60.32% (p=0.000 n=10) | -60.70% (p=0.000 n=10) | -55.59% (p=0.000 n=10) |
+| none | 256B | 169.5ns ±6% | 68.29ns ±11% | 73.50ns ±5% | 98.25ns ±5% | -59.72% (p=0.000 n=10) | -56.65% (p=0.000 n=10) | -42.05% (p=0.000 n=10) |
+| none | 1KiB | 164.8ns ±8% | 68.56ns ±3% | 84.58ns ±3% | 186.6ns ±20% | -58.40% (p=0.000 n=10) | -48.68% (p=0.000 n=10) | +13.20% (p=0.000 n=10) |
+| none | 16KiB | 170.9ns ±7% | 70.05ns ±2% | 312.8ns ±10% | 1.671µs ±20% | -59.00% (p=0.000 n=10) | +83.06% (p=0.000 n=10) | +878.05% (p=0.000 n=10) |
+| five | 64B | 390.4ns ±7% | 163.7ns ±3% | 163.2ns ±5% | 190.1ns ±3% | -58.07% (p=0.000 n=10) | -58.21% (p=0.000 n=10) | -51.31% (p=0.000 n=10) |
+| five | 256B | 382.0ns ±5% | 163.4ns ±12% | 169.2ns ±2% | 201.8ns ±3% | -57.21% (p=0.000 n=10) | -55.71% (p=0.000 n=10) | -47.17% (p=0.000 n=10) |
+| five | 1KiB | 390.1ns ±4% | 162.2ns ±3% | 180.0ns ±2% | 289.0ns ±18% | -58.42% (p=0.000 n=10) | -53.86% (p=0.000 n=10) | -25.91% (p=0.000 n=10) |
+| five | 16KiB | 379.6ns ±6% | 163.7ns ±12% | 408.8ns ±2% | 1.743µs ±5% | -56.87% (p=0.000 n=10) | +7.72% (p=0.002 n=10) | +359.10% (p=0.000 n=10) |
 
-<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-16 at 989e13c76172.</sub>
+<sub>sec/op: median of 10 runs ±95% CI; changes where p < 0.05 (Mann-Whitney U), ~ otherwise; recorded 2026-11-18 at bf28c23d1cc0.</sub>
 <!-- /benchtab -->
 
 Neither Eclipse's encoder nor mqttv5's header encoder touches the
@@ -701,7 +701,7 @@ under and how to read them, are in the [results above](#results).
 Allocations to decode one PUBLISH from a stream (`props=five`: a
 content type and five user properties), then read its properties:
 
-<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-17-codec/codec.txt filter=".name:DecodePublishRead" rows=props,size cols=lib unit=allocs/op -->
 
 | props | size | eclipse | mqttv5 |
 |---|---|---:|---:|
@@ -714,7 +714,7 @@ content type and five user properties), then read its properties:
 | five | 1KiB | 95 | 0 |
 | five | 16KiB | 103 | 0 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-18 at bf28c23d1cc0.</sub>
 <!-- /benchtab -->
 
 Allocations to encode one PUBLISH and write it, with each of mqttv5's
@@ -725,7 +725,7 @@ goroutine), and `mqttv5-owned` copies it into a buffer of its own that
 the session keeps for retransmission (every QoS 1/2 publish). See the
 [codec section](#codec):
 
-<!-- benchtab file=results/2026-11-16-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=allocs/op -->
+<!-- benchtab file=results/2026-11-17-codec/codec.txt filter=".name:EncodePublish" rows=props,size cols=lib unit=allocs/op -->
 
 | props | size | eclipse | mqttv5-header | mqttv5-pooled | mqttv5-owned |
 |---|---|---:|---:|---:|---:|
@@ -738,7 +738,7 @@ the session keeps for retransmission (every QoS 1/2 publish). See the
 | five | 1KiB | 12 | 0 | 0 | 1 |
 | five | 16KiB | 12 | 0 | 0 | 1 |
 
-<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-16 at 989e13c76172.</sub>
+<sub>allocs/op: median of 10 runs ±95% CI; recorded 2026-11-18 at bf28c23d1cc0.</sub>
 <!-- /benchtab -->
 
 ### Publish allocations
