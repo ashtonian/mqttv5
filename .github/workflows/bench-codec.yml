@@ -59,7 +59,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@439da8bdc22311fff2f04371ca9cd9c3233ee7d0 # v1.6.2
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
