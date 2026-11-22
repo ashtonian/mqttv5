@@ -1,10 +1,11 @@
 name: bench-codec
 
-# Codec micro-benchmarks: fast, deterministic, run on every push to
-# main and every PR that touches the codec or its consumers. Results
-# are persisted to the gh-pages branch and rendered as a live chart at
+# Codec micro-benchmarks on every push to main and every PR that touches
+# the codec or its consumers. A push records the full sweep in the
+# history on the gh-pages branch, rendered as a live chart at
 # https://<owner>.github.io/<repo>/dev/bench/ — see benchmarks/README.md
-# for the dashboard URL and the one-time GH Pages enablement step.
+# for the dashboard URL and the one-time GH Pages enablement step. A PR
+# runs one short sample per benchmark for the comparison comment.
 #
 # The end-to-end benchmarks vs autopaho live in bench.yml and stay
 # manual (workflow_dispatch) because they're slow, need mosquitto, and
@@ -40,9 +41,9 @@ permissions:
   pull-requests: write  # post comparison comments on PRs
 
 env:
-  # The oldest Go minor go.mod accepts, at its newest patch: what a
-  # supported user builds with, standard-library security fixes included.
-  # govulncheck checks the standard library of the Go that runs it.
+  # The oldest Go minor go.mod accepts, at the newest patch the runner's tool
+  # cache holds (setup-go downloads only when it holds none): the runner image
+  # tracks Go patch releases.
   GO_VERSION: '1.27.x'
 
 jobs:
@@ -59,19 +60,23 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
           cache-dependency-path: benchmarks/go.sum
 
       - name: run codec benchmarks
-        # -count=5 over a 2s benchtime gives benchmark-action stable
-        # medians without taking forever; codec benches are < 1 µs/op
-        # so the whole sweep runs in ~30 s on a GH ubuntu runner.
+        # The history takes five 2 s samples per benchmark for stable
+        # medians: about 15 minutes on arc-mqttv5. A PR takes one 500 ms
+        # sample, a twentieth of the benchmark time, which is enough for
+        # the comment to flag a 1.5x regression; the push that merges it
+        # records the full sweep.
+        env:
+          BENCH_FLAGS: ${{ github.event_name == 'push' && '-benchtime=2s -count=5' || '-benchtime=500ms -count=1' }}
         run: |
+          read -r -a flags <<<"$BENCH_FLAGS"
           go test -bench='^Benchmark(Decode|Encode)' -run=^$ -benchmem \
-            -benchtime=2s -count=5 ./... | tee bench.out
+            "${flags[@]}" ./... | tee bench.out
         working-directory: benchmarks
 
       - name: check for benchmark history

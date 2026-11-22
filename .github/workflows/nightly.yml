@@ -9,6 +9,11 @@ name: nightly
 #     transport) and HiveMQ CE,
 #     with the strict-limit tests against a HiveMQ that announces tight
 #     CONNACK limits, and a ten-minute connection-cut soak per broker.
+#
+# The models run every night: their seeds change. The broker suite runs
+# only when it has something new to check: a scheduled run skips it when
+# it already passed on the same commit (go-ci-actions already-passed).
+# A manual run always runs it.
 
 on:
   schedule:
@@ -29,12 +34,26 @@ concurrency:
 
 env:
   CI_ARTIFACT_ENDPOINT: ${{ secrets.CI_ARTIFACT_ENDPOINT }}
-  # The oldest Go minor go.mod accepts, at its newest patch: what a
-  # supported user builds with, standard-library security fixes included.
-  # govulncheck checks the standard library of the Go that runs it.
+  # The oldest Go minor go.mod accepts, at the newest patch the runner's tool
+  # cache holds (setup-go downloads only when it holds none): the runner image
+  # tracks Go patch releases.
   GO_VERSION: '1.27.x'
 
 jobs:
+  history:
+    name: broker suite already passed on this commit
+    if: github.event_name == 'schedule' && github.actor_id == '4212452'
+    permissions:
+      actions: read
+    runs-on: arc-mqttv5
+    timeout-minutes: 5
+    outputs:
+      passed: ${{ steps.conformance.outputs.passed }}
+    steps:
+      - id: conformance
+        uses: ashtonian/go-ci-actions/already-passed@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
+        with:
+          jobs: conformance
   models:
     name: model-based tests
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
@@ -48,10 +67,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
 
       - name: seed base for tonight
         run: |
@@ -68,7 +86,9 @@ jobs:
         run: MQTTV5_SEED_BASE=$BASE MQTTV5_SEEDS=2000 go test -race -count=1 -timeout 60m -run '^TestSubscriptionModel$' .
   conformance:
     name: conformance (${{ matrix.broker.name }})
-    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: history
+    # !cancelled() runs the suite when history is skipped, as on a manual run.
+    if: ${{ !cancelled() && needs.history.outputs.passed != 'true' && github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository)) }}
     permissions:
       contents: read
       id-token: write
@@ -92,11 +112,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
           cache-dependency-path: conformance/go.sum
 
       - name: start brokers
@@ -141,7 +160,7 @@ jobs:
             | xargs docker inspect --format '{{.Name}} {{.State.Status}} exit={{.State.ExitCode}} oom-killed={{.State.OOMKilled}}'
           docker compose -f conformance/docker-compose.yml --profile hivemq logs --no-color
 
-      - uses: ashtonian/go-ci-actions/upload-artifact@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions/upload-artifact@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         if: always()
         with:
           name: broker-memory-${{ matrix.broker.name }}

@@ -4,6 +4,11 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # The full, unscoped run; it does nothing when master has not moved since
+  # the last green one (go-ci-actions scope).
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -13,156 +18,181 @@ permissions:
   contents: read
 
 env:
-  # The oldest Go minor go.mod accepts, at its newest patch: what a
-  # supported user builds with, standard-library security fixes included.
-  # govulncheck checks the standard library of the Go that runs it.
+  CI_ARTIFACT_ENDPOINT: ${{ secrets.CI_ARTIFACT_ENDPOINT }}
+  # The oldest Go minor go.mod accepts. Lint and tests take the newest patch
+  # the runner's tool cache holds; the vulnerability scan resolves the newest
+  # released patch (see the build job).
   GO_VERSION: '1.27.x'
   GOLANGCI_LINT_VERSION: v2.15.0
   GOVULNCHECK_VERSION: v1.8.0
 
+# The scope job decides which jobs a change needs and which packages they
+# check: the changed packages and every package that depends on them, across
+# the modules go.work uses (go-ci-actions scope). A pull request is measured
+# from its base, a push from the last green run on master, and the push that
+# merges a pull request skips the jobs that pull request passed on the same
+# tree (go-ci-actions acceptance). The nightly schedule, a manual run and the
+# full-ci label check everything.
 jobs:
-  lint:
-    name: lint (${{ matrix.module }})
+  scope:
+    name: scope
     if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
     permissions:
       contents: read
+      actions: read
       id-token: write
     runs-on: arc-mqttv5
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - .
-          - codec/json
-          - codec/msgpack
-          - store/file
-          - queue/file
-          - internal/filedb
-          - transport/ws
-          - transport/quic
-          - tlsrevocation
-          - examples
-          - conformance
-          - benchmarks
+    timeout-minutes: 10
+    outputs:
+      jobs: ${{ steps.accepted.outputs.remaining || steps.scope.outputs.jobs }}
+      wide-jobs: ${{ steps.scope.outputs.wide-jobs }}
+      go-packages: ${{ steps.scope.outputs.go-packages }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      # Go loads the package graph.
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
-          workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache-dependency-path: ${{ matrix.module }}/go.sum
-
+      # Tests read docs/*.md, README.md and CONTRIBUTING.md from the root
+      # package and examples/readme (go-owners). The conformance suite reads
+      # its PKI and broker configuration from conformance/.
+      - id: scope
+        uses: ashtonian/go-ci-actions/scope@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
+        with:
+          jobs: |
+            {
+              "lint": {"paths": [".golangci.yml"], "go": ["./..."]},
+              "test": {"paths": ["scripts/test-module.sh", "scripts/untagged-packages.sh"], "go": ["./..."]},
+              "build": {"paths": ["scripts/build-module.sh", "scripts/untagged-packages.sh"], "go": ["./..."]},
+              "conformance": {"go": ["./conformance/...", "./examples/..."]}
+            }
+          shared: |
+            .github/workflows/ci.yml
+            .github/workflows/conformance.yml
+            scripts/each-module.sh
+          go-tags: conformance e2e smoke
+          go-owners: |
+            {
+              "docs/*.md": [".", "./examples/readme"],
+              "README.md": ["./examples/readme"],
+              "CONTRIBUTING.md": ["."],
+              "conformance/**": ["./conformance"]
+            }
+          go-ignore: |
+            .github/**
+            .gitignore
+            .golangci.yml
+            LICENSE
+            Makefile
+            scripts/**
+            benchmarks/broker/**
+            benchmarks/scripts/**
+      - id: accepted
+        if: github.event_name == 'push'
+        uses: ashtonian/go-ci-actions/acceptance@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
+        with:
+          mode: verify
+          required: ${{ steps.scope.outputs.jobs }}
+          variables: ${{ toJSON(vars) }}
+  lint:
+    name: lint (affected modules)
+    needs: scope
+    if: contains(needs.scope.outputs.jobs, '"lint"')
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: arc-mqttv5
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
-          working-directory: ${{ matrix.module }}
+          install-only: true
+      - name: golangci-lint the affected packages
+        env:
+          GO_PACKAGES: ${{ contains(needs.scope.outputs.wide-jobs, '"lint"') && 'all' || needs.scope.outputs.go-packages }}
+        run: scripts/each-module.sh golangci-lint run
   test:
-    name: tidy, vet and test (${{ matrix.module }})
-    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    name: tidy, vet and test (affected modules)
+    needs: scope
+    if: contains(needs.scope.outputs.jobs, '"test"')
     permissions:
       contents: read
       id-token: write
     runs-on: arc-mqttv5
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - .
-          - codec/json
-          - codec/msgpack
-          - store/file
-          - queue/file
-          - internal/filedb
-          - transport/ws
-          - transport/quic
-          - tlsrevocation
-          - examples
-          - benchmarks
-          - conformance
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
-          workload: ${{ toJSON(matrix) }}
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache-dependency-path: ${{ matrix.module }}/go.sum
-
-      - name: Verify module dependencies
-        working-directory: ${{ matrix.module }}
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-      - name: Vet untagged packages
-        if: matrix.module != 'conformance'
-        working-directory: ${{ matrix.module }}
-        run: go vet ./...
-      - name: Vet tagged packages
-        working-directory: ${{ matrix.module }}
-        run: go vet -tags 'conformance e2e smoke' ./...
-      - name: go test -race
-        if: matrix.module != 'conformance'
-        run: go test -race -v -timeout 5m -count=1 -coverprofile=coverage.out ./...
-        working-directory: ${{ matrix.module }}
-
-      # Informational, not a gate.
-      - name: coverage summary
-        if: always() && matrix.module != 'conformance'
-        run: |
-          if [ -f coverage.out ]; then
-            echo "### Coverage (${{ matrix.module }}): $(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')" >> "$GITHUB_STEP_SUMMARY"
-          fi
-        working-directory: ${{ matrix.module }}
+      - name: Tidy, vet and race-test the affected packages
+        env:
+          GO_PACKAGES: ${{ contains(needs.scope.outputs.wide-jobs, '"test"') && 'all' || needs.scope.outputs.go-packages }}
+        run: scripts/each-module.sh "$PWD/scripts/test-module.sh"
   build:
-    name: build
-    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
+    name: build and vulnerability scan (affected modules)
+    needs: scope
+    if: contains(needs.scope.outputs.jobs, '"build"')
     permissions:
       contents: read
       id-token: write
     runs-on: arc-mqttv5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-
-      - name: build core
-        run: go build ./...
-
-      - name: build examples
-        run: go build ./...
-        working-directory: examples
-  vuln:
-    name: vulnerability scans (all modules)
-    if: github.actor_id == '4212452' && (github.event_name != 'pull_request' || (github.event.pull_request.user.id == 4212452 && github.event.pull_request.head.repo.full_name == github.repository))
-    permissions:
-      contents: read
-      id-token: write
-    runs-on: arc-mqttv5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      # govulncheck checks the standard library of the Go that runs it, so
+      # this job resolves the newest released patch, what a supported user
+      # builds with, rather than the one the runner image carries.
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
-      - name: Scan every module
-        run: |
-          for module in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws transport/quic tlsrevocation examples conformance benchmarks; do
-            echo "Scanning $module"
-            (cd "$module" && govulncheck ./...)
-          done
+      - name: Build and scan the affected packages
+        env:
+          GO_PACKAGES: ${{ contains(needs.scope.outputs.wide-jobs, '"build"') && 'all' || needs.scope.outputs.go-packages }}
+        run: scripts/each-module.sh "$PWD/scripts/build-module.sh"
+  # The release gate calls the same workflow. It runs the whole broker suite
+  # and every example whenever one of their packages is affected.
+  conformance:
+    name: conformance
+    needs: scope
+    if: contains(needs.scope.outputs.jobs, '"conformance"')
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/conformance.yml
+  accepted:
+    name: record validation
+    needs: [scope, lint, test, build, conformance]
+    # When no selected job failed. The status check must be explicit: with
+    # the default success(), a job the scope skipped would skip this one.
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && needs.scope.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: arc-mqttv5
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ashtonian/go-ci-actions/acceptance@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
+        with:
+          mode: record
+          results: ${{ toJSON(needs) }}
+          variables: ${{ toJSON(vars) }}

@@ -1,23 +1,17 @@
 name: conformance
 
+# Called by ci.yml on every push and pull request, and by the release gate on
+# the tagged commit. The caller owns concurrency.
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-  # The release gate runs this workflow on the tagged commit.
   workflow_call:
-
-concurrency:
-  group: conformance-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 env:
-  # The oldest Go minor go.mod accepts, at its newest patch: what a
-  # supported user builds with, standard-library security fixes included.
-  # govulncheck checks the standard library of the Go that runs it.
+  # The oldest Go minor go.mod accepts, at the newest patch the runner's tool
+  # cache holds (setup-go downloads only when it holds none): the runner image
+  # tracks Go patch releases.
   GO_VERSION: '1.27.x'
 
 jobs:
@@ -33,10 +27,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
           cache-dependency-path: conformance/go.sum
 
       # --wait returns once every broker's healthcheck passes. A port that
