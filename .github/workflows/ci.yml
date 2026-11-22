@@ -44,7 +44,7 @@ jobs:
     runs-on: arc-mqttv5
     timeout-minutes: 10
     outputs:
-      jobs: ${{ steps.accepted.outputs.reused == 'true' && '[]' || steps.scope.outputs.jobs }}
+      jobs: ${{ steps.accepted.outputs.remaining || steps.scope.outputs.jobs }}
       wide-jobs: ${{ steps.scope.outputs.wide-jobs }}
       go-packages: ${{ steps.scope.outputs.go-packages }}
     steps:
