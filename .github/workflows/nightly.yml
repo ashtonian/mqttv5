@@ -92,7 +92,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    runs-on: arc-mqttv5
+    # Every leg starts the whole broker stack, up to 13.3Gi (home-ops-private#727).
+    runs-on: arc-mqttv5-large
     timeout-minutes: 60
     strategy:
       fail-fast: false

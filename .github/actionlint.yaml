@@ -1,3 +1,4 @@
 self-hosted-runner:
   labels:
     - arc-mqttv5
+    - arc-mqttv5-large
