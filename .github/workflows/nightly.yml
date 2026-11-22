@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CI_ARTIFACT_ENDPOINT: ${{ vars.CI_ARTIFACT_ENDPOINT }}
+  CI_ARTIFACT_ENDPOINT: ${{ secrets.CI_ARTIFACT_ENDPOINT }}
   # The oldest Go minor go.mod accepts, at its newest patch: what a
   # supported user builds with, standard-library security fixes included.
   # govulncheck checks the standard library of the Go that runs it.
