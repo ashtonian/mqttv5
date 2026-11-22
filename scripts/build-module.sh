@@ -8,7 +8,7 @@ scripts=$(cd "$(dirname "$0")" && pwd -P)
 untagged=()
 while IFS= read -r package; do
     untagged+=("$package")
-done < <("$scripts/untagged-packages.sh" "${@:-./...}")
+done < <("$scripts/untagged-packages.sh" --buildable "${@:-./...}")
 if ((${#untagged[@]} == 0)); then
     exit 0
 fi
