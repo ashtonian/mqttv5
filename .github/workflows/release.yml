@@ -10,9 +10,9 @@ permissions:
   contents: read
 
 env:
-  # The oldest Go minor go.mod accepts, at its newest patch: what a
-  # supported user builds with, standard-library security fixes included.
-  # govulncheck checks the standard library of the Go that runs it.
+  # The oldest Go minor go.mod accepts, at the newest patch the runner's tool
+  # cache holds (setup-go downloads only when it holds none): the runner image
+  # tracks Go patch releases.
   GO_VERSION: '1.27.x'
 
 jobs:
@@ -28,18 +28,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@4425a5fdd39bd4f2fba5be7ee71314b145a6e591 # v1.8.0 candidate (go-ci-actions#18)
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
 
-      - name: go vet and go test -race (every module)
-        run: |
-          for m in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws transport/quic tlsrevocation examples benchmarks; do
-            echo "::group::$m"
-            (cd "$m" && go vet ./... && go test -race -timeout 5m -count=1 ./...) || exit 1
-            echo "::endgroup::"
-          done
+      # The checks ci.yml runs, on the tagged commit.
+      - name: Tidy, vet and race-test every module
+        run: scripts/each-module.sh "$PWD/scripts/test-module.sh"
   # The same workflow every push runs, so the release gate cannot drift
   # from it.
   conformance:
@@ -63,10 +58,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@4425a5fdd39bd4f2fba5be7ee71314b145a6e591 # v1.8.0 candidate (go-ci-actions#18)
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
 
       - name: go get every released module in a module outside the repository
         run: scripts/verify-release.sh "${GITHUB_REF_NAME}"

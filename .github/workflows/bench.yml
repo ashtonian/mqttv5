@@ -26,9 +26,9 @@ permissions:
 
 env:
   CI_ARTIFACT_ENDPOINT: ${{ secrets.CI_ARTIFACT_ENDPOINT }}
-  # The oldest Go minor go.mod accepts, at its newest patch: what a
-  # supported user builds with, standard-library security fixes included.
-  # govulncheck checks the standard library of the Go that runs it.
+  # The oldest Go minor go.mod accepts, at the newest patch the runner's tool
+  # cache holds (setup-go downloads only when it holds none): the runner image
+  # tracks Go patch releases.
   GO_VERSION: '1.27.x'
 
 jobs:
@@ -44,10 +44,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ashtonian/go-ci-actions@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions@4425a5fdd39bd4f2fba5be7ee71314b145a6e591 # v1.8.0 candidate (go-ci-actions#18)
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
           cache-dependency-path: benchmarks/go.sum
 
       - name: start the benchmark broker
@@ -69,7 +68,7 @@ jobs:
             -bench '^BenchmarkE2E_SlowConsumer$' -benchtime 200000x -timeout 1h
         working-directory: benchmarks
 
-      - uses: ashtonian/go-ci-actions/upload-artifact@fd722a57af04549dc44eeb876c53c72da97d7faf # v1.5.0
+      - uses: ashtonian/go-ci-actions/upload-artifact@4425a5fdd39bd4f2fba5be7ee71314b145a6e591 # v1.8.0 candidate (go-ci-actions#18)
         if: always()
         with:
           name: e2e-bench-${{ github.run_id }}

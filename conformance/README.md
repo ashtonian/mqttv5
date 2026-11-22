@@ -149,14 +149,15 @@ docker compose -f conformance/docker-compose.yml --profile hivemq up -d --wait
 MQTT_BROKER=mqtt://127.0.0.1:1886 go -C conformance test -tags conformance -race ./...
 ```
 
-CI runs the suite against mosquitto, and every example, on every push
-and pull request (`.github/workflows/conformance.yml`). The release
-workflow calls that same workflow on the tagged commit before it
-publishes the GitHub release. A nightly
-job (`.github/workflows/nightly.yml`) runs it against mosquitto, EMQX
-(over `mqtt://`, `mqtts://`, `ws://`, `wss://` and QUIC) and HiveMQ, the
-strict-limit tests, a ten-minute soak per broker over plain MQTT, and the
-model-based tests with a million new seeds.
+CI runs the suite against mosquitto, and every example, on every pull
+request and every push (`.github/workflows/conformance.yml`, called by
+`ci.yml`); the push that merges a pull request reuses that pull request's
+run when the tree is the same. The release workflow calls the same
+workflow on the tagged commit before it publishes the GitHub release. A
+nightly job (`.github/workflows/nightly.yml`) runs it against mosquitto,
+EMQX (over `mqtt://`, `mqtts://`, `ws://`, `wss://` and QUIC) and
+HiveMQ, the strict-limit tests, a ten-minute soak per broker over plain
+MQTT, and the model-based tests with a million new seeds.
 
 ## External dependencies
 

@@ -3,6 +3,7 @@
 [Documentation](docs/README.md) · [API reference](https://pkg.go.dev/github.com/ashtonian/mqttv5) · [Examples](examples/README.md)
 
 - [Build and test](#build-and-test)
+- [Continuous integration](#continuous-integration)
 - [Documentation checks](#documentation-checks)
 - [Independence](#independence)
 
@@ -17,10 +18,9 @@ map. Run the commands below from the repository root.
 # Core — no broker required.
 go test -race ./...
 
-# Every module (each has its own go.mod).
-for m in . codec/json codec/msgpack store/file queue/file internal/filedb transport/ws transport/quic tlsrevocation examples benchmarks; do
-    (cd $m && go vet ./... && go test -race ./...)
-done
+# Every module go.work uses (each has its own go.mod): tidy, vet with and
+# without the test build tags, and race tests, exactly as CI runs them.
+scripts/each-module.sh "$PWD/scripts/test-module.sh"
 
 # Conformance against mosquitto and EMQX (add `--profile hivemq` for
 # HiveMQ CE; see conformance/README.md), then every example run against
@@ -34,6 +34,27 @@ docker compose -f benchmarks/docker-compose.yml up -d --wait
 benchmarks/scripts/run.sh e2e . -tags e2e -run '^$' -bench '^BenchmarkE2E_' -benchmem -timeout 3h
 go -C benchmarks run ./cmd/benchtab README.md ../README.md
 ```
+
+## Continuous integration
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `ci.yml` | every pull request and push to `master` | Three jobs over every module go.work uses (`scripts/each-module.sh`): golangci-lint; tidy, vet and race tests (`scripts/test-module.sh`); build and govulncheck. A fourth calls `conformance.yml`. |
+| `conformance.yml` | called by `ci.yml` and `release.yml` | The broker suite against mosquitto, then every example. |
+| `bench-codec.yml` | pull requests and pushes that touch `wire/` or the codec benchmarks | One short sample per benchmark on a pull request; the full sweep, recorded in the `gh-pages` history, on a push. See [benchmarks/README.md](benchmarks/README.md#in-ci). |
+| `nightly.yml` | 02:41 UTC, and by hand | The model-based tests with new seeds, and the full broker suite and soak. See [conformance/README.md](conformance/README.md). |
+| `release.yml` | a `v*` tag | The `ci.yml` module checks and `conformance.yml` on the tag, a proxy install check, then the GitHub release. |
+
+A pull request's `ci` run ends with `record validation`, which stores a
+receipt of the tested merge commit's tree
+([go-ci-actions acceptance](https://github.com/ashtonian/go-ci-actions#push-acceptance)).
+The push that merges it starts with `reuse pull request validation`: when
+the merge commit has that tree and the pull request run passed within
+six hours, the lint, test, build and conformance jobs are skipped, and the
+job summary links the run they passed in. A squash or rebase merge, a
+direct push, a re-run or a stale pull request run executes them all; the
+job's `reason` output says which. Jobs pin the Go minor (`1.27.x`) and take
+the newest patch the runner image carries.
 
 ## Documentation checks
 
