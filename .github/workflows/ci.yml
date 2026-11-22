@@ -52,14 +52,14 @@ jobs:
         with:
           persist-credentials: false
       # Go loads the package graph.
-      - uses: ashtonian/go-ci-actions@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
       # Tests read docs/*.md, README.md and CONTRIBUTING.md from the root
       # package and examples/readme (go-owners). The conformance suite reads
       # its PKI and broker configuration from conformance/.
       - id: scope
-        uses: ashtonian/go-ci-actions/scope@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+        uses: ashtonian/go-ci-actions/scope@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           jobs: |
             {
@@ -91,7 +91,7 @@ jobs:
             benchmarks/scripts/**
       - id: accepted
         if: github.event_name == 'push'
-        uses: ashtonian/go-ci-actions/acceptance@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+        uses: ashtonian/go-ci-actions/acceptance@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           mode: verify
           required: ${{ steps.scope.outputs.jobs }}
@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ashtonian/go-ci-actions@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -133,7 +133,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ashtonian/go-ci-actions@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: Tidy, vet and race-test the affected packages
@@ -156,7 +156,7 @@ jobs:
       # govulncheck checks the standard library of the Go that runs it, so
       # this job resolves the newest released patch, what a supported user
       # builds with, rather than the one the runner image carries.
-      - uses: ashtonian/go-ci-actions@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+      - uses: ashtonian/go-ci-actions@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ashtonian/go-ci-actions/acceptance@4404b5c0617f86383381bd07ca8a72eeb11863df # v1.10.0
+      - uses: ashtonian/go-ci-actions/acceptance@08c90cf92313762d7c2a1d85f665403ee3f53c0f # v1.8.0
         with:
           mode: record
           results: ${{ toJSON(needs) }}
