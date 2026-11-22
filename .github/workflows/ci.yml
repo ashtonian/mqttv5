@@ -95,7 +95,6 @@ jobs:
         with:
           mode: verify
           required: ${{ steps.scope.outputs.jobs }}
-          base: ${{ steps.scope.outputs.base }}
           variables: ${{ toJSON(vars) }}
   lint:
     name: lint (affected modules)
