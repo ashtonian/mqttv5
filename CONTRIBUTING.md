@@ -74,10 +74,10 @@ decides which jobs a change needs and which packages they check.
   passed
   ([go-ci-actions acceptance](https://github.com/ashtonian/go-ci-actions#push-acceptance)).
   When the merge commit has that tree, the pull request run passed within
-  six hours and the commit it merges onto has a green `ci` run, the push
-  skips each job of its own scope that passed in the pull request and runs
-  the rest. A red parent, a squash or rebase merge, a direct push, a re-run
-  or a stale pull request run runs its scoped jobs instead. The scope
+  six hours and the commit its scope is measured from (the last green `ci`
+  run) is green, the push skips each job of its own scope that passed in the
+  pull request and runs the rest. A squash or rebase merge, a direct push, a
+  re-run or a stale pull request run runs its scoped jobs instead. The scope
   job's log names the reason for each decision.
 
 The scope's configuration lives in `ci.yml`, in the `scope` step's inputs.
