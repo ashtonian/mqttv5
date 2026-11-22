@@ -979,7 +979,10 @@ with 100 cut-and-recover cycles; the others adapt the iteration count to
   [github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark):
   a chart per benchmark at `https://<owner>.github.io/<repo>/dev/bench/`
   and a comment on each pull request, flagged when a benchmark is 1.5×
-  slower than the last entry on `master`. A regression never fails the
+  slower than the last entry on `master`. A push to `master` records five
+  2 s samples per benchmark (about 15 minutes); a pull request runs one
+  500 ms sample, a twentieth of that benchmark time, for the comment, so
+  its numbers are noisier than the history they are compared with. A regression never fails the
   build: shared runners are too noisy for that. The history lives on the
   `gh-pages` branch, which has to exist before the first run; until it
   does, the workflow runs the benchmarks and says they are not tracked.
