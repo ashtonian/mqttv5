@@ -156,8 +156,11 @@ run when the tree is the same. The release workflow calls the same
 workflow on the tagged commit before it publishes the GitHub release. A
 nightly job (`.github/workflows/nightly.yml`) runs it against mosquitto,
 EMQX (over `mqtt://`, `mqtts://`, `ws://`, `wss://` and QUIC) and
-HiveMQ, the strict-limit tests, a ten-minute soak per broker over plain
-MQTT, and the model-based tests with a million new seeds.
+HiveMQ, the strict-limit tests and a ten-minute soak per broker over
+plain MQTT, unless it already passed on the same commit in an earlier
+nightly; the model-based tests run every night with a million new seeds.
+Run the nightly by hand (`gh workflow run nightly.yml`) to repeat the
+suite on an unchanged commit.
 
 ## External dependencies
 

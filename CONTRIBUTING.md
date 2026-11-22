@@ -42,7 +42,7 @@ go -C benchmarks run ./cmd/benchtab README.md ../README.md
 | `ci.yml` | every pull request and push to `master` | Three jobs over every module go.work uses (`scripts/each-module.sh`): golangci-lint; tidy, vet and race tests (`scripts/test-module.sh`); build and govulncheck. A fourth calls `conformance.yml`. |
 | `conformance.yml` | called by `ci.yml` and `release.yml` | The broker suite against mosquitto, then every example. |
 | `bench-codec.yml` | pull requests and pushes that touch `wire/` or the codec benchmarks | One short sample per benchmark on a pull request; the full sweep, recorded in the `gh-pages` history, on a push. See [benchmarks/README.md](benchmarks/README.md#in-ci). |
-| `nightly.yml` | 02:41 UTC, and by hand | The model-based tests with new seeds, and the full broker suite and soak. See [conformance/README.md](conformance/README.md). |
+| `nightly.yml` | 02:41 UTC, and by hand | The model-based tests with new seeds every night; the full broker suite and soak unless they already passed on the same commit. See [conformance/README.md](conformance/README.md). |
 | `release.yml` | a `v*` tag | The `ci.yml` module checks and `conformance.yml` on the tag, a proxy install check, then the GitHub release. |
 
 A pull request's `ci` run ends with `record validation`, which stores a
