@@ -150,9 +150,11 @@ MQTT_BROKER=mqtt://127.0.0.1:1886 go -C conformance test -tags conformance -race
 ```
 
 CI runs the suite against mosquitto, and every example, on every pull
-request and every push (`.github/workflows/conformance.yml`, called by
-`ci.yml`); the push that merges a pull request reuses that pull request's
-run when the tree is the same. The release workflow calls the same
+request and push that affects a package of this module or of `examples`,
+or changes a file under `conformance/` (`.github/workflows/conformance.yml`,
+called by `ci.yml`; CONTRIBUTING.md, "What a change runs"), and every night
+on a new commit; the push that merges a pull request reuses that pull
+request's run when the tree is the same. The release workflow calls the same
 workflow on the tagged commit before it publishes the GitHub release. A
 nightly job (`.github/workflows/nightly.yml`) runs it against mosquitto,
 EMQX (over `mqtt://`, `mqtts://`, `ws://`, `wss://` and QUIC) and
