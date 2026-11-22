@@ -53,8 +53,10 @@ the merge commit has that tree and the pull request run passed within
 six hours, the lint, test, build and conformance jobs are skipped, and the
 job summary links the run they passed in. A squash or rebase merge, a
 direct push, a re-run or a stale pull request run executes them all; the
-job's `reason` output says which. Jobs pin the Go minor (`1.27.x`) and take
-the newest patch the runner image carries.
+job's `reason` output says which. Jobs pin the Go minor (`1.27.x`). Lint
+and tests take the newest patch the runner image carries; the build and
+govulncheck job resolves the newest released patch, because govulncheck
+reports the standard library of the Go that runs it.
 
 ## Documentation checks
 

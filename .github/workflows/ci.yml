@@ -14,10 +14,9 @@ permissions:
 
 env:
   CI_ARTIFACT_ENDPOINT: ${{ secrets.CI_ARTIFACT_ENDPOINT }}
-  # The oldest Go minor go.mod accepts, at the newest patch the runner's tool
-  # cache holds (setup-go downloads only when it holds none): the runner image
-  # tracks Go patch releases. govulncheck checks the standard library of the
-  # Go that runs it.
+  # The oldest Go minor go.mod accepts. Lint and tests take the newest patch
+  # the runner's tool cache holds; the vulnerability scan resolves the newest
+  # released patch (see the build job).
   GO_VERSION: '1.27.x'
   GOLANGCI_LINT_VERSION: v2.15.0
   GOVULNCHECK_VERSION: v1.8.0
@@ -102,9 +101,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # govulncheck checks the standard library of the Go that runs it, so
+      # this job resolves the newest released patch, what a supported user
+      # builds with, rather than the one the runner image carries.
       - uses: ashtonian/go-ci-actions@4425a5fdd39bd4f2fba5be7ee71314b145a6e591 # v1.8.0 candidate (go-ci-actions#18)
         with:
           go-version: ${{ env.GO_VERSION }}
+          check-latest: true
       - name: Build every module
         run: scripts/each-module.sh go build ./...
       - name: Install govulncheck
