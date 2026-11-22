@@ -1,8 +1,7 @@
 name: Artifact storage
+# The pull request that changes CI checks the runner's artifact access; the
+# push that merges it would repeat the same check on the same runners.
 on:
-  push:
-    branches: [master]
-    paths: ['.github/**', 'scripts/ci-acceptance.py', 'tools/ci_acceptance.py', 'tools/testinventory/**']
   pull_request:
     paths: ['.github/**', 'scripts/ci-acceptance.py', 'tools/ci_acceptance.py', 'tools/testinventory/**']
   workflow_dispatch:
